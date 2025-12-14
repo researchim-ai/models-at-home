@@ -1,0 +1,48 @@
+# HomeLLM - FSDP (Fully Sharded Data Parallel)
+# =============================================
+# PyTorch native шардирование модели по GPU
+# Рекомендуется для моделей >1B параметров на нескольких GPU
+#
+# Использование:
+#   accelerate launch --config_file configs/accelerate_fsdp.yaml \
+#       -m homellm.training.pretrain --data_path ...
+
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: "bf16"
+num_processes: 2  # Измените на количество ваших GPU
+num_machines: 1
+main_training_function: main
+
+fsdp_config:
+  # Стратегия шардирования:
+  # - FULL_SHARD: полное шардирование параметров, градиентов и состояния оптимизатора
+  # - SHARD_GRAD_OP: шардирование только градиентов и состояния оптимизатора
+  # - NO_SHARD: без шардирования (как DDP)
+  fsdp_sharding_strategy: FULL_SHARD
+  
+  # Автоматическое оборачивание слоёв
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_transformer_layer_cls_to_wrap: HomeBlock
+  
+  # Offload на CPU для экономии VRAM
+  fsdp_offload_params: false
+  fsdp_cpu_ram_efficient_loading: true
+  
+  # Backward prefetch для ускорения
+  fsdp_backward_prefetch: BACKWARD_PRE
+  
+  # State dict type для сохранения
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  
+  # Синхронизация буферов между устройствами
+  fsdp_sync_module_states: true
+  
+  # Forward prefetch
+  fsdp_forward_prefetch: false
+  
+  # Использовать оригинальные параметры
+  fsdp_use_orig_params: true
+
+dynamo_backend: "no"
+

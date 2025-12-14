@@ -1,0 +1,14 @@
+# HomeLLM - Multi-GPU конфиг (DDP)
+# =================================
+# Использование:
+#   accelerate launch --config_file configs/accelerate_multi_gpu.yaml \
+#       -m homellm.training.pretrain --data_path ...
+
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+mixed_precision: "bf16"
+num_processes: 2  # Измените на количество ваших GPU
+num_machines: 1
+main_training_function: main
+dynamo_backend: "no"
+

@@ -1,0 +1,13 @@
+# HomeLLM - Базовый конфиг Accelerate (одна GPU / CPU)
+# =====================================================
+# Использование:
+#   accelerate launch --config_file configs/accelerate_default.yaml \
+#       -m homellm.training.pretrain --data_path ...
+
+compute_environment: LOCAL_MACHINE
+distributed_type: "NO"
+mixed_precision: "no"
+num_processes: 1
+num_machines: 1
+dynamo_backend: "no"
+
