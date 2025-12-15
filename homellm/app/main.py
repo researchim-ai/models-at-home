@@ -374,6 +374,7 @@ def start_training(config: dict) -> str:
             "accelerate", "launch",
             "--config_file", config_file,
             "--num_processes", str(num_gpus),
+            "--gradient_accumulation_steps", str(config.get("gradient_accumulation", 1)),
             "-m", "homellm.app.trainer_worker",
             "--config", str(config_path),
             "--metrics", str(metrics_path)
@@ -1001,7 +1002,9 @@ def render_metrics_dashboard(metrics: dict):
     
     # Error
     if metrics.get("error"):
-        st.error(f"Ошибка: {metrics['error']}")
+        st.error("❌ Произошла ошибка во время тренировки")
+        with st.expander("Подробности ошибки (Traceback)", expanded=True):
+            st.code(metrics['error'], language="python")
     
     # Логи процесса
     if st.session_state.current_run_id:
@@ -1013,17 +1016,19 @@ def render_metrics_dashboard(metrics: dict):
             col1, col2 = st.columns(2)
             
             with col1:
-                st.caption("stdout")
+                st.caption("stdout (последние 500 строк)")
                 if stdout_path.exists():
                     with open(stdout_path) as f:
-                        content = f.read()[-2000:]  # Последние 2000 символов
+                        lines = f.readlines()
+                        content = "".join(lines[-500:])
                         st.code(content if content else "(пусто)", language=None)
             
             with col2:
-                st.caption("stderr")
+                st.caption("stderr (последние 500 строк)")
                 if stderr_path.exists():
                     with open(stderr_path) as f:
-                        content = f.read()[-2000:]
+                        lines = f.readlines()
+                        content = "".join(lines[-500:])
                         st.code(content if content else "(пусто)", language=None)
 
 

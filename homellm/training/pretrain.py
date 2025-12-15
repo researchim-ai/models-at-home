@@ -57,11 +57,13 @@ logging.basicConfig(
 class StreamingTextDataset(IterableDataset):
     """Поточно читает текст/JSONL файл построчно, не загружая всё в память."""
 
-    def __init__(self, file_path: str, tokenizer, seq_len: int):
+    def __init__(self, file_path: str, tokenizer, seq_len: int, num_replicas: int = 1, rank: int = 0):
         super().__init__()
         self.file_path = Path(file_path)
         self.tokenizer = tokenizer
         self.seq_len = seq_len
+        self.num_replicas = num_replicas
+        self.rank = rank
 
         if not self.file_path.exists():
             raise FileNotFoundError(f"Dataset {self.file_path} not found")
@@ -85,24 +87,30 @@ class StreamingTextDataset(IterableDataset):
                 yield line
 
     def __iter__(self):
-        # Получаем информацию о воркере для правильного разбиения данных
+        # Получаем информацию о воркере DataLoader
         worker_info = torch.utils.data.get_worker_info()
         
+        # Общее количество "читателей" = num_replicas * num_workers
+        total_workers = self.num_replicas
+        current_worker_id = self.rank
+        
+        if worker_info is not None:
+            total_workers *= worker_info.num_workers
+            current_worker_id = self.rank * worker_info.num_workers + worker_info.id
+        
         for idx, text in enumerate(self._read_lines()):
-            # Если есть несколько воркеров, каждый обрабатывает свою часть данных
-            if worker_info is not None:
-                if idx % worker_info.num_workers != worker_info.id:
-                    continue
+            # Шардинг данных между процессами и воркерами
+            if idx % total_workers != current_worker_id:
+                continue
             
             tokens = self.tokenizer(
                 text,
                 truncation=True,
                 max_length=self.seq_len,
+                padding="max_length",  # Всегда дополняем до seq_len
                 add_special_tokens=True,
             )["input_ids"]
-            # Отбрасываем слишком короткие примеры (<2 токенов)
-            if len(tokens) < 2:
-                continue
+            
             yield torch.tensor(tokens, dtype=torch.long)
 
     def __len__(self):

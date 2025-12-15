@@ -30,17 +30,17 @@ deepspeed_config:
       pin_memory: true
     
     # Подгрузка весов
-    stage3_prefetch_bucket_size: 5e7
-    stage3_param_persistence_threshold: 1e5
-    stage3_max_live_parameters: 1e9
-    stage3_max_reuse_distance: 1e9
+    stage3_prefetch_bucket_size: 50000000
+    stage3_param_persistence_threshold: 100000
+    stage3_max_live_parameters: 1000000000
+    stage3_max_reuse_distance: 1000000000
     
     # Сбор параметров для forward/backward
     stage3_gather_16bit_weights_on_model_save: true
     
     # Оптимизации
-    sub_group_size: 1e9
-    reduce_bucket_size: auto
+    sub_group_size: 1000000000
+    reduce_bucket_size: 500000000
     contiguous_gradients: true
     overlap_comm: true
   
@@ -51,37 +51,9 @@ deepspeed_config:
   bf16:
     enabled: true
   
-  # Оптимизатор
-  optimizer:
-    type: AdamW
-    params:
-      lr: auto
-      betas: [0.9, 0.95]
-      eps: 1e-8
-      weight_decay: auto
-  
-  # LR Scheduler
-  scheduler:
-    type: WarmupDecayLR
-    params:
-      warmup_min_lr: 0
-      warmup_max_lr: auto
-      warmup_num_steps: auto
-      total_num_steps: auto
-
-  # Размер батча
+  # Размер батча - accelerate подставит значения
   train_batch_size: auto
   train_micro_batch_size_per_gpu: auto
   gradient_accumulation_steps: auto
 
-  # Zero Infinity (NVMe offload) - раскомментировать если нужен offload на SSD
-  # zero_infinity: true
-  # aio:
-  #   block_size: 1048576
-  #   queue_depth: 8
-  #   thread_count: 1
-  #   single_submit: false
-  #   overlap_events: true
-
 dynamo_backend: "no"
-

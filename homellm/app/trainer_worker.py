@@ -168,7 +168,9 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         train_dataset = StreamingTextDataset(
             config["data_path"], 
             tokenizer, 
-            seq_len=config["seq_len"]
+            seq_len=config["seq_len"],
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index
         )
         data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
         train_loader = DataLoader(
@@ -306,7 +308,10 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         )
         
     except Exception as e:
-        metrics.update(status="error", error=str(e))
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"Training failed: {e}\n{tb}")
+        metrics.update(status="error", error=f"{str(e)}\n\n{tb}")
         raise
 
 
