@@ -4,7 +4,7 @@
 
 Система построена на базе **PyTorch**, **Accelerate** и **Streamlit**, обеспечивая поддержку современных методов распределенного обучения (DDP, FSDP, DeepSpeed).
 
-![Status](https://img.shields.io/badge/Status-Active-success) ![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![License](https://img.shields.io/badge/License-MIT-green)
+![Status](https://img.shields.io/badge/Status-Active-success) ![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![License](https://img.shields.io/badge/License-Apache_2.0-blue)
 
 ## Основные возможности
 
