@@ -1,0 +1,16 @@
+{
+  "status": "error",
+  "start_time": "2025-12-14T20:50:00.029922",
+  "current_step": 0,
+  "total_steps": 0,
+  "epoch": 0,
+  "loss_history": [],
+  "lr_history": [],
+  "steps_history": [],
+  "current_loss": 0.0,
+  "current_lr": 0.0,
+  "samples_per_second": 0.0,
+  "eta_seconds": 0,
+  "error": "Dataset dataset/data.jsonl not found",
+  "checkpoints": []
+}
