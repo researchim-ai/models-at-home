@@ -22,6 +22,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import pandas as pd
 import torch
+from datasets import load_dataset  # Добавляем импорт
 
 # Пути
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -1032,6 +1033,201 @@ def render_metrics_dashboard(metrics: dict):
                         st.code(content if content else "(пусто)", language=None)
 
 
+def render_data_manager():
+    """Вкладка управления данными."""
+    st.header("💾 Управление данными")
+    
+    col_upload, col_list = st.columns([1, 2])
+    
+    with col_upload:
+        # Секция 1: Загрузка локальных файлов
+        with st.expander("📤 Загрузка локальных файлов", expanded=False):
+            uploaded_files = st.file_uploader(
+                "Перетащите файлы сюда", 
+                type=["jsonl", "txt", "json"], 
+                accept_multiple_files=True
+            )
+            
+            if uploaded_files:
+                if st.button("📥 Сохранить файлы"):
+                    for uploaded_file in uploaded_files:
+                        save_path = DATASET_DIR / uploaded_file.name
+                        with open(save_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                        st.toast(f"Файл {uploaded_file.name} сохранён!", icon="✅")
+                    time.sleep(1)
+                    st.rerun()
+
+        # Секция 2: Загрузка с HuggingFace
+        st.subheader("🤗 Скачать с HuggingFace")
+        with st.form("hf_download_form"):
+            hf_repo_id = st.text_input("Репозиторий (ID)", placeholder="HuggingFaceFW/fineweb-2", help="Например: HuggingFaceFW/fineweb-2")
+            hf_subset = st.text_input("Subset (опционально)", placeholder="default", help="Например: default")
+            hf_split = st.text_input("Split", value="train")
+            
+            # Расширенные фильтры
+            with st.expander("🛠️ Фильтры и Лимиты (FineWeb/CommonCrawl)", expanded=True):
+                col_filt1, col_filt2 = st.columns(2)
+                
+                with col_filt1:
+                    st.markdown("**Фильтрация данных**")
+                    filter_lang = st.text_input("Язык (language)", placeholder="rus", help="Оставьте пустым, чтобы не фильтровать. Для FineWeb используйте коды ISO (например, 'rus' или 'ru')")
+                    filter_score = st.slider("Мин. language_score", 0.0, 1.0, 0.0, step=0.01, help="Минимальный порог уверенности классификатора языка")
+                
+                with col_filt2:
+                    st.markdown("**Ограничение объема**")
+                    limit_type = st.radio("Ограничить по:", ["Количество строк", "Размер (ГБ)"])
+                    
+                    if limit_type == "Количество строк":
+                        limit_val = st.number_input("Макс. строк", min_value=0, value=10000, step=1000)
+                        limit_bytes = 0
+                    else:
+                        limit_gb = st.number_input("Макс. ГБ", min_value=0.1, value=1.0, step=0.1)
+                        limit_bytes = int(limit_gb * 1024**3)
+                        limit_val = 0
+
+            hf_filename = st.text_input("Имя файла для сохранения", placeholder="dataset.jsonl")
+            
+            submitted = st.form_submit_button("🚀 Скачать и обработать")
+            
+            if submitted and hf_repo_id:
+                target_filename = hf_filename if hf_filename else f"{hf_repo_id.split('/')[-1]}_{hf_split}.jsonl"
+                if not target_filename.endswith('.jsonl'):
+                    target_filename += '.jsonl'
+                
+                save_path = DATASET_DIR / target_filename
+                
+                status_text = st.empty()
+                progress_bar = st.progress(0)
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                
+                try:
+                    status_text.info(f"Подключение к {hf_repo_id}...")
+                    
+                    # Загружаем в streaming режиме
+                    ds = load_dataset(
+                        hf_repo_id, 
+                        name=hf_subset if hf_subset else None, 
+                        split=hf_split, 
+                        streaming=True,
+                        trust_remote_code=True
+                    )
+                    
+                    status_text.info(f"Скачивание и фильтрация в {target_filename}...")
+                    
+                    count = 0
+                    current_bytes = 0
+                    skipped_count = 0
+                    
+                    with open(save_path, "w", encoding="utf-8") as f:
+                        for item in ds:
+                            # 1. Фильтрация
+                            # Проверка языка
+                            if filter_lang:
+                                item_lang = item.get("language")
+                                if item_lang and filter_lang.lower() not in item_lang.lower():
+                                    skipped_count += 1
+                                    continue
+                            
+                            # Проверка score
+                            if filter_score > 0:
+                                item_score = item.get("language_score")
+                                if item_score is not None and float(item_score) < filter_score:
+                                    skipped_count += 1
+                                    continue
+                            
+                            # 2. Извлечение текста
+                            text = item.get("text") or item.get("content") or item.get("body")
+                            
+                            if text:
+                                # Сохраняем
+                                row_data = json.dumps({"text": text}, ensure_ascii=False)
+                                row_bytes = len(row_data.encode('utf-8')) + 1 # +newline
+                                
+                                f.write(row_data + "\n")
+                                
+                                count += 1
+                                current_bytes += row_bytes
+                                
+                                # Обновление UI (не слишком часто)
+                                if count % 1000 == 0:
+                                    status_text.text(f"Скачано: {count} строк | {current_bytes / 1024**2:.1f} MB | Пропущено: {skipped_count}")
+                                    
+                                    # Проверка лимитов
+                                    if limit_val > 0:
+                                        progress = min(count / limit_val, 1.0)
+                                        progress_bar.progress(progress)
+                                        if count >= limit_val:
+                                            break
+                                    elif limit_bytes > 0:
+                                        progress = min(current_bytes / limit_bytes, 1.0)
+                                        progress_bar.progress(progress)
+                                        if current_bytes >= limit_bytes:
+                                            break
+                    
+                    final_size_mb = current_bytes / (1024 * 1024)
+                    status_text.success(f"✅ Готово! Файл: {target_filename}")
+                    
+                    metric_col1.metric("Строк сохранено", count)
+                    metric_col2.metric("Размер", f"{final_size_mb:.1f} MB")
+                    metric_col3.metric("Отфильтровано", skipped_count)
+                    
+                    time.sleep(3)
+                    st.rerun()
+                    
+                except Exception as e:
+                    status_text.error(f"Ошибка: {e}")
+    
+    with col_list:
+        st.subheader("Доступные датасеты")
+        
+        datasets = []
+        if DATASET_DIR.exists():
+            # JSONL / JSON
+            for f in list(DATASET_DIR.glob("*.jsonl")) + list(DATASET_DIR.glob("*.json")):
+                size_mb = f.stat().st_size / (1024 * 1024)
+                datasets.append({
+                    "name": f.name,
+                    "type": "JSONL/JSON",
+                    "size_mb": size_mb,
+                    "path": f
+                })
+            # TXT
+            for f in DATASET_DIR.glob("*.txt"):
+                size_mb = f.stat().st_size / (1024 * 1024)
+                datasets.append({
+                    "name": f.name,
+                    "type": "Text",
+                    "size_mb": size_mb,
+                    "path": f
+                })
+        
+        if not datasets:
+            st.info("Нет загруженных датасетов. Загрузите файлы слева.")
+        else:
+            # Отображаем список
+            for ds in datasets:
+                with st.expander(f"📄 {ds['name']} ({ds['size_mb']:.1f} MB)"):
+                    st.caption(f"Тип: {ds['type']}")
+                    
+                    # Preview
+                    try:
+                        with open(ds['path'], "r", encoding="utf-8") as f:
+                            head = [next(f).strip() for _ in range(5)]
+                        st.markdown("**Preview (первые 5 строк):**")
+                        st.code("\n".join(head), language="json" if "JSON" in ds['type'] else "text")
+                        
+                        col_del, col_info = st.columns([1, 4])
+                        with col_del:
+                            if st.button("🗑️ Удалить", key=f"del_{ds['name']}"):
+                                ds['path'].unlink()
+                                st.toast(f"Файл {ds['name']} удалён", icon="🗑️")
+                                time.sleep(1)
+                                st.rerun()
+                    except Exception as e:
+                        st.error(f"Ошибка чтения файла: {e}")
+
+
 def render_model_preview(config: dict, distributed_config: dict = None):
     """Превью архитектуры модели и настроек параллелизма."""
     st.subheader("📐 Архитектура модели")
@@ -1199,7 +1395,7 @@ def main():
     full_config["config_file"] = distributed_config["config_file"]
     
     # Main content
-    tab1, tab2, tab3, tab4 = st.tabs(["🚀 Запуск", "📊 Мониторинг", "💬 Чат", "📜 История"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🚀 Запуск", "📊 Мониторинг", "💬 Чат", "📜 История", "💾 Данные"])
     
     with tab1:
         col1, col2 = st.columns([2, 1])
@@ -1300,6 +1496,9 @@ def main():
                             st.info("👆 Перейдите на вкладку **📊 Мониторинг**")
         else:
             st.info("Нет предыдущих запусков")
+            
+    with tab5:
+        render_data_manager()
         
         # Подсказка про чат
         st.markdown("---")

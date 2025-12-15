@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  studio:
+    build: .
+    container_name: models-at-home
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./datasets:/app/datasets  # Ваши данные
+      - ./out:/app/out            # Чекпоинты и модели
+      - ./.runs:/app/.runs        # Логи и метрики
+      # Можно раскомментировать для разработки (live reload кода)
+      # - ./homellm:/app/homellm 
+      # - ./configs:/app/configs
+    environment:
+      - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
