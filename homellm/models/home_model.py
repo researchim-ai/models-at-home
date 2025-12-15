@@ -247,6 +247,7 @@ class HomeModel(nn.Module):
 class HomeForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = HomeConfig
     base_model_prefix = "home_model"
+    _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config: HomeConfig):
         super().__init__(config)
@@ -257,6 +258,10 @@ class HomeForCausalLM(PreTrainedModel, GenerationMixin):
         self.lm_head.weight = self.home_model.embed_tokens.weight
 
         self.post_init()
+    
+    def tie_weights(self):
+        """Привязать веса lm_head к embed_tokens."""
+        self.lm_head.weight = self.home_model.embed_tokens.weight
 
     def get_input_embeddings(self):
         return self.home_model.embed_tokens
@@ -271,10 +276,20 @@ class HomeForCausalLM(PreTrainedModel, GenerationMixin):
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         labels: Optional[torch.Tensor] = None,
+        **kwargs,  # Для совместимости с новыми версиями transformers (cache_position, etc.)
     ) -> CausalLMOutputWithPast:
+        # Конвертируем DynamicCache в список кортежей если нужно
+        legacy_past = None
+        if past_key_values is not None:
+            if hasattr(past_key_values, 'to_legacy_cache'):
+                # Это DynamicCache из новых transformers
+                legacy_past = past_key_values.to_legacy_cache()
+            elif isinstance(past_key_values, (list, tuple)):
+                legacy_past = past_key_values
+        
         hidden_states, presents = self.home_model(
             input_ids,
-            past_key_values=past_key_values,
+            past_key_values=legacy_past,
             use_cache=use_cache,
         )
 

@@ -30,6 +30,57 @@ from homellm.training.pretrain import StreamingTextDataset
 logger = logging.getLogger(__name__)
 
 
+def get_gpu_stats():
+    """Получить статистику GPU через nvidia-smi (работает правильно при DDP)."""
+    gpu_stats = []
+    
+    try:
+        import subprocess
+        # Получаем данные со всех GPU через nvidia-smi
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index,memory.used,memory.total,utilization.gpu', 
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=2
+        )
+        
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                if line.strip():
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) >= 4:
+                        gpu_id = int(parts[0])
+                        memory_used = float(parts[1]) / 1024  # MiB -> GiB
+                        memory_total = float(parts[2]) / 1024
+                        utilization = int(parts[3]) if parts[3].isdigit() else None
+                        
+                        gpu_stats.append({
+                            "id": gpu_id,
+                            "memory_used_gb": round(memory_used, 2),
+                            "memory_total_gb": round(memory_total, 2),
+                            "memory_percent": round(memory_used / memory_total * 100, 1) if memory_total > 0 else 0,
+                            "utilization": utilization,
+                        })
+    except Exception:
+        # Fallback на torch.cuda если nvidia-smi недоступен
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                try:
+                    memory_allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                    memory_total = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                    
+                    gpu_stats.append({
+                        "id": i,
+                        "memory_used_gb": round(memory_allocated, 2),
+                        "memory_total_gb": round(memory_total, 2),
+                        "memory_percent": round(memory_allocated / memory_total * 100, 1),
+                        "utilization": None,
+                    })
+                except:
+                    pass
+    
+    return gpu_stats
+
+
 class MetricsLogger:
     """Логгер метрик в JSON файл для визуализации."""
     
@@ -50,6 +101,7 @@ class MetricsLogger:
             "eta_seconds": 0,
             "error": None,
             "checkpoints": [],
+            "gpu_stats": [],
         }
         self._save()
     
@@ -61,7 +113,7 @@ class MetricsLogger:
         self.metrics.update(kwargs)
         self._save()
     
-    def log_step(self, step: int, loss: float, lr: float, samples_per_sec: float = 0):
+    def log_step(self, step: int, loss: float, lr: float, samples_per_sec: float = 0, step_time: float = 0):
         self.metrics["current_step"] = step
         self.metrics["current_loss"] = loss
         self.metrics["current_lr"] = lr
@@ -70,10 +122,13 @@ class MetricsLogger:
         self.metrics["lr_history"].append(lr)
         self.metrics["steps_history"].append(step)
         
-        # ETA
-        if step > 0 and samples_per_sec > 0:
-            remaining_steps = self.metrics["total_steps"] - step
-            self.metrics["eta_seconds"] = int(remaining_steps / samples_per_sec)
+        # GPU stats
+        self.metrics["gpu_stats"] = get_gpu_stats()
+        
+        # ETA на основе времени шага
+        if step > 0 and step_time > 0:
+            remaining_steps = max(0, self.metrics["total_steps"] - step)
+            self.metrics["eta_seconds"] = int(remaining_steps * step_time)
         
         self._save()
     
@@ -143,16 +198,22 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         if config.get("grad_checkpoint", False):
             model.gradient_checkpointing_enable()
         
-        # Scheduler
-        try:
-            dataset_len = len(train_loader)
-        except TypeError:
-            dataset_len = config.get("save_every", 5000) * config["epochs"]
+        # Scheduler - определяем количество шагов
+        # Если указан max_steps - используем его
+        if config.get("max_steps"):
+            max_train_steps = config["max_steps"]
+        else:
+            # Пробуем получить длину датасета
+            try:
+                dataset_len = len(train_dataset)  # Количество примеров
+                steps_per_epoch = math.ceil(dataset_len / config["batch_size"])
+                num_update_steps_per_epoch = math.ceil(steps_per_epoch / config["gradient_accumulation"])
+                max_train_steps = config["epochs"] * num_update_steps_per_epoch
+            except (TypeError, AttributeError):
+                # Для streaming dataset без __len__ - используем save_every * 10 как оценку
+                max_train_steps = config.get("save_every", 5000) * 2
         
-        num_update_steps_per_epoch = math.ceil(dataset_len / config["gradient_accumulation"])
-        max_train_steps = config["epochs"] * num_update_steps_per_epoch
-        
-        metrics.update(total_steps=max_train_steps)
+        metrics.update(total_steps=max_train_steps, max_steps_estimated=config.get("max_steps") is None)
         
         optimizer = torch.optim.AdamW(
             model.parameters(), 
@@ -179,7 +240,12 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         global_step = 0
         start_time = time.time()
         
+        training_complete = False
+        
         for epoch in range(config["epochs"]):
+            if training_complete:
+                break
+                
             metrics.update(epoch=epoch + 1)
             model.train()
             
@@ -197,22 +263,32 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 global_step += 1
                 
                 # Логирование
+                step_time = time.time() - step_start
                 if global_step % config.get("log_every", 10) == 0 or global_step == 1:
-                    step_time = time.time() - step_start
                     samples_per_sec = config["batch_size"] / step_time if step_time > 0 else 0
                     
                     metrics.log_step(
                         step=global_step,
                         loss=loss.detach().float().item(),
                         lr=lr_scheduler.get_last_lr()[0],
-                        samples_per_sec=samples_per_sec
+                        samples_per_sec=samples_per_sec,
+                        step_time=step_time
                     )
                 
                 # Checkpoint
                 if global_step % config.get("save_every", 5000) == 0:
                     ckpt_path = output_dir / f"checkpoint_step{global_step}"
                     accelerator.save_state(ckpt_path)
+                    
+                    # Сохраняем конфигурацию модели для загрузки чекпоинта
+                    model_config.save_pretrained(ckpt_path)
+                    
                     metrics.log_checkpoint(str(ckpt_path))
+                
+                # Проверяем достигли ли лимита шагов
+                if global_step >= max_train_steps:
+                    training_complete = True
+                    break
         
         # Final save
         metrics.update(status="saving_model")
