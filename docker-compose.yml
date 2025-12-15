@@ -15,6 +15,7 @@ services:
       # - ./configs:/app/configs
     environment:
       - PYTHONUNBUFFERED=1
+      - MKL_THREADING_LAYER=GNU
     deploy:
       resources:
         reservations:

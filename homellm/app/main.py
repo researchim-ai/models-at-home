@@ -174,6 +174,8 @@ def restore_session_state():
                         pid = int(f.read().strip())
                     os.kill(pid, 0)  # Проверка существования процесса
                     process_alive = True
+                except PermissionError:
+                    process_alive = True
                 except (ProcessLookupError, ValueError, PermissionError):
                     pass
             
@@ -480,6 +482,10 @@ def is_process_running(run_id: str) -> bool:
             pid = int(f.read().strip())
         # Проверяем существует ли процесс
         os.kill(pid, 0)
+        return True
+    except PermissionError:
+        # Процесс существует, но у нас нет прав (например, запущен от другого юзера)
+        # Считаем, что он жив
         return True
     except (ProcessLookupError, ValueError, FileNotFoundError):
         return False
@@ -1033,6 +1039,110 @@ def render_metrics_dashboard(metrics: dict):
                         st.code(content if content else "(пусто)", language=None)
 
 
+
+def download_hf_dataset(repo_id, subset, split, limit_val, limit_bytes, filter_lang, filter_score, filename):
+    """Функция скачивания датасета (выполняется при нажатии кнопки)."""
+    st.info(f"Начинаем скачивание: {repo_id}...")
+    
+    target_filename = filename if filename else f"{repo_id.split('/')[-1]}_{split}.jsonl"
+    if not target_filename.endswith('.jsonl'):
+        target_filename += '.jsonl'
+    
+    save_path = DATASET_DIR / target_filename
+    
+    status_text = st.empty()
+    progress_bar = st.progress(0)
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
+    
+    try:
+        status_text.info(f"Подключение к {repo_id}...")
+        
+        # Обработка имени конфига
+        config_name = subset if subset and subset != "default" else None
+        
+        # Пробуем загрузить
+        try:
+            ds = load_dataset(
+                repo_id, 
+                name=config_name, 
+                split=split, 
+                streaming=True,
+                trust_remote_code=True
+            )
+        except ValueError as e:
+            if "BuilderConfig" in str(e) and "not found" in str(e):
+                # Пытаемся распарсить доступные конфиги из сообщения об ошибке
+                import re
+                match = re.search(r"Available: \[(.*?)\]", str(e))
+                if match:
+                    available = match.group(1).replace("'", "")
+                    # Показываем подсказку
+                    st.error(f"Конфиг '{subset}' не найден! Доступные конфиги (скопируйте нужный в поле Subset):")
+                    st.code(available, language=None)
+                    # Если есть rus_Cyrl, подсказываем его
+                    if "rus_Cyrl" in available:
+                        st.info("💡 Для русского языка попробуйте Subset: **rus_Cyrl**")
+                    return
+            raise e
+        
+        status_text.info(f"Скачивание в {target_filename}...")
+        
+        count = 0
+        current_bytes = 0
+        skipped_count = 0
+        
+        # Проверяем первый элемент
+        iterator = iter(ds)
+        try:
+            first_item = next(iterator)
+            items_to_process = [first_item]
+        except StopIteration:
+            st.error("Датасет пуст!")
+            return
+        
+        with open(save_path, "w", encoding="utf-8") as f:
+            import itertools
+            for item in itertools.chain(items_to_process, iterator):
+                # 1. Фильтрация
+                if filter_lang:
+                    item_lang = item.get("language")
+                    if item_lang and filter_lang.lower() not in item_lang.lower():
+                        skipped_count += 1
+                        continue
+                
+                if filter_score > 0:
+                    item_score = item.get("language_score")
+                    if item_score is not None and float(item_score) < filter_score:
+                        skipped_count += 1
+                        continue
+                
+                # 2. Извлечение текста
+                text = item.get("text") or item.get("content") or item.get("body")
+                
+                if text:
+                    row_data = json.dumps({"text": text}, ensure_ascii=False)
+                    row_bytes = len(row_data.encode('utf-8')) + 1
+                    
+                    f.write(row_data + "\n")
+                    
+                    count += 1
+                    current_bytes += row_bytes
+                    
+                    if count % 100 == 0:
+                        status_text.text(f"Скачано: {count} | {current_bytes / 1024**2:.1f} MB")
+                        if limit_val > 0 and count >= limit_val:
+                            break
+                        if limit_bytes > 0 and current_bytes >= limit_bytes:
+                            break
+        
+        status_text.success(f"✅ Готово! Сохранено в {target_filename}")
+        time.sleep(2)
+        st.rerun()
+        
+    except Exception as e:
+        st.error(f"Ошибка: {e}")
+
+
 def render_data_manager():
     """Вкладка управления данными."""
     st.header("💾 Управление данными")
@@ -1060,123 +1170,50 @@ def render_data_manager():
 
         # Секция 2: Загрузка с HuggingFace
         st.subheader("🤗 Скачать с HuggingFace")
-        with st.form("hf_download_form"):
-            hf_repo_id = st.text_input("Репозиторий (ID)", placeholder="HuggingFaceFW/fineweb-2", help="Например: HuggingFaceFW/fineweb-2")
-            hf_subset = st.text_input("Subset (опционально)", placeholder="default", help="Например: default")
-            hf_split = st.text_input("Split", value="train")
-            
-            # Расширенные фильтры
-            with st.expander("🛠️ Фильтры и Лимиты (FineWeb/CommonCrawl)", expanded=True):
-                col_filt1, col_filt2 = st.columns(2)
-                
-                with col_filt1:
-                    st.markdown("**Фильтрация данных**")
-                    filter_lang = st.text_input("Язык (language)", placeholder="rus", help="Оставьте пустым, чтобы не фильтровать. Для FineWeb используйте коды ISO (например, 'rus' или 'ru')")
-                    filter_score = st.slider("Мин. language_score", 0.0, 1.0, 0.0, step=0.01, help="Минимальный порог уверенности классификатора языка")
-                
-                with col_filt2:
-                    st.markdown("**Ограничение объема**")
-                    limit_type = st.radio("Ограничить по:", ["Количество строк", "Размер (ГБ)"])
-                    
-                    if limit_type == "Количество строк":
-                        limit_val = st.number_input("Макс. строк", min_value=0, value=10000, step=1000)
-                        limit_bytes = 0
-                    else:
-                        limit_gb = st.number_input("Макс. ГБ", min_value=0.1, value=1.0, step=0.1)
-                        limit_bytes = int(limit_gb * 1024**3)
-                        limit_val = 0
-
-            hf_filename = st.text_input("Имя файла для сохранения", placeholder="dataset.jsonl")
-            
-            submitted = st.form_submit_button("🚀 Скачать и обработать")
-            
-            if submitted and hf_repo_id:
-                target_filename = hf_filename if hf_filename else f"{hf_repo_id.split('/')[-1]}_{hf_split}.jsonl"
-                if not target_filename.endswith('.jsonl'):
-                    target_filename += '.jsonl'
-                
-                save_path = DATASET_DIR / target_filename
-                
-                status_text = st.empty()
-                progress_bar = st.progress(0)
-                metric_col1, metric_col2, metric_col3 = st.columns(3)
-                
-                try:
-                    status_text.info(f"Подключение к {hf_repo_id}...")
-                    
-                    # Загружаем в streaming режиме
-                    ds = load_dataset(
-                        hf_repo_id, 
-                        name=hf_subset if hf_subset else None, 
-                        split=hf_split, 
-                        streaming=True,
-                        trust_remote_code=True
-                    )
-                    
-                    status_text.info(f"Скачивание и фильтрация в {target_filename}...")
-                    
-                    count = 0
-                    current_bytes = 0
-                    skipped_count = 0
-                    
-                    with open(save_path, "w", encoding="utf-8") as f:
-                        for item in ds:
-                            # 1. Фильтрация
-                            # Проверка языка
-                            if filter_lang:
-                                item_lang = item.get("language")
-                                if item_lang and filter_lang.lower() not in item_lang.lower():
-                                    skipped_count += 1
-                                    continue
-                            
-                            # Проверка score
-                            if filter_score > 0:
-                                item_score = item.get("language_score")
-                                if item_score is not None and float(item_score) < filter_score:
-                                    skipped_count += 1
-                                    continue
-                            
-                            # 2. Извлечение текста
-                            text = item.get("text") or item.get("content") or item.get("body")
-                            
-                            if text:
-                                # Сохраняем
-                                row_data = json.dumps({"text": text}, ensure_ascii=False)
-                                row_bytes = len(row_data.encode('utf-8')) + 1 # +newline
-                                
-                                f.write(row_data + "\n")
-                                
-                                count += 1
-                                current_bytes += row_bytes
-                                
-                                # Обновление UI (не слишком часто)
-                                if count % 1000 == 0:
-                                    status_text.text(f"Скачано: {count} строк | {current_bytes / 1024**2:.1f} MB | Пропущено: {skipped_count}")
-                                    
-                                    # Проверка лимитов
-                                    if limit_val > 0:
-                                        progress = min(count / limit_val, 1.0)
-                                        progress_bar.progress(progress)
-                                        if count >= limit_val:
-                                            break
-                                    elif limit_bytes > 0:
-                                        progress = min(current_bytes / limit_bytes, 1.0)
-                                        progress_bar.progress(progress)
-                                        if current_bytes >= limit_bytes:
-                                            break
-                    
-                    final_size_mb = current_bytes / (1024 * 1024)
-                    status_text.success(f"✅ Готово! Файл: {target_filename}")
-                    
-                    metric_col1.metric("Строк сохранено", count)
-                    metric_col2.metric("Размер", f"{final_size_mb:.1f} MB")
-                    metric_col3.metric("Отфильтровано", skipped_count)
-                    
-                    time.sleep(3)
-                    st.rerun()
-                    
-                except Exception as e:
-                    status_text.error(f"Ошибка: {e}")
+        
+        # Используем session_state для хранения значений формы
+        if "hf_repo_id" not in st.session_state: st.session_state.hf_repo_id = "HuggingFaceFW/fineweb-2"
+        if "hf_subset" not in st.session_state: st.session_state.hf_subset = "default"
+        if "hf_split" not in st.session_state: st.session_state.hf_split = "train"
+        if "hf_filename" not in st.session_state: st.session_state.hf_filename = ""
+        
+        # Инпуты обновляют session_state
+        st.text_input("Репозиторий (ID)", key="hf_repo_id", help="Например: HuggingFaceFW/fineweb-2")
+        st.text_input("Subset (конфиг)", key="hf_subset", help="Например: rus_Cyrl (для русского) или default. Если ошибка 'Config not found', смотрите список доступных в ошибке.")
+        st.text_input("Split", key="hf_split")
+        
+        with st.expander("🛠️ Фильтры и Лимиты", expanded=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                filter_lang = st.text_input("Язык (rus)", value="rus", key="filter_lang")
+                filter_score = st.slider("Мин. score", 0.0, 1.0, 0.0, key="filter_score")
+            with col2:
+                limit_type = st.radio("Лимит", ["Строки", "ГБ"], key="limit_type")
+                if limit_type == "Строки":
+                    limit_val = st.number_input("Кол-во", value=10000, key="limit_val")
+                    limit_bytes = 0
+                else:
+                    limit_gb = st.number_input("ГБ", value=0.1, step=0.1, key="limit_gb")
+                    limit_bytes = int(limit_gb * 1024**3)
+                    limit_val = 0
+        
+        st.text_input("Имя файла", key="hf_filename", placeholder="dataset.jsonl")
+        
+        # Кнопка запускает функцию
+        if st.button("🚀 Скачать", type="primary"):
+            if not st.session_state.hf_repo_id:
+                st.error("Укажите ID репозитория!")
+            else:
+                download_hf_dataset(
+                    st.session_state.hf_repo_id,
+                    st.session_state.hf_subset,
+                    st.session_state.hf_split,
+                    limit_val,
+                    limit_bytes,
+                    filter_lang,
+                    filter_score,
+                    st.session_state.hf_filename
+                )
     
     with col_list:
         st.subheader("Доступные датасеты")
