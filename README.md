@@ -27,7 +27,7 @@
 
 1.  **Клонируйте репозиторий:**
     ```bash
-    git clone https://github.com/your-username/models-at-home.git
+    git clone https://github.com/researchim-ai/models-at-home.git
     cd models-at-home
     ```
 

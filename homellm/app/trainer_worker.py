@@ -23,9 +23,11 @@ from transformers import (
     get_cosine_schedule_with_warmup,
     DataCollatorForLanguageModeling,
 )
+from safetensors.torch import load_file
 
 from homellm.models.home_model import HomeConfig, HomeForCausalLM
 from homellm.training.pretrain import StreamingTextDataset
+from homellm.training.sft import SFTDataset
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +153,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         
         # Mixed precision
         mixed_precision = config.get("mixed_precision", "no")
+        stage = config.get("stage", "pretrain") # pretrain | sft
         
         accelerator = Accelerator(
             gradient_accumulation_steps=config["gradient_accumulation"],
@@ -158,40 +161,110 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         )
         
         # Tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(config["tokenizer_path"])
+        tokenizer_path = config.get("tokenizer_path", "gpt2") # Fallback to gpt2 if missing
+        try:
+             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        except:
+             # Если путь к токенизатору кривой или это путь к чекпоинту без токенизатора
+             logger.warning(f"Failed to load tokenizer from {tokenizer_path}, falling back to gpt2")
+             tokenizer = AutoTokenizer.from_pretrained("gpt2")
+             
         if tokenizer.pad_token is None:
             tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
         
-        metrics.update(status="loading_dataset")
+        metrics.update(status=f"loading_dataset ({stage})")
         
-        # Dataset
-        train_dataset = StreamingTextDataset(
-            config["data_path"], 
-            tokenizer, 
-            seq_len=config["seq_len"],
-            num_replicas=accelerator.num_processes,
-            rank=accelerator.process_index
-        )
-        data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+        # Dataset Selection based on Stage
+        if stage == "sft":
+            train_dataset = SFTDataset(
+                config["data_path"],
+                tokenizer,
+                seq_len=config["seq_len"],
+                sft_columns=config.get("sft_columns"),
+                sft_template=config.get("sft_template")
+            )
+            # Для SFT data collator не нужен специальный masking, 
+            # но нужно просто паддить тензоры в батче.
+            # SFTDataset уже возвращает тензоры, DataCollatorForLanguageModeling с mlm=False подойдет
+            # или default_data_collator если labels уже есть (а они есть в SFTDataset)
+            from transformers import default_data_collator
+            collate_fn = default_data_collator
+        else:
+            # Pretrain
+            train_dataset = StreamingTextDataset(
+                config["data_path"], 
+                tokenizer, 
+                seq_len=config["seq_len"],
+                num_replicas=accelerator.num_processes,
+                rank=accelerator.process_index
+            )
+            collate_fn = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+            
         train_loader = DataLoader(
             train_dataset,
             batch_size=config["batch_size"],
-            collate_fn=data_collator,
+            collate_fn=collate_fn,
             num_workers=2,
         )
         
         metrics.update(status="building_model")
         
-        # Model
-        model_config = HomeConfig(
-            vocab_size=len(tokenizer),
-            hidden_size=config["hidden_size"],
-            num_hidden_layers=config["num_layers"],
-            num_attention_heads=config["n_heads"],
-            max_position_embeddings=config["seq_len"],
-            dropout=config.get("dropout", 0.0),
-        )
-        model = HomeForCausalLM(model_config)
+        # Model Configuration
+        # Если SFT, мы должны загрузить веса
+        if stage == "sft" and config.get("base_model_path"):
+            base_model_path = Path(config["base_model_path"])
+            
+            # Пытаемся загрузить конфиг
+            if (base_model_path / "config.json").exists():
+                model_config = HomeConfig.from_pretrained(str(base_model_path))
+            else:
+                 # Пытаемся найти конфиг в родительской папке запуска
+                 parent_config = base_model_path.parent / "run_config.json"
+                 if parent_config.exists():
+                     with open(parent_config) as f:
+                        run_cfg = json.load(f)
+                     model_config = HomeConfig(
+                        vocab_size=len(tokenizer),
+                        hidden_size=run_cfg.get("hidden_size", 512),
+                        num_hidden_layers=run_cfg.get("num_layers", 8),
+                        num_attention_heads=run_cfg.get("n_heads", 8),
+                        max_position_embeddings=run_cfg.get("seq_len", 512),
+                     )
+                 else:
+                     raise ValueError(f"Cannot find config.json in {base_model_path}")
+                     
+            model = HomeForCausalLM(model_config)
+            
+            # Загрузка весов
+            # Ищем .safetensors или .bin
+            if (base_model_path / "model.safetensors").exists():
+                 state_dict = load_file(str(base_model_path / "model.safetensors"))
+                 model.load_state_dict(state_dict, strict=False) # strict=False т.к. может измениться размер vocab
+            elif (base_model_path / "pytorch_model.bin").exists():
+                 state_dict = torch.load(base_model_path / "pytorch_model.bin", map_location="cpu")
+                 model.load_state_dict(state_dict, strict=False)
+            else:
+                # Accelerate checkpoint format?
+                try:
+                    # Попробуем загрузить через load_state_dict если это папка чекпоинта accelerate
+                    # Обычно accelerate сохраняет random_states и model.safetensors внутри
+                    pass
+                except:
+                    pass
+            
+            logger.info(f"Loaded base model from {base_model_path}")
+            
+        else:
+            # Pretrain from scratch
+            model_config = HomeConfig(
+                vocab_size=len(tokenizer),
+                hidden_size=config["hidden_size"],
+                num_hidden_layers=config["num_layers"],
+                num_attention_heads=config["n_heads"],
+                max_position_embeddings=config["seq_len"],
+                dropout=config.get("dropout", 0.0),
+            )
+            model = HomeForCausalLM(model_config)
         
         # Подсчёт параметров
         num_params = sum(p.numel() for p in model.parameters())
@@ -207,7 +280,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         else:
             # Пробуем получить длину датасета
             try:
-                dataset_len = len(train_dataset)  # Количество примеров
+                dataset_len = len(train_dataset)  # Количество примеров (если доступно)
                 steps_per_epoch = math.ceil(dataset_len / config["batch_size"])
                 num_update_steps_per_epoch = math.ceil(steps_per_epoch / config["gradient_accumulation"])
                 max_train_steps = config["epochs"] * num_update_steps_per_epoch
@@ -296,6 +369,44 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         metrics.update(status="saving_model")
         final_dir = output_dir / "final_model"
         final_dir.mkdir(parents=True, exist_ok=True)
+        
+        # --- ВАЖНО: Сохраняем Chat Template в токенизатор ---
+        # Чтобы при инференсе (в чате) модель знала свои теги (User/Assistant)
+        if stage == "sft" and config.get("sft_template"):
+            tmpl = config["sft_template"]
+            # Формируем Jinja2 шаблон для HuggingFace
+            # Он будет автоматически подставлять system, user_tag, bot_tag и separator
+            # Обратите внимание: мы жестко вшиваем значения из конфига в строку шаблона
+            
+            sys = tmpl.get('system', '')
+            u_tag = tmpl.get('user_tag', '### User:')
+            b_tag = tmpl.get('bot_tag', '### Assistant:')
+            sep = tmpl.get('separator', '\n\n').replace('\n', '\\n') # Экранируем для json
+            
+            # Шаблон:
+            # 1. System prompt (если есть)
+            # 2. Цикл по сообщениям
+            # 3. Generation prompt (тег ассистента в конце)
+            
+            jinja_template = (
+                f"{{% if messages[0]['role'] == 'system' %}}"
+                f"{{{{ messages[0]['content'] + '{sep}' }}}}"
+                f"{{% endif %}}"
+                f"{{% for message in messages %}}"
+                f"{{% if message['role'] == 'user' %}}"
+                f"{{{{ '{u_tag}\\n' + message['content'] + '{sep}' }}}}"
+                f"{{% elif message['role'] == 'assistant' %}}"
+                f"{{{{ '{b_tag}\\n' + message['content'] + '{sep}' }}}}"
+                f"{{% endif %}}"
+                f"{{% endfor %}}"
+                f"{{% if add_generation_prompt %}}"
+                f"{{{{ '{b_tag}\\n' }}}}"
+                f"{{% endif %}}"
+            )
+            
+            tokenizer.chat_template = jinja_template
+            logger.info("Saved custom chat_template to tokenizer")
+
         unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_model.save_pretrained(final_dir, save_function=accelerator.save)
         tokenizer.save_pretrained(final_dir)
@@ -336,4 +447,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

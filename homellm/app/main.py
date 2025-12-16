@@ -517,13 +517,325 @@ def render_header():
     st.caption("Визуальный интерфейс для тренировки языковых моделей дома")
 
 
+def get_dataset_columns(file_path: str):
+    """Анализирует файл и возвращает список колонок и пример данных."""
+    path = Path(file_path)
+    if not path.exists():
+        return [], {}
+        
+    try:
+        if path.suffix == ".jsonl":
+            with open(path, "r", encoding="utf-8") as f:
+                line = f.readline()
+                if line:
+                    data = json.loads(line)
+                    return list(data.keys()), data
+        elif path.suffix == ".json":
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list) and len(data) > 0:
+                    return list(data[0].keys()), data[0]
+                elif isinstance(data, dict):
+                    # Если это словарь колонок (HuggingFace format иногда)
+                    return list(data.keys()), {k: v[0] if isinstance(v, list) else v for k, v in data.items()}
+        elif path.suffix == ".csv":
+            import csv
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                row = next(reader, None)
+                if row:
+                    return list(row.keys()), row
+    except Exception as e:
+        st.error(f"Ошибка чтения файла: {e}")
+        return [], {}
+    
+    return [], {}
+
+
+def render_sft_main_config(data_path: str):
+    """Отображает конфигурацию SFT в основной области (не в сайдбаре)."""
+    st.markdown("### 🛠️ Настройка данных для SFT")
+    
+    # 1. Анализ файла
+    columns, sample = get_dataset_columns(data_path)
+    
+    col_preview, col_map = st.columns([1, 1])
+    
+    with col_preview:
+        st.caption(f"Файл: `{Path(data_path).name}`")
+        if sample:
+            st.markdown("**Пример записи:**")
+            st.json(sample, expanded=False)
+        else:
+            st.warning("Не удалось прочитать структуру файла")
+            
+    with col_map:
+        if columns:
+            st.markdown("**Маппинг колонок**")
+            # Пытаемся угадать колонки
+            def guess_idx(options, keywords):
+                for i, opt in enumerate(options):
+                    if any(k in opt.lower() for k in keywords):
+                        return i
+                return 0
+            
+            c_instr = st.selectbox("Instruction (Вопрос)", options=columns, index=guess_idx(columns, ["instruct", "question", "prompt", "input"]))
+            # Input опционален
+            c_input_opts = ["<Нет>"] + columns
+            c_input = st.selectbox("Input (Контекст)", options=c_input_opts, index=guess_idx(c_input_opts, ["context", "input"]) if "input" in columns else 0)
+            c_output = st.selectbox("Output (Ответ)", options=columns, index=guess_idx(columns, ["output", "answer", "response", "target"]))
+            
+            sft_columns = {
+                "instruction": c_instr,
+                "input": None if c_input == "<Нет>" else c_input,
+                "output": c_output
+            }
+        else:
+            # Fallback на ручной ввод
+            c_instr = st.text_input("Instruction Col", "instruction")
+            c_input = st.text_input("Input Col", "input")
+            c_output = st.text_input("Output Col", "output")
+            sft_columns = {"instruction": c_instr, "input": c_input, "output": c_output}
+
+    # 2. Шаблон чата
+    with st.expander("💬 Шаблон чата (Prompt Template)", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            system_prompt = st.text_area("System Prompt", "You are a helpful assistant.")
+            separator = st.text_input("Separator (между сообщениями)", value="\\n\\n")
+        with c2:
+            user_tag = st.text_input("User Tag", "### User:")
+            bot_tag = st.text_input("Assistant Tag", "### Assistant:")
+            
+            sft_template = {
+        "system": system_prompt,
+        "user_tag": user_tag,
+        "bot_tag": bot_tag,
+        "separator": separator.replace("\\n", "\n")
+    }
+    
+    # --- Предпросмотр промпта ---
+    if sample:
+        st.markdown("#### 👁️ Предпросмотр (Final Prompt)")
+        st.caption("Пример того, что увидит модель на входе (для одной записи):")
+        
+        try:
+            # Эмуляция логики из SFTDataset
+            instr_val = str(sample.get(c_instr, ""))
+            input_val = str(sample.get(c_input, "")) if c_input != "<Нет>" and c_input in sample else ""
+            output_val = str(sample.get(c_output, ""))
+            
+            tmpl = sft_template
+            sep = tmpl["separator"]
+            
+            # System
+            prompt_preview = f"{tmpl['system']}{sep}"
+            
+            # User
+            user_content = instr_val
+            if input_val:
+                user_content += f"\n{input_val}"
+            prompt_preview += f"{tmpl['user_tag']}\n{user_content}{sep}"
+            
+            # Assistant (Target)
+            prompt_preview += f"{tmpl['bot_tag']}\n{output_val}<|endoftext|>"
+            
+            st.code(prompt_preview, language="text")
+            
+        except Exception as e:
+            st.error(f"Ошибка генерации превью: {e}")
+    
+    return {
+        "sft_columns": sft_columns,
+        "sft_template": sft_template
+    }
+
+
+def get_dataset_columns(file_path: str):
+    """Анализирует файл и возвращает список колонок и пример данных."""
+    path = Path(file_path)
+    if not path.exists():
+        return [], {}
+        
+    try:
+        if path.suffix == ".jsonl":
+            with open(path, "r", encoding="utf-8") as f:
+                line = f.readline()
+                if line:
+                    data = json.loads(line)
+                    return list(data.keys()), data
+        elif path.suffix == ".json":
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list) and len(data) > 0:
+                    return list(data[0].keys()), data[0]
+                elif isinstance(data, dict):
+                    # Если это словарь колонок (HuggingFace format иногда)
+                    return list(data.keys()), {k: v[0] if isinstance(v, list) else v for k, v in data.items()}
+        elif path.suffix == ".csv":
+            import csv
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                row = next(reader, None)
+                if row:
+                    return list(row.keys()), row
+    except Exception as e:
+        st.error(f"Ошибка чтения файла: {e}")
+        return [], {}
+    
+    return [], {}
+
+
+def render_sft_main_config(data_path: str):
+    """Отображает конфигурацию SFT в основной области (не в сайдбаре)."""
+    st.markdown("### 🛠️ Настройка данных для SFT")
+    
+    # 1. Анализ файла
+    columns, sample = get_dataset_columns(data_path)
+    
+    col_preview, col_map = st.columns([1, 1])
+    
+    with col_preview:
+        st.caption(f"Файл: `{Path(data_path).name}`")
+        if sample:
+            st.markdown("**Пример записи:**")
+            st.json(sample, expanded=False)
+        else:
+            st.warning("Не удалось прочитать структуру файла")
+            
+    with col_map:
+        if columns:
+            st.markdown("**Маппинг колонок**")
+            # Пытаемся угадать колонки
+            def guess_idx(options, keywords):
+                for i, opt in enumerate(options):
+                    if any(k in opt.lower() for k in keywords):
+                        return i
+                return 0
+            
+            c_instr = st.selectbox("Instruction (Вопрос)", options=columns, index=guess_idx(columns, ["instruct", "question", "prompt", "input"]))
+            # Input опционален
+            c_input_opts = ["<Нет>"] + columns
+            c_input = st.selectbox("Input (Контекст)", options=c_input_opts, index=guess_idx(c_input_opts, ["context", "input"]) if "input" in columns else 0)
+            c_output = st.selectbox("Output (Ответ)", options=columns, index=guess_idx(columns, ["output", "answer", "response", "target"]))
+            
+            sft_columns = {
+                "instruction": c_instr,
+                "input": None if c_input == "<Нет>" else c_input,
+                "output": c_output
+            }
+        else:
+            # Fallback на ручной ввод
+            c_instr = st.text_input("Instruction Col", "instruction")
+            c_input = st.text_input("Input Col", "input")
+            c_output = st.text_input("Output Col", "output")
+            sft_columns = {"instruction": c_instr, "input": c_input, "output": c_output}
+
+    # 2. Шаблон чата
+    with st.expander("💬 Шаблон чата (Prompt Template)", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            system_prompt = st.text_area("System Prompt", "You are a helpful assistant.")
+            separator = st.text_input("Separator (между сообщениями)", value="\\n\\n")
+        with c2:
+            user_tag = st.text_input("User Tag", "### User:")
+            bot_tag = st.text_input("Assistant Tag", "### Assistant:")
+            
+            sft_template = {
+        "system": system_prompt,
+        "user_tag": user_tag,
+        "bot_tag": bot_tag,
+        "separator": separator.replace("\\n", "\n")
+    }
+    
+    # --- Предпросмотр промпта ---
+    if sample:
+        st.markdown("#### 👁️ Предпросмотр (Final Prompt)")
+        st.caption("Пример того, что увидит модель на входе (для одной записи):")
+        
+        try:
+            # Эмуляция логики из SFTDataset
+            instr_val = str(sample.get(c_instr, ""))
+            input_val = str(sample.get(c_input, "")) if c_input != "<Нет>" and c_input in sample else ""
+            output_val = str(sample.get(c_output, ""))
+            
+            tmpl = sft_template
+            sep = tmpl["separator"]
+            
+            # System
+            prompt_preview = f"{tmpl['system']}{sep}"
+            
+            # User
+            user_content = instr_val
+            if input_val:
+                user_content += f"\n{input_val}"
+            prompt_preview += f"{tmpl['user_tag']}\n{user_content}{sep}"
+            
+            # Assistant (Target)
+            prompt_preview += f"{tmpl['bot_tag']}\n{output_val}<|endoftext|>"
+            
+            st.code(prompt_preview, language="text")
+            
+        except Exception as e:
+            st.error(f"Ошибка генерации превью: {e}")
+    
+    return {
+        "sft_columns": sft_columns,
+        "sft_template": sft_template
+    }
+
+
 def render_model_config():
     """Конфигуратор модели в сайдбаре."""
-    st.sidebar.header("🧠 Архитектура модели")
+    st.sidebar.header("🧠 Архитектура и Режим")
+    
+    # Режим обучения
+    stage_options = {
+        "pretrain": "Pretraining (с нуля)",
+        "sft": "SFT (Fine-Tuning)"
+    }
+    selected_stage = st.sidebar.selectbox(
+        "Этап обучения",
+        options=list(stage_options.keys()),
+        format_func=lambda x: stage_options[x],
+        help="Выберите этап: обучение с нуля или дообучение существующей модели"
+    )
     
     # Имя модели (для папки эксперимента)
-    model_name = st.sidebar.text_input("Название эксперимента", value="my_first_model", help="Имя папки для сохранения")
+    model_name_default = "home_pretrain" if selected_stage == "pretrain" else "home_sft"
+    model_name = st.sidebar.text_input("Название эксперимента", value=model_name_default, help="Имя папки для сохранения")
     
+    base_model_path = None
+    
+    if selected_stage == "sft":
+        st.sidebar.subheader("📦 Базовая модель")
+        available = get_available_models()
+        if not available:
+            st.sidebar.warning("Нет доступных моделей для SFT. Сначала обучите Pretrain модель!")
+            # Можно дать возможность ввести путь вручную
+            base_model_path = st.sidebar.text_input("Путь к модели вручную", placeholder="/path/to/model")
+        else:
+            # Создаем список опций
+            model_options = [m["name"] for m in available]
+            selected_base_name = st.sidebar.selectbox("Выберите модель", options=model_options)
+            # Находим путь
+            base_model_path = next(m["path"] for m in available if m["name"] == selected_base_name)
+            
+            st.sidebar.caption(f"Путь: `{base_model_path}`")
+    
+    st.sidebar.subheader("⚙️ Параметры модели")
+    
+    # Дефолтные значения
+    d_hid, d_layers = 512, 8
+    
+    # Если SFT и модель загружена (в теории), можно было бы подтянуть конфиг.
+    # Но пока оставим ручной выбор/пресеты, чтобы пользователь видел, что происходит.
+    # В идеале при SFT эти параметры должны быть заблокированы и читаться из конфига модели.
+    # Но так как config.json читается только в worker-е, оставим возможность "угадать" или настроить.
+    # Для улучшения UX добавим подсказку.
+    if selected_stage == "sft":
+        st.sidebar.caption("⚠️ Убедитесь, что параметры совпадают с базовой моделью!")
+
     # Пресеты
     preset = st.sidebar.selectbox(
         "Пресет",
@@ -580,6 +892,8 @@ def render_model_config():
     st.sidebar.metric("Параметры (≈)", format_params(est_params))
     
     return {
+        "stage": selected_stage,
+        "base_model_path": base_model_path,
         "model_name_input": model_name,
         "hidden_size": hidden_size,
         "num_layers": num_layers,
@@ -675,8 +989,8 @@ def render_training_config():
     }
 
 
-def render_dataset_config():
-    """Выбор датасета."""
+def render_dataset_config(stage="pretrain"):
+    """Выбор датасета (только выбор файла)."""
     st.sidebar.header("📁 Датасет")
     
     datasets = get_available_datasets()
@@ -687,8 +1001,8 @@ def render_dataset_config():
         selected_name = selected.split(" (")[0]
         data_path = str(DATASET_DIR / selected_name)
     else:
-        st.sidebar.warning("Датасеты не найдены в dataset/")
-        data_path = st.sidebar.text_input("Путь к датасету", "dataset/data.jsonl")
+        st.sidebar.warning("Датасеты не найдены в datasets/")
+        data_path = st.sidebar.text_input("Путь к датасету", "datasets/data.jsonl")
     
     return {"data_path": data_path}
 
@@ -1175,7 +1489,33 @@ def render_data_manager():
         
         # Интерактивное состояние для репозитория
         if "ds_repo_info" not in st.session_state:
-            st.session_state.ds_repo_info = {} # {repo_id: {'configs': [], 'splits': [], 'features': {}}}
+            st.session_state.ds_repo_info = {} 
+
+        # Словарь пресетов
+        presets = {
+            "👇 Выберите из списка или введите вручную...": None,
+            "🟢 Pretrain: FineWeb-2 (Russian)": "HuggingFaceFW/fineweb-2",
+            "🟢 Pretrain: FineWeb-Edu (Educational)": "HuggingFaceFW/fineweb-edu",
+            "🟢 Pretrain: Wikitext-103": "wikitext",
+            "🔵 SFT: Alpaca (English)": "tatsu-lab/alpaca",
+            "🔵 SFT: OpenAssistant (Multilingual)": "OpenAssistant/oasst1",
+            "🔵 SFT: Dolly-15k (Instruct)": "databricks/databricks-dolly-15k",
+        }
+        def on_preset_change():
+            """Callback для обновления поля ввода при выборе пресета."""
+            sel = st.session_state.dataset_preset_selector
+            if presets.get(sel):
+                st.session_state.hf_repo_id_input = presets[sel]
+
+        # Селектор пресетов
+        st.selectbox(
+            "📚 Популярные датасеты",
+            options=list(presets.keys()),
+            index=0,
+            key="dataset_preset_selector",
+            on_change=on_preset_change,
+            help="Выберите готовый датасет для автоматического заполнения ID"
+        )
 
         repo_id = st.text_input("Репозиторий (ID)", value="HuggingFaceFW/fineweb-2", key="hf_repo_id_input")
         
@@ -1397,6 +1737,12 @@ def render_model_preview(config: dict, distributed_config: dict = None):
     """Превью архитектуры модели и настроек параллелизма."""
     st.subheader("📐 Архитектура модели")
     
+    stage = config.get("stage", "pretrain")
+    if stage == "sft":
+        st.info(f"🔄 **Режим SFT** (Fine-Tuning)\nБазовая модель: `{Path(config.get('base_model_path') or 'Unknown').name}`")
+    else:
+        st.success("🏗️ **Режим Pretraining** (С нуля)")
+
     params = estimate_parameters(config["hidden_size"], config["num_layers"])
     
     col1, col2, col3 = st.columns(3)
@@ -1552,7 +1898,10 @@ def main():
     
     training_config = render_training_config()
     distributed_config = render_distributed_config()
-    dataset_config = render_dataset_config()
+    
+    # Передаем stage в dataset_config
+    dataset_config = render_dataset_config(stage=model_config.get("stage", "pretrain"))
+    
     output_config = render_output_config(st.session_state.current_model_name)
     
     # Merge configs
@@ -1569,6 +1918,13 @@ def main():
         
         with col1:
             render_model_preview(model_config, distributed_config)
+            
+            # SFT Config (Main Area)
+            if model_config.get("stage") == "sft" and dataset_config.get("data_path"):
+                st.markdown("---")
+                # Вызываем функцию (даже если она дублирована, вызовется последняя определенная)
+                sft_cfg = render_sft_main_config(dataset_config["data_path"])
+                full_config.update(sft_cfg)
             
             st.subheader("📋 Конфигурация")
             st.json(full_config)
@@ -1856,7 +2212,30 @@ def main():
                                     model = st.session_state.chat_model
                                     device = next(model.parameters()).device
                                     
-                                    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+                                    # Формируем полный контекст
+                                    # Используем chat_template если он есть (для SFT моделей)
+                                    # Иначе просто склеиваем текст (для Pretrain моделей)
+                                    
+                                    # Берем историю + новое сообщение
+                                    conversation = st.session_state.messages # [{"role": "user", ...}, ...]
+                                    
+                                    if tokenizer.chat_template:
+                                        # Для SFT модели: применяем шаблон с тегами
+                                        prompt_text = tokenizer.apply_chat_template(
+                                            conversation, 
+                                            tokenize=False, 
+                                            add_generation_prompt=True
+                                        )
+                                    else:
+                                        # Для Base/Pretrain модели: просто текст
+                                        # Обычно Base модели не понимают диалог, но попробуем просто слать последний промпт
+                                        # или весь диалог текстом
+                                        prompt_text = ""
+                                        for m in conversation:
+                                            prompt_text += f"{m['role']}: {m['content']}\n"
+                                        prompt_text += "assistant: "
+                                    
+                                    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
                                     
                                     with torch.no_grad():
                                         outputs = model.generate(
@@ -1897,4 +2276,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
