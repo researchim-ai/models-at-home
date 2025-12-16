@@ -354,8 +354,21 @@ def load_metrics(run_id: str) -> dict:
 def start_training(config: dict) -> str:
     """Запустить тренировку в фоне."""
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = RUNS_DIR / run_id
+    
+    # ЛОГИКА ПУТЕЙ
+    # config["output_dir"] - это корень эксперимента (например out/my_model)
+    # Мы хотим сохранять чекпоинты в out/my_model/run_2023.../checkpoint_...
+    experiment_root = Path(PROJECT_ROOT) / config.get("output_dir", "out/default")
+    run_output_dir = experiment_root / run_id
+    
+    # Обновляем output_dir в конфиге, чтобы worker сохранял туда
+    config["output_dir"] = str(run_output_dir)
+    
+    # Папка для метаданных запуска (логи, метрики)
+    # Можно хранить их там же, где и чекпоинты, для удобства
+    run_dir = RUNS_DIR / run_id # Оставляем .runs для внутренних логов стримлита
     run_dir.mkdir(parents=True, exist_ok=True)
+    run_output_dir.mkdir(parents=True, exist_ok=True) # Создаем папку для весов
     
     config_path = run_dir / "config.json"
     metrics_path = run_dir / "metrics.json"
@@ -508,6 +521,9 @@ def render_model_config():
     """Конфигуратор модели в сайдбаре."""
     st.sidebar.header("🧠 Архитектура модели")
     
+    # Имя модели (для папки эксперимента)
+    model_name = st.sidebar.text_input("Название эксперимента", value="my_first_model", help="Имя папки для сохранения")
+    
     # Пресеты
     preset = st.sidebar.selectbox(
         "Пресет",
@@ -564,6 +580,7 @@ def render_model_config():
     st.sidebar.metric("Параметры (≈)", format_params(est_params))
     
     return {
+        "model_name_input": model_name,
         "hidden_size": hidden_size,
         "num_layers": num_layers,
         "n_heads": n_heads,
@@ -676,13 +693,17 @@ def render_dataset_config():
     return {"data_path": data_path}
 
 
-def render_output_config():
+def render_output_config(model_name="training_run"):
     """Конфигурация вывода."""
     st.sidebar.header("💾 Сохранение")
     
+    # Автоматический путь: out/{model_name}
+    default_dir = f"out/{model_name}"
+    
     output_dir = st.sidebar.text_input(
-        "Output Directory",
-        value="out/training_run"
+        "Output Directory (Experiment Root)",
+        value=default_dir,
+        help="Корневая папка для всех запусков этого эксперимента"
     )
     
     save_every = st.sidebar.number_input(
@@ -883,7 +904,8 @@ def live_metrics_fragment():
         st.success(f"🟢 Процесс запущен (Run: {run_id})")
     else:
         if metrics and metrics.get("status") == "completed":
-            st.success(f"✅ Тренировка завершена (Run: {run_id})")
+            duration = metrics.get("training_duration", "unknown")
+            st.success(f"✅ Тренировка завершена за {duration} (Run: {run_id})")
         elif metrics and metrics.get("status") == "error":
             st.error(f"❌ Ошибка (Run: {run_id})")
         elif metrics and metrics.get("status") == "stopped":
@@ -1517,10 +1539,12 @@ def main():
     
     # Sidebar configs
     model_config = render_model_config()
+    st.session_state.current_model_name = model_config.get("model_name_input", "home_model")
+    
     training_config = render_training_config()
     distributed_config = render_distributed_config()
     dataset_config = render_dataset_config()
-    output_config = render_output_config()
+    output_config = render_output_config(st.session_state.current_model_name)
     
     # Merge configs
     full_config = {**model_config, **training_config, **dataset_config, **output_config}
@@ -1572,7 +1596,7 @@ def main():
         # Используем fragment для автоматического обновления без перезагрузки страницы
         live_metrics_fragment()
     
-    with tab3:
+    with tab4:
         st.header("📜 История запусков")
         st.markdown("---")
         
@@ -1588,13 +1612,15 @@ def main():
                     status_emoji = {"training": "🟢", "completed": "✅", "error": "❌", "stopped": "⏹️"}.get(status, "⏳")
                     
                     with st.expander(f"{status_emoji} {run_id}"):
-                        col1, col2, col3 = st.columns(3)
+                        col1, col2, col3, col4 = st.columns(4)
                         with col1:
                             st.metric("Steps", metrics.get("current_step", 0))
                         with col2:
                             st.metric("Final Loss", f"{metrics.get('current_loss', 0):.4f}")
                         with col3:
                             st.metric("Status", status)
+                        with col4:
+                            st.metric("Duration", metrics.get("training_duration", "-"))
                         
                         # Чекпоинты этого запуска
                         checkpoints = metrics.get("checkpoints", [])
@@ -1641,7 +1667,7 @@ def main():
     with tab6:
         render_docs()
     
-    with tab4:
+    with tab3:
         st.header("💬 Чат с моделью")
         st.markdown("---")
         
@@ -1793,49 +1819,56 @@ def main():
             else:
                 st.success(f"✅ Модель загружена: {selected_model_name}")
                 
-                # Показываем историю чата
-                for message in st.session_state.messages:
-                    with st.chat_message(message["role"]):
-                        st.write(message["content"])
+                # --- ИНТЕРФЕЙС ЧАТА С ФИКСИРОВАННЫМ СКРОЛЛОМ ---
+                chat_container = st.container(height=500) # Прокручиваемый контейнер
                 
-                # Ввод пользователя
+                with chat_container:
+                    # Показываем историю чата
+                    for message in st.session_state.messages:
+                        with st.chat_message(message["role"]):
+                            st.write(message["content"])
+                
+                # Ввод пользователя (всегда внизу)
                 if prompt := st.chat_input("Введите сообщение..."):
                     # Добавляем сообщение пользователя
                     st.session_state.messages.append({"role": "user", "content": prompt})
                     
-                    with st.chat_message("user"):
-                        st.write(prompt)
+                    # Обновляем контейнер (показываем сообщение юзера сразу)
+                    with chat_container:
+                        with st.chat_message("user"):
+                            st.write(prompt)
                     
                     # Генерируем ответ
-                    with st.chat_message("assistant"):
-                        with st.spinner("Генерация..."):
-                            try:
-                                tokenizer = st.session_state.chat_tokenizer
-                                model = st.session_state.chat_model
-                                device = next(model.parameters()).device
-                                
-                                inputs = tokenizer(prompt, return_tensors="pt").to(device)
-                                
-                                with torch.no_grad():
-                                    outputs = model.generate(
-                                        **inputs,
-                                        max_new_tokens=max_tokens,
-                                        temperature=temperature,
-                                        top_p=top_p,
-                                        do_sample=True,
-                                        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-                                        use_cache=False,  # Отключаем KV-cache для совместимости
+                    with chat_container: # Ответ тоже пишем в контейнер
+                        with st.chat_message("assistant"):
+                            with st.spinner("Генерация..."):
+                                try:
+                                    tokenizer = st.session_state.chat_tokenizer
+                                    model = st.session_state.chat_model
+                                    device = next(model.parameters()).device
+                                    
+                                    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+                                    
+                                    with torch.no_grad():
+                                        outputs = model.generate(
+                                            **inputs,
+                                            max_new_tokens=max_tokens,
+                                            temperature=temperature,
+                                            top_p=top_p,
+                                            do_sample=True,
+                                            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                                            use_cache=False,  # Отключаем KV-cache для совместимости
+                                        )
+                                    
+                                    response = tokenizer.decode(
+                                        outputs[0][inputs["input_ids"].shape[1]:], 
+                                        skip_special_tokens=True
                                     )
-                                
-                                response = tokenizer.decode(
-                                    outputs[0][inputs["input_ids"].shape[1]:], 
-                                    skip_special_tokens=True
-                                )
-                                
-                                st.write(response)
-                                st.session_state.messages.append({"role": "assistant", "content": response})
-                            except Exception as e:
-                                st.error(f"Ошибка генерации: {e}")
+                                    
+                                    st.write(response)
+                                    st.session_state.messages.append({"role": "assistant", "content": response})
+                                except Exception as e:
+                                    st.error(f"Ошибка генерации: {e}")
                 
                 # Кнопка очистки чата
                 if st.session_state.messages:

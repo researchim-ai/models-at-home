@@ -301,9 +301,16 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         tokenizer.save_pretrained(final_dir)
         
         total_time = time.time() - start_time
+        
+        # Форматируем время (чч:мм:сс)
+        hours, rem = divmod(total_time, 3600)
+        minutes, seconds = divmod(rem, 60)
+        duration_str = "{:0>2}:{:0>2}:{:05.2f}".format(int(hours), int(minutes), seconds)
+        
         metrics.update(
             status="completed",
             total_time_seconds=total_time,
+            training_duration=duration_str,
             final_model_path=str(final_dir)
         )
         
