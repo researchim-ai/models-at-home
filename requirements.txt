@@ -17,6 +17,8 @@ ninja
 # Утилиты
 tqdm>=4.66.0
 numpy>=1.24.0
+pandas>=2.0.0
+psutil>=5.9.0
 
 # Визуальное приложение (Training Studio)
 streamlit>=1.32.0

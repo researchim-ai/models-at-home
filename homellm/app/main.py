@@ -1188,14 +1188,17 @@ def render_data_manager():
                 filter_lang = st.text_input("Язык (rus)", value="rus", key="filter_lang")
                 filter_score = st.slider("Мин. score", 0.0, 1.0, 0.0, key="filter_score")
             with col2:
-                limit_type = st.radio("Лимит", ["Строки", "ГБ"], key="limit_type")
-                if limit_type == "Строки":
-                    limit_val = st.number_input("Кол-во", value=10000, key="limit_val")
-                    limit_bytes = 0
+                # По умолчанию - лимит в ГБ
+                limit_type = st.radio("Тип лимита", ["ГБ (Размер)", "Строки (Количество)"], key="limit_type")
+                
+                limit_val = 0
+                limit_bytes = 0
+                
+                if limit_type == "Строки (Количество)":
+                    limit_val = st.number_input("Кол-во строк", value=100000, step=10000, key="limit_val")
                 else:
-                    limit_gb = st.number_input("ГБ", value=0.1, step=0.1, key="limit_gb")
+                    limit_gb = st.number_input("Размер (ГБ)", value=2.0, step=0.5, min_value=0.1, key="limit_gb")
                     limit_bytes = int(limit_gb * 1024**3)
-                    limit_val = 0
         
         st.text_input("Имя файла", key="hf_filename", placeholder="dataset.jsonl")
         
