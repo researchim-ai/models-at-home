@@ -743,31 +743,40 @@ def render_output_config(model_name="training_run"):
 
 
 def get_available_models():
-    """Получить список доступных обученных моделей."""
+    """Получить список доступных обученных моделей (рекурсивный поиск)."""
     models = []
     
-    # Ищем в out/
+    # Ищем рекурсивно в out/
     if OUTPUT_DIR.exists():
-        for model_dir in OUTPUT_DIR.iterdir():
-            if model_dir.is_dir():
-                # Проверяем есть ли final_model
-                final_model = model_dir / "final_model"
-                if final_model.exists() and (final_model / "config.json").exists():
-                    models.append({
-                        "name": f"{model_dir.name}/final_model",
-                        "path": str(final_model),
-                        "type": "final",
-                    })
+        # Ищем любые config.json внутри out/
+        for config_file in OUTPUT_DIR.rglob("config.json"):
+            model_dir = config_file.parent
+            
+            # Игнорируем папки, которые не похожи на модели (например, логи)
+            # Критерий модели: наличие config.json + (pytorch_model.bin или model.safetensors или adapter_model.bin)
+            has_weights = (
+                (model_dir / "pytorch_model.bin").exists() or 
+                (model_dir / "model.safetensors").exists() or
+                (model_dir / "adapter_model.bin").exists()
+            )
+            
+            if has_weights:
+                # Определяем тип (final или checkpoint)
+                m_type = "checkpoint" if "checkpoint" in model_dir.name else "final"
+                if model_dir.name == "final_model": m_type = "final"
                 
-                # Ищем чекпоинты
-                for ckpt in sorted(model_dir.glob("checkpoint_*"), reverse=True):
-                    if ckpt.is_dir():
-                        models.append({
-                            "name": f"{model_dir.name}/{ckpt.name}",
-                            "path": str(ckpt),
-                            "type": "checkpoint",
-                        })
+                # Формируем красивое имя
+                # Берем путь относительно OUTPUT_DIR
+                rel_path = model_dir.relative_to(OUTPUT_DIR)
+                models.append({
+                    "name": str(rel_path),
+                    "path": str(model_dir),
+                    "type": m_type,
+                    "time": model_dir.stat().st_mtime
+                })
     
+    # Сортируем по времени (новые сверху)
+    models.sort(key=lambda x: x["time"], reverse=True)
     return models
 
 
@@ -984,7 +993,7 @@ def render_metrics_dashboard(metrics: dict):
                 height=300,
                 margin=dict(l=0, r=0, t=40, b=0)
             )
-            st.plotly_chart(fig_loss, width="stretch")
+            st.plotly_chart(fig_loss, use_container_width=True, key=f"loss_chart_{metrics.get('current_step')}")
         
         with col2:
             # LR chart
@@ -1004,7 +1013,7 @@ def render_metrics_dashboard(metrics: dict):
                 height=300,
                 margin=dict(l=0, r=0, t=40, b=0)
             )
-            st.plotly_chart(fig_lr, width="stretch")
+            st.plotly_chart(fig_lr, use_container_width=True, key=f"lr_chart_{metrics.get('current_step')}")
     
     # Checkpoints
     if metrics.get("checkpoints"):
