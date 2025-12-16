@@ -22,7 +22,11 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import pandas as pd
 import torch
-from datasets import load_dataset  # Добавляем импорт
+from datasets import load_dataset, get_dataset_config_names, get_dataset_split_names, load_dataset_builder  # Добавляем импорт
+try:
+    from .docs import render_docs
+except ImportError:
+    from docs import render_docs
 
 # Пути
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -1040,107 +1044,74 @@ def render_metrics_dashboard(metrics: dict):
 
 
 
-def download_hf_dataset(repo_id, subset, split, limit_val, limit_bytes, filter_lang, filter_score, filename):
-    """Функция скачивания датасета (выполняется при нажатии кнопки)."""
-    st.info(f"Начинаем скачивание: {repo_id}...")
-    
-    target_filename = filename if filename else f"{repo_id.split('/')[-1]}_{split}.jsonl"
-    if not target_filename.endswith('.jsonl'):
-        target_filename += '.jsonl'
-    
-    save_path = DATASET_DIR / target_filename
-    
-    status_text = st.empty()
-    progress_bar = st.progress(0)
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
-    
+def download_hf_dataset(repo_id, subset, split, limit_type, limit_val, limit_bytes, save_path, filters=None):
+    """Функция скачивания и сохранения датасета."""
     try:
-        status_text.info(f"Подключение к {repo_id}...")
+        status_text = f"Начинаем скачивание: {repo_id}..."
+        st.toast(status_text)
+        print(status_text)
         
-        # Обработка имени конфига
-        config_name = subset if subset and subset != "default" else None
+        # Параметры stream=True чтобы не качать все в память
+        ds = load_dataset(repo_id, subset, split=split, streaming=True)
         
-        # Пробуем загрузить
-        try:
-            ds = load_dataset(
-                repo_id, 
-                name=config_name, 
-                split=split, 
-                streaming=True,
-                trust_remote_code=True
-            )
-        except ValueError as e:
-            if "BuilderConfig" in str(e) and "not found" in str(e):
-                # Пытаемся распарсить доступные конфиги из сообщения об ошибке
-                import re
-                match = re.search(r"Available: \[(.*?)\]", str(e))
-                if match:
-                    available = match.group(1).replace("'", "")
-                    # Показываем подсказку
-                    st.error(f"Конфиг '{subset}' не найден! Доступные конфиги (скопируйте нужный в поле Subset):")
-                    st.code(available, language=None)
-                    # Если есть rus_Cyrl, подсказываем его
-                    if "rus_Cyrl" in available:
-                        st.info("💡 Для русского языка попробуйте Subset: **rus_Cyrl**")
-                    return
-            raise e
-        
-        status_text.info(f"Скачивание в {target_filename}...")
+        # Создаем файл
+        save_path = DATASET_DIR / save_path
+        save_path.parent.mkdir(exist_ok=True)
         
         count = 0
         current_bytes = 0
-        skipped_count = 0
-        
-        # Проверяем первый элемент
-        iterator = iter(ds)
-        try:
-            first_item = next(iterator)
-            items_to_process = [first_item]
-        except StopIteration:
-            st.error("Датасет пуст!")
-            return
         
         with open(save_path, "w", encoding="utf-8") as f:
-            import itertools
-            for item in itertools.chain(items_to_process, iterator):
-                # 1. Фильтрация
-                if filter_lang:
-                    item_lang = item.get("language")
-                    if item_lang and filter_lang.lower() not in item_lang.lower():
-                        skipped_count += 1
-                        continue
-                
-                if filter_score > 0:
-                    item_score = item.get("language_score")
-                    if item_score is not None and float(item_score) < filter_score:
-                        skipped_count += 1
-                        continue
-                
-                # 2. Извлечение текста
-                text = item.get("text") or item.get("content") or item.get("body")
-                
-                if text:
-                    row_data = json.dumps({"text": text}, ensure_ascii=False)
-                    row_bytes = len(row_data.encode('utf-8')) + 1
+            for item in ds:
+                # Применение фильтров
+                if filters:
+                    # Фильтр по score
+                    if "score_col" in filters and "min_score" in filters:
+                         col = filters["score_col"]
+                         min_s = filters["min_score"]
+                         # Проверяем наличие колонки и типа
+                         if col in item and item[col] is not None:
+                             try:
+                                 val = float(item[col])
+                                 if val < min_s:
+                                     continue
+                             except ValueError:
+                                 pass
                     
-                    f.write(row_data + "\n")
+                    # Фильтр по языку
+                    if "lang_col" in filters and "target_lang" in filters:
+                         col = filters["lang_col"]
+                         target = filters["target_lang"]
+                         if col in item and item[col] is not None:
+                             val = str(item[col])
+                             if target.lower() not in val.lower():
+                                 continue
+                
+                # Сохраняем как JSONL
+                line = json.dumps(item, ensure_ascii=False) + "\n"
+                line_bytes = len(line.encode('utf-8'))
+                
+                # Проверка лимитов
+                if limit_type == "Строки (Количество)" and count >= limit_val:
+                    break
+                if limit_type == "ГБ (Размер)" and (current_bytes + line_bytes) > limit_bytes:
+                    break
                     
-                    count += 1
-                    current_bytes += row_bytes
-                    
-                    if count % 100 == 0:
-                        status_text.text(f"Скачано: {count} | {current_bytes / 1024**2:.1f} MB")
-                        if limit_val > 0 and count >= limit_val:
-                            break
-                        if limit_bytes > 0 and current_bytes >= limit_bytes:
-                            break
-        
-        status_text.success(f"✅ Готово! Сохранено в {target_filename}")
-        time.sleep(2)
-        st.rerun()
-        
+                f.write(line)
+                count += 1
+                current_bytes += line_bytes
+                
+                if count % 1000 == 0:
+                    print(f"Downloaded {count} lines, {current_bytes / 1024**2:.2f} MB")
+
+        st.success(f"Готово! Сохранено {count} строк ({current_bytes / 1024**2:.2f} MB) в {save_path}")
+        return True
+
     except Exception as e:
         st.error(f"Ошибка: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return False
 
 
 def render_data_manager():
@@ -1171,26 +1142,67 @@ def render_data_manager():
         # Секция 2: Загрузка с HuggingFace
         st.subheader("🤗 Скачать с HuggingFace")
         
-        # Используем session_state для хранения значений формы
-        if "hf_repo_id" not in st.session_state: st.session_state.hf_repo_id = "HuggingFaceFW/fineweb-2"
-        if "hf_subset" not in st.session_state: st.session_state.hf_subset = "default"
-        if "hf_split" not in st.session_state: st.session_state.hf_split = "train"
-        if "hf_filename" not in st.session_state: st.session_state.hf_filename = ""
+        # Интерактивное состояние для репозитория
+        if "ds_repo_info" not in st.session_state:
+            st.session_state.ds_repo_info = {} # {repo_id: {'configs': [], 'splits': [], 'features': {}}}
+
+        repo_id = st.text_input("Репозиторий (ID)", value="HuggingFaceFW/fineweb-2", key="hf_repo_id_input")
         
-        # Инпуты обновляют session_state
-        st.text_input("Репозиторий (ID)", key="hf_repo_id", help="Например: HuggingFaceFW/fineweb-2")
-        st.text_input("Subset (конфиг)", key="hf_subset", help="Например: rus_Cyrl (для русского) или default. Если ошибка 'Config not found', смотрите список доступных в ошибке.")
-        st.text_input("Split", key="hf_split")
+        # Кнопка проверки репозитория
+        if st.button("🔍 Проверить репозиторий"):
+            try:
+                with st.spinner(f"Анализируем {repo_id}..."):
+                    # 1. Получаем конфиги
+                    configs = get_dataset_config_names(repo_id)
+                    
+                    # 2. Получаем сплиты (берем первый конфиг по дефолту)
+                    default_config = configs[0] if configs else None
+                    splits = []
+                    features_info = {}
+                    
+                    if default_config:
+                        splits = get_dataset_split_names(repo_id, default_config)
+                        # 3. Пытаемся получить информацию о структуре (features)
+                        try:
+                            ds_builder = load_dataset_builder(repo_id, default_config)
+                            if ds_builder.info.features:
+                                features_info = ds_builder.info.features
+                        except Exception as e:
+                            print(f"Could not load features: {e}")
+
+                    st.session_state.ds_repo_info[repo_id] = {
+                        "configs": configs,
+                        "splits": splits,
+                        "features": features_info
+                    }
+                    st.success(f"Найдено {len(configs)} конфигураций")
+            except Exception as e:
+                st.error(f"Не удалось получить информацию: {e}")
+
+        # Работаем с кэшированной информацией
+        repo_info = st.session_state.ds_repo_info.get(repo_id, {})
+        available_configs = repo_info.get("configs", [])
+        available_splits = repo_info.get("splits", [])
+        features = repo_info.get("features", {})
         
+        if available_configs:
+            subset = st.selectbox("Subset (конфиг)", available_configs, key="hf_subset_select")
+        else:
+            subset = st.text_input("Subset (конфиг)", "default", key="hf_subset_input")
+        
+        if available_splits:
+             split = st.selectbox("Split", available_splits, key="hf_split_select")
+        else:
+             split = st.text_input("Split", "train", key="hf_split_input")
+
+        # --- УМНЫЕ ФИЛЬТРЫ ---
         with st.expander("🛠️ Фильтры и Лимиты", expanded=True):
-            col1, col2 = st.columns(2)
-            with col1:
-                filter_lang = st.text_input("Язык (rus)", value="rus", key="filter_lang")
-                filter_score = st.slider("Мин. score", 0.0, 1.0, 0.0, key="filter_score")
-            with col2:
-                # По умолчанию - лимит в ГБ
+            # Лимиты (всегда доступны)
+            col_lim1, col_lim2 = st.columns(2)
+            with col_lim1:
                 limit_type = st.radio("Тип лимита", ["ГБ (Размер)", "Строки (Количество)"], key="limit_type")
-                
+            
+            with col_lim2:
                 limit_val = 0
                 limit_bytes = 0
                 
@@ -1199,24 +1211,106 @@ def render_data_manager():
                 else:
                     limit_gb = st.number_input("Размер (ГБ)", value=2.0, step=0.5, min_value=0.1, key="limit_gb")
                     limit_bytes = int(limit_gb * 1024**3)
-        
-        st.text_input("Имя файла", key="hf_filename", placeholder="dataset.jsonl")
-        
-        # Кнопка запускает функцию
-        if st.button("🚀 Скачать", type="primary"):
-            if not st.session_state.hf_repo_id:
-                st.error("Укажите ID репозитория!")
+            
+            st.divider()
+            
+            # Фильтры на основе структуры (features)
+            active_filters = {}
+            
+            if features:
+                st.caption("🔍 Настройка фильтров по колонкам:")
+                
+                # Получаем список колонок и их типов
+                # features это словарь {col_name: feature_info}
+                # feature_info может быть строкой 'Value(dtype='string')' или объектом
+                
+                # 1. Фильтр числовой (Score/Quality)
+                float_cols = []
+                string_cols = []
+                
+                for col_name, feature_def in features.items():
+                    # Пытаемся определить тип
+                    dtype = getattr(feature_def, 'dtype', str(feature_def))
+                    if 'float' in str(dtype):
+                        float_cols.append(col_name)
+                    elif 'string' in str(dtype):
+                        string_cols.append(col_name)
+                
+                col_f1, col_f2 = st.columns(2)
+                
+                with col_f1:
+                    if float_cols:
+                        st.markdown("**Фильтр по значению (float)**")
+                        selected_float_col = st.selectbox("Выберите колонку", ["(нет)"] + float_cols, key="sel_float_col")
+                        if selected_float_col != "(нет)":
+                            min_val = st.slider(f"Мин. значение {selected_float_col}", 0.0, 1.0, 0.0, key="val_float_col")
+                            active_filters["score_col"] = selected_float_col
+                            active_filters["min_score"] = min_val
+                    else:
+                        st.caption("Числовые колонки не найдены")
+
+                with col_f2:
+                    if string_cols:
+                        st.markdown("**Фильтр по тексту (contains)**")
+                        selected_str_col = st.selectbox("Выберите колонку", ["(нет)"] + string_cols, key="sel_str_col")
+                        if selected_str_col != "(нет)":
+                            target_str = st.text_input(f"Текст должен содержать:", key="val_str_col")
+                            if target_str:
+                                active_filters["lang_col"] = selected_str_col
+                                active_filters["target_lang"] = target_str
+                    else:
+                        st.caption("Текстовые колонки не найдены")
+
             else:
-                download_hf_dataset(
-                    st.session_state.hf_repo_id,
-                    st.session_state.hf_subset,
-                    st.session_state.hf_split,
-                    limit_val,
-                    limit_bytes,
-                    filter_lang,
-                    filter_score,
-                    st.session_state.hf_filename
-                )
+                st.info("⚠️ Структура датасета не загружена. Доступны только лимиты по объему.")
+
+
+        save_filename = st.text_input("Имя файла для сохранения", "dataset.jsonl", key="save_filename")
+        
+        # Кнопка скачивания с использованием callback
+        def on_download_click(active_filters_map):
+            # Получаем значения из session_state явно
+            r_id = st.session_state.get('hf_repo_id_input')
+            
+            # Определяем subset и split
+            if st.session_state.get('hf_subset_select'):
+                sub = st.session_state.get('hf_subset_select')
+            else:
+                sub = st.session_state.get('hf_subset_input')
+                
+            if st.session_state.get('hf_split_select'):
+                spl = st.session_state.get('hf_split_select')
+            else:
+                spl = st.session_state.get('hf_split_input')
+                
+            l_type = st.session_state.get('limit_type')
+            l_val = st.session_state.get('limit_val')
+            
+            l_gb = st.session_state.get('limit_gb', 2.0)
+            l_bytes = int(l_gb * 1024**3)
+
+            s_path = st.session_state.get('save_filename')
+            
+            # Собираем фильтры
+            filters_to_pass = {}
+            
+            # 1. Динамические фильтры
+            if active_filters_map:
+                if "score_col" in active_filters_map:
+                    filters_to_pass["score_col"] = active_filters_map["score_col"]
+                    filters_to_pass["min_score"] = st.session_state.get("filter_score", 0.0)
+                
+                if "lang_col" in active_filters_map:
+                    filters_to_pass["lang_col"] = active_filters_map["lang_col"]
+                    filters_to_pass["target_lang"] = st.session_state.get("filter_lang", "ru")
+            
+            # 2. Фолбэк для FineWeb (удален, так как вызывал путаницу)
+            # elif "fineweb" in r_id.lower():
+            #      pass
+            
+            download_hf_dataset(r_id, sub, spl, l_type, l_val, l_bytes, s_path, filters=filters_to_pass)
+
+        st.button("Скачать и обработать", on_click=on_download_click, args=(active_filters,))
     
     with col_list:
         st.subheader("Доступные датасеты")
@@ -1435,7 +1529,7 @@ def main():
     full_config["config_file"] = distributed_config["config_file"]
     
     # Main content
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🚀 Запуск", "📊 Мониторинг", "💬 Чат", "📜 История", "💾 Данные"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🚀 Запуск", "📊 Мониторинг", "💬 Чат", "📜 История", "💾 Данные", "📚 Учебник"])
     
     with tab1:
         col1, col2 = st.columns([2, 1])
@@ -1543,6 +1637,9 @@ def main():
         # Подсказка про чат
         st.markdown("---")
         st.info("💡 Чтобы пообщаться с моделью, перейдите на вкладку **💬 Чат** (в верхней части страницы)")
+
+    with tab6:
+        render_docs()
     
     with tab4:
         st.header("💬 Чат с моделью")
