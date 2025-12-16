@@ -2,7 +2,7 @@
 
 **Models at Home** — это open-source студия для тренировки и дообучения больших языковых моделей (LLM) в домашних условиях. Проект создан, чтобы сделать технологии Deep Learning доступными для каждого.
 
-![Screenshot](https://via.placeholder.com/800x400?text=Models+at+Home+Screenshot)
+![Screenshot](src/models-at-home.png)
 
 ## ✨ Возможности
 
