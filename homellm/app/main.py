@@ -908,7 +908,7 @@ def render_sft_main_config(data_path: str):
                 
                 preview = f"{sys_val}{sep}{user_tag}\n{user_val}{sep}{assistant_tag}\n{asst_val}<|endoftext|>"
             
-            with st.container(height=180):
+            with st.container(height=400):
                 st.code(preview, language=None)
             
             st.success("✅ Готово!")

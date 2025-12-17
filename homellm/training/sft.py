@@ -1,4 +1,5 @@
 import json
+import re
 import torch
 from torch.utils.data import IterableDataset
 from transformers import PreTrainedTokenizer
@@ -6,6 +7,7 @@ from transformers import PreTrainedTokenizer
 class SFTDataset(IterableDataset):
     """
     Датасет для Supervised Fine-Tuning с гибкой настройкой.
+    Поддерживает Chat и Instruct форматы.
     """
     def __init__(self, file_path: str, tokenizer: PreTrainedTokenizer, seq_len: int = 2048, 
                  sft_columns=None, sft_template=None):
@@ -14,9 +16,9 @@ class SFTDataset(IterableDataset):
         self.seq_len = seq_len
         
         # Дефолтные настройки
-        self.cols = sft_columns or {"format": "alpaca", "instruction": "instruction", "input": "input", "output": "output"}
+        self.cols = sft_columns or {"format": "instruct", "instruction": "instruction", "output": "output"}
         self.tmpl = sft_template or {
-            "system": "",
+            "system": "You are a helpful assistant.",
             "user_tag": "### User:",
             "bot_tag": "### Assistant:",
             "separator": "\n\n"
@@ -27,9 +29,17 @@ class SFTDataset(IterableDataset):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def _get_nested(self, data: dict, path: str):
-        """Получить значение из вложенного словаря по пути 'key.subkey'."""
+        """Получить значение из вложенного словаря по пути.
+        
+        Поддерживает:
+        - 'key.subkey' - вложенные словари
+        - 'messages [список из N эл.]' - списки (убирает суффикс)
+        """
         if not path:
             return None
+        
+        # Убираем суффиксы типа " [список из 3 эл.]"
+        path = re.sub(r' \[список.*?\]$', '', path)
         
         keys = path.split('.')
         curr = data
@@ -37,6 +47,8 @@ class SFTDataset(IterableDataset):
             for k in keys:
                 if isinstance(curr, dict):
                     curr = curr.get(k)
+                elif isinstance(curr, list) and k.isdigit():
+                    curr = curr[int(k)]
                 else:
                     return None
                 
@@ -60,71 +72,91 @@ class SFTDataset(IterableDataset):
                     data = json.loads(line)
                     text = ""
                     
-                    # Определяем формат: Chat или Alpaca
-                    fmt = self.cols.get("format", "alpaca")
+                    # Определяем формат
+                    fmt = self.cols.get("format", "instruct")
                     
                     # 1. Chat Format (Messages List)
                     if fmt == "chat":
-                        msg_col = self.cols.get("messages", "messages")
-                        msgs = self._get_nested(data, msg_col)
+                        # Получаем путь к списку сообщений
+                        msg_path = self.cols.get("messages_path") or self.cols.get("messages", "messages")
+                        msgs = self._get_nested(data, msg_path)
                         
-                        if msgs:
-                            # Если messages это строка с JSON, парсим её
-                            if isinstance(msgs, str):
-                                try:
-                                    msgs = json.loads(msgs)
-                                except:
-                                    continue # Skip broken JSON
+                        if not msgs:
+                            continue
+                        
+                        # Если messages это строка с JSON, парсим её
+                        if isinstance(msgs, str):
+                            try:
+                                msgs = json.loads(msgs)
+                            except:
+                                continue
+                        
+                        if not isinstance(msgs, list) or not msgs:
+                            continue
+                        
+                        # Получаем настройки маппинга полей
+                        role_field = self.cols.get("role_field", "role")
+                        content_field = self.cols.get("content_field", "content")
+                        role_system = self.cols.get("role_system", "system")
+                        role_user = self.cols.get("role_user", "user")
+                        role_assistant = self.cols.get("role_assistant", "assistant")
+                        
+                        # Формируем текст
+                        sys_text = self.tmpl.get("system", "")
+                        user_texts = []
+                        assistant_texts = []
+                        
+                        for m in msgs:
+                            if not isinstance(m, dict):
+                                continue
+                            role = str(m.get(role_field, ""))
+                            content = str(m.get(content_field, ""))
                             
-                            if isinstance(msgs, list):
-                                if self.tokenizer.chat_template:
-                                    text = self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
-                                else:
-                                    # Fallback на простой формат
-                                    text = self.tmpl["system"] + self.tmpl["separator"]
-                                    for m in msgs:
-                                        role = m.get("role")
-                                        content = m.get("content")
-                                        if role == "user":
-                                            text += f"{self.tmpl['user_tag']}\n{content}{self.tmpl['separator']}"
-                                        elif role == "assistant":
-                                            text += f"{self.tmpl['bot_tag']}\n{content}{self.tmpl['separator']}"
-                                        elif role == "system":
-                                            text = f"{content}{self.tmpl['separator']}" + text
+                            if role == role_system:
+                                sys_text = content
+                            elif role == role_user:
+                                user_texts.append(content)
+                            elif role == role_assistant:
+                                assistant_texts.append(content)
+                        
+                        if not user_texts and not assistant_texts:
+                            continue
+                        
+                        # Строим промпт
+                        sep = self.tmpl.get("separator", "\n\n")
+                        text = f"{sys_text}{sep}" if sys_text else ""
+                        
+                        # Чередуем user/assistant
+                        for i in range(max(len(user_texts), len(assistant_texts))):
+                            if i < len(user_texts):
+                                text += f"{self.tmpl['user_tag']}\n{user_texts[i]}{sep}"
+                            if i < len(assistant_texts):
+                                text += f"{self.tmpl['bot_tag']}\n{assistant_texts[i]}{sep}"
+                        
+                        text = text.rstrip(sep) + self.tokenizer.eos_token
                     
-                    # 2. Alpaca Format (Columns)
+                    # 2. Instruct Format (отдельные поля)
                     else:
                         instr = self._get_nested(data, self.cols.get("instruction", "instruction")) or ""
-                        inp = self._get_nested(data, self.cols.get("input", "input")) or ""
                         out = self._get_nested(data, self.cols.get("output", "output")) or ""
                         
-                        # System Prompt: может быть задан в данных или статически в шаблоне
+                        # System Prompt
                         sys_field = self.cols.get("system_field")
-                        sys_val = self.tmpl["system"]
+                        sys_val = self.tmpl.get("system", "")
                         if sys_field:
-                            # Если поле есть в данных, берем оттуда
                             val_in_data = self._get_nested(data, sys_field)
                             if val_in_data:
                                 sys_val = str(val_in_data)
                         
                         if not instr and not out:
                             continue
-                            
-                        # Формируем промпт вручную
-                        # System -> User (Instr + Input) -> Bot (Output)
                         
-                        prompt = f"{sys_val}{self.tmpl['separator']}"
-                        
-                        user_content = str(instr)
-                        if inp:
-                            user_content += f"\n{inp}"
-                            
-                        prompt += f"{self.tmpl['user_tag']}\n{user_content}{self.tmpl['separator']}"
-                        prompt += f"{self.tmpl['bot_tag']}\n{out}{self.tokenizer.eos_token}"
-                        
-                        text = prompt
+                        sep = self.tmpl.get("separator", "\n\n")
+                        text = f"{sys_val}{sep}" if sys_val else ""
+                        text += f"{self.tmpl['user_tag']}\n{instr}{sep}"
+                        text += f"{self.tmpl['bot_tag']}\n{out}{self.tokenizer.eos_token}"
                     
-                    if not text:
+                    if not text or len(text.strip()) < 10:
                         continue
                         
                     # Токенизация
@@ -149,5 +181,6 @@ class SFTDataset(IterableDataset):
                         "labels": labels
                     }
                     
-                except Exception:
+                except Exception as e:
+                    # Пропускаем битые записи
                     continue
