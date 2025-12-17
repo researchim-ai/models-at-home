@@ -1,5 +1,9 @@
 # 🏠 Models at Home
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat&logo=docker&logoColor=white)](https://www.docker.com/)
+
 **Models at Home** — это open-source студия для тренировки и дообучения больших языковых моделей (LLM) в домашних условиях. Проект создан, чтобы сделать технологии Deep Learning доступными для каждого.
 
 ![Screenshot](src/models-at-home.png)

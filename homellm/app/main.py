@@ -10,9 +10,15 @@ Motels at Home Training Studio — Визуальное приложение д�
 """
 
 import streamlit as st
+import logging
 import subprocess
 import json
 import time
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 import os
 import signal
 from pathlib import Path
@@ -517,26 +523,43 @@ def render_header():
     st.caption("Визуальный интерфейс для тренировки языковых моделей дома")
 
 
+def get_nested_value(data: dict, path: str):
+    """Получает значение по пути 'a.b.c'."""
+    if not path: return None
+    keys = path.split('.')
+    curr = data
+    try:
+        for k in keys:
+            if isinstance(curr, dict):
+                curr = curr.get(k)
+            else:
+                return None
+            if curr is None: return None
+        return curr
+    except:
+        return None
+
+
 def get_dataset_columns(file_path: str):
-    """Анализирует файл и возвращает список колонок и пример данных."""
+    """Анализирует файл и возвращает список колонок (включая вложенные) и пример."""
     path = Path(file_path)
     if not path.exists():
         return [], {}
         
     try:
+        sample_data = {}
         if path.suffix == ".jsonl":
             with open(path, "r", encoding="utf-8") as f:
                 line = f.readline()
                 if line:
-                    data = json.loads(line)
-                    return list(data.keys()), data
+                    sample_data = json.loads(line)
         elif path.suffix == ".json":
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list) and len(data) > 0:
-                    return list(data[0].keys()), data[0]
+                    sample_data = data[0]
                 elif isinstance(data, dict):
-                    # Если это словарь колонок (HuggingFace format иногда)
+                    # Если это словарь колонок, просто берем ключи
                     return list(data.keys()), {k: v[0] if isinstance(v, list) else v for k, v in data.items()}
         elif path.suffix == ".csv":
             import csv
@@ -544,7 +567,14 @@ def get_dataset_columns(file_path: str):
                 reader = csv.DictReader(f)
                 row = next(reader, None)
                 if row:
-                    return list(row.keys()), row
+                    sample_data = row
+        
+        if sample_data:
+            # Для get_dataset_columns нам не нужно возвращать плоские ключи, 
+            # так как render_sft_main_config теперь сам строит дерево.
+            # Но для совместимости оставим возврат sample_data
+            return [], sample_data
+            
     except Exception as e:
         st.error(f"Ошибка чтения файла: {e}")
         return [], {}
@@ -552,237 +582,209 @@ def get_dataset_columns(file_path: str):
     return [], {}
 
 
+def flatten_json_structure(d: dict, parent_path: str = '', depth: int = 0) -> list:
+    """Преобразует JSON в плоский список с информацией о вложенности для отрисовки дерева."""
+    items = []
+    for k, v in d.items():
+        current_path = f"{parent_path}.{k}" if parent_path else k
+        
+        if isinstance(v, dict):
+            # Папка
+            items.append({"type": "folder", "key": k, "path": current_path, "depth": depth, "val": ""})
+            items.extend(flatten_json_structure(v, current_path, depth + 1))
+        elif isinstance(v, list):
+            # Список
+            items.append({"type": "list", "key": k, "path": current_path, "depth": depth, "val": f"List[{len(v)}]"})
+            # Показываем структуру первого элемента, если он есть
+            if v:
+                if isinstance(v[0], dict):
+                    items.extend(flatten_json_structure(v[0], current_path, depth + 1))
+                else:
+                    # Список примитивов (строк и т.д.) - показываем как лист
+                    # Но нам не нужно показывать каждый элемент, просто даем понять что внутри
+                    # Для SFT мы обычно не выбираем элементы списка по отдельности, а весь список
+                    pass
+        else:
+            # Лист (значение)
+            items.append({"type": "leaf", "key": k, "path": current_path, "depth": depth, "val": str(v)})
+    return items
+
+
 def render_sft_main_config(data_path: str):
-    """Отображает конфигурацию SFT в основной области (не в сайдбаре)."""
+    """Отображает конфигурацию SFT — ПРОСТОЙ интерфейс."""
     st.markdown("### 🛠️ Настройка данных для SFT")
     
     # 1. Анализ файла
     columns, sample = get_dataset_columns(data_path)
     
-    col_preview, col_map = st.columns([1, 1])
+    if not sample:
+        st.error("Не удалось прочитать файл или он пуст.")
+        return {}
     
-    with col_preview:
-        st.caption(f"Файл: `{Path(data_path).name}`")
-        if sample:
-            st.markdown("**Пример записи:**")
-            st.json(sample, expanded=False)
-        else:
-            st.warning("Не удалось прочитать структуру файла")
-            
-    with col_map:
-        if columns:
-            st.markdown("**Маппинг колонок**")
-            # Пытаемся угадать колонки
-            def guess_idx(options, keywords):
-                for i, opt in enumerate(options):
-                    if any(k in opt.lower() for k in keywords):
-                        return i
-                return 0
-            
-            c_instr = st.selectbox("Instruction (Вопрос)", options=columns, index=guess_idx(columns, ["instruct", "question", "prompt", "input"]))
-            # Input опционален
-            c_input_opts = ["<Нет>"] + columns
-            c_input = st.selectbox("Input (Контекст)", options=c_input_opts, index=guess_idx(c_input_opts, ["context", "input"]) if "input" in columns else 0)
-            c_output = st.selectbox("Output (Ответ)", options=columns, index=guess_idx(columns, ["output", "answer", "response", "target"]))
-            
-            sft_columns = {
-                "instruction": c_instr,
-                "input": None if c_input == "<Нет>" else c_input,
-                "output": c_output
-            }
-        else:
-            # Fallback на ручной ввод
-            c_instr = st.text_input("Instruction Col", "instruction")
-            c_input = st.text_input("Input Col", "input")
-            c_output = st.text_input("Output Col", "output")
-            sft_columns = {"instruction": c_instr, "input": c_input, "output": c_output}
+    # State initialization — только 3 поля!
+    if "sft_user_path" not in st.session_state: st.session_state.sft_user_path = ""
+    if "sft_assistant_path" not in st.session_state: st.session_state.sft_assistant_path = ""
+    if "sft_system_path" not in st.session_state: st.session_state.sft_system_path = ""
 
-    # 2. Шаблон чата
-    with st.expander("💬 Шаблон чата (Prompt Template)", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            system_prompt = st.text_area("System Prompt", "You are a helpful assistant.")
-            separator = st.text_input("Separator (между сообщениями)", value="\\n\\n")
-        with c2:
-            user_tag = st.text_input("User Tag", "### User:")
-            bot_tag = st.text_input("Assistant Tag", "### Assistant:")
-            
-            sft_template = {
-        "system": system_prompt,
-        "user_tag": user_tag,
-        "bot_tag": bot_tag,
-        "separator": separator.replace("\\n", "\n")
-    }
+    # Callbacks для кнопок [U] [A] [S]
+    def set_user(path): st.session_state.sft_user_path = path
+    def set_assistant(path): st.session_state.sft_assistant_path = path
+    def set_system(path): st.session_state.sft_system_path = path
+    def clear_user(): st.session_state.sft_user_path = ""
+    def clear_assistant(): st.session_state.sft_assistant_path = ""
+    def clear_system(): st.session_state.sft_system_path = ""
+
+    col_tree, col_result = st.columns([3, 2])
     
-    # --- Предпросмотр промпта ---
-    if sample:
-        st.markdown("#### 👁️ Предпросмотр (Final Prompt)")
-        st.caption("Пример того, что увидит модель на входе (для одной записи):")
+    # --- Левая колонка: Дерево JSON ---
+    with col_tree:
+        st.markdown("**📂 Структура JSON** — нажмите кнопку чтобы назначить роль:")
+        st.caption("**[U]** = User, **[A]** = Assistant, **[S]** = System")
+        st.markdown("---")
         
+        tree_items = flatten_json_structure(sample)
+        
+        for item in tree_items:
+            # Только leaf (конечные поля) показываем с кнопками
+            if item['type'] != 'leaf':
+                # Папки и списки просто показываем как заголовки
+                indent = "&nbsp;" * (item['depth'] * 4)
+                icon = "📁" if item['type'] == 'folder' else "📋"
+                st.markdown(f"{indent}{icon} **{item['key']}** {item['val']}", unsafe_allow_html=True)
+                continue
+            
+            # Для leaf полей — строка с кнопками
+            indent = "&nbsp;" * (item['depth'] * 4)
+            
+            # Определяем, выбрано ли это поле
+            current_role = None
+            if item['path'] == st.session_state.sft_user_path:
+                current_role = "user"
+            elif item['path'] == st.session_state.sft_assistant_path:
+                current_role = "assistant"
+            elif item['path'] == st.session_state.sft_system_path:
+                current_role = "system"
+            
+            # Превью значения
+            val_preview = item['val']
+            if len(val_preview) > 40:
+                val_preview = val_preview[:40] + "..."
+            
+            # Создаем строку
+            cols = st.columns([0.5 + item['depth'] * 0.3, 2.5, 2, 0.6, 0.6, 0.6])
+            
+            with cols[1]:
+                st.markdown(f"📄 **{item['key']}**")
+            
+            with cols[2]:
+                st.caption(f"`{val_preview}`")
+            
+            # Кнопки [U] [A] [S]
+            with cols[3]:
+                if current_role == "user":
+                    st.button("✅U", key=f"u_{item['path']}", on_click=clear_user, help="Убрать User")
+                else:
+                    st.button("U", key=f"u_{item['path']}", on_click=set_user, args=(item['path'],), help="Назначить User")
+            
+            with cols[4]:
+                if current_role == "assistant":
+                    st.button("✅A", key=f"a_{item['path']}", on_click=clear_assistant, help="Убрать Assistant")
+                else:
+                    st.button("A", key=f"a_{item['path']}", on_click=set_assistant, args=(item['path'],), help="Назначить Assistant")
+            
+            with cols[5]:
+                if current_role == "system":
+                    st.button("✅S", key=f"s_{item['path']}", on_click=clear_system, help="Убрать System")
+                else:
+                    st.button("S", key=f"s_{item['path']}", on_click=set_system, args=(item['path'],), help="Назначить System")
+
+    # --- Правая колонка: Результат выбора ---
+    with col_result:
+        st.markdown("**🎯 Выбранные поля:**")
+        
+        # User
+        if st.session_state.sft_user_path:
+            st.success(f"👤 **User:** `{st.session_state.sft_user_path}`")
+        else:
+            st.warning("👤 **User:** не выбрано")
+        
+        # Assistant
+        if st.session_state.sft_assistant_path:
+            st.success(f"🤖 **Assistant:** `{st.session_state.sft_assistant_path}`")
+        else:
+            st.warning("🤖 **Assistant:** не выбрано")
+        
+        # System (опционально)
+        if st.session_state.sft_system_path:
+            st.info(f"⚙️ **System:** `{st.session_state.sft_system_path}`")
+        else:
+            st.caption("⚙️ **System:** не выбрано (опционально)")
+        
+        st.markdown("---")
+        
+        # Template Config
+        with st.expander("⚙️ Настройки шаблона", expanded=False):
+            sys_p = st.text_area("System Prompt (по умолчанию)", "You are a helpful assistant.", height=80)
+            c1, c2 = st.columns(2)
+            u_tag = c1.text_input("User Tag", "### User:")
+            a_tag = c2.text_input("Assistant Tag", "### Assistant:")
+            sep = st.text_input("Separator", "\\n\\n")
+        
+        # Если expander закрыт, используем defaults
+        if 'sys_p' not in dir():
+            sys_p = "You are a helpful assistant."
+            u_tag = "### User:"
+            a_tag = "### Assistant:"
+            sep = "\\n\\n"
+        
+        sft_template = {
+            "system": sys_p,
+            "separator": sep.replace("\\n", "\n"),
+            "user_tag": u_tag,
+            "bot_tag": a_tag
+        }
+        
+        sft_columns = {
+            "format": "alpaca",
+            "instruction": st.session_state.sft_user_path,
+            "output": st.session_state.sft_assistant_path,
+            "system_field": st.session_state.sft_system_path
+        }
+
+    # --- Превью итогового промпта ---
+    st.markdown("---")
+    st.markdown("### 👁️ Превью итогового промпта")
+    
+    user_path = st.session_state.sft_user_path
+    asst_path = st.session_state.sft_assistant_path
+    sys_path = st.session_state.sft_system_path
+    
+    if user_path and asst_path:
         try:
-            # Эмуляция логики из SFTDataset
-            instr_val = str(sample.get(c_instr, ""))
-            input_val = str(sample.get(c_input, "")) if c_input != "<Нет>" and c_input in sample else ""
-            output_val = str(sample.get(c_output, ""))
+            user_val = str(get_nested_value(sample, user_path) or "")
+            asst_val = str(get_nested_value(sample, asst_path) or "")
             
-            tmpl = sft_template
-            sep = tmpl["separator"]
+            # System: из поля или дефолтный
+            sys_val = sft_template["system"]
+            if sys_path:
+                field_sys = get_nested_value(sample, sys_path)
+                if field_sys:
+                    sys_val = str(field_sys)
             
-            # System
-            prompt_preview = f"{tmpl['system']}{sep}"
+            sep = sft_template["separator"]
             
-            # User
-            user_content = instr_val
-            if input_val:
-                user_content += f"\n{input_val}"
-            prompt_preview += f"{tmpl['user_tag']}\n{user_content}{sep}"
+            preview = f"{sys_val}{sep}"
+            preview += f"{sft_template['user_tag']}\n{user_val}{sep}"
+            preview += f"{sft_template['bot_tag']}\n{asst_val}<|endoftext|>"
             
-            # Assistant (Target)
-            prompt_preview += f"{tmpl['bot_tag']}\n{output_val}<|endoftext|>"
-            
-            st.code(prompt_preview, language="text")
+            st.code(preview, language=None)
             
         except Exception as e:
-            st.error(f"Ошибка генерации превью: {e}")
-    
-    return {
-        "sft_columns": sft_columns,
-        "sft_template": sft_template
-    }
+            st.error(f"Ошибка: {e}")
+    else:
+        st.info("👈 Выберите поля **User** и **Assistant** в дереве слева")
 
-
-def get_dataset_columns(file_path: str):
-    """Анализирует файл и возвращает список колонок и пример данных."""
-    path = Path(file_path)
-    if not path.exists():
-        return [], {}
-        
-    try:
-        if path.suffix == ".jsonl":
-            with open(path, "r", encoding="utf-8") as f:
-                line = f.readline()
-                if line:
-                    data = json.loads(line)
-                    return list(data.keys()), data
-        elif path.suffix == ".json":
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list) and len(data) > 0:
-                    return list(data[0].keys()), data[0]
-                elif isinstance(data, dict):
-                    # Если это словарь колонок (HuggingFace format иногда)
-                    return list(data.keys()), {k: v[0] if isinstance(v, list) else v for k, v in data.items()}
-        elif path.suffix == ".csv":
-            import csv
-            with open(path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                row = next(reader, None)
-                if row:
-                    return list(row.keys()), row
-    except Exception as e:
-        st.error(f"Ошибка чтения файла: {e}")
-        return [], {}
-    
-    return [], {}
-
-
-def render_sft_main_config(data_path: str):
-    """Отображает конфигурацию SFT в основной области (не в сайдбаре)."""
-    st.markdown("### 🛠️ Настройка данных для SFT")
-    
-    # 1. Анализ файла
-    columns, sample = get_dataset_columns(data_path)
-    
-    col_preview, col_map = st.columns([1, 1])
-    
-    with col_preview:
-        st.caption(f"Файл: `{Path(data_path).name}`")
-        if sample:
-            st.markdown("**Пример записи:**")
-            st.json(sample, expanded=False)
-        else:
-            st.warning("Не удалось прочитать структуру файла")
-            
-    with col_map:
-        if columns:
-            st.markdown("**Маппинг колонок**")
-            # Пытаемся угадать колонки
-            def guess_idx(options, keywords):
-                for i, opt in enumerate(options):
-                    if any(k in opt.lower() for k in keywords):
-                        return i
-                return 0
-            
-            c_instr = st.selectbox("Instruction (Вопрос)", options=columns, index=guess_idx(columns, ["instruct", "question", "prompt", "input"]))
-            # Input опционален
-            c_input_opts = ["<Нет>"] + columns
-            c_input = st.selectbox("Input (Контекст)", options=c_input_opts, index=guess_idx(c_input_opts, ["context", "input"]) if "input" in columns else 0)
-            c_output = st.selectbox("Output (Ответ)", options=columns, index=guess_idx(columns, ["output", "answer", "response", "target"]))
-            
-            sft_columns = {
-                "instruction": c_instr,
-                "input": None if c_input == "<Нет>" else c_input,
-                "output": c_output
-            }
-        else:
-            # Fallback на ручной ввод
-            c_instr = st.text_input("Instruction Col", "instruction")
-            c_input = st.text_input("Input Col", "input")
-            c_output = st.text_input("Output Col", "output")
-            sft_columns = {"instruction": c_instr, "input": c_input, "output": c_output}
-
-    # 2. Шаблон чата
-    with st.expander("💬 Шаблон чата (Prompt Template)", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            system_prompt = st.text_area("System Prompt", "You are a helpful assistant.")
-            separator = st.text_input("Separator (между сообщениями)", value="\\n\\n")
-        with c2:
-            user_tag = st.text_input("User Tag", "### User:")
-            bot_tag = st.text_input("Assistant Tag", "### Assistant:")
-            
-            sft_template = {
-        "system": system_prompt,
-        "user_tag": user_tag,
-        "bot_tag": bot_tag,
-        "separator": separator.replace("\\n", "\n")
-    }
-    
-    # --- Предпросмотр промпта ---
-    if sample:
-        st.markdown("#### 👁️ Предпросмотр (Final Prompt)")
-        st.caption("Пример того, что увидит модель на входе (для одной записи):")
-        
-        try:
-            # Эмуляция логики из SFTDataset
-            instr_val = str(sample.get(c_instr, ""))
-            input_val = str(sample.get(c_input, "")) if c_input != "<Нет>" and c_input in sample else ""
-            output_val = str(sample.get(c_output, ""))
-            
-            tmpl = sft_template
-            sep = tmpl["separator"]
-            
-            # System
-            prompt_preview = f"{tmpl['system']}{sep}"
-            
-            # User
-            user_content = instr_val
-            if input_val:
-                user_content += f"\n{input_val}"
-            prompt_preview += f"{tmpl['user_tag']}\n{user_content}{sep}"
-            
-            # Assistant (Target)
-            prompt_preview += f"{tmpl['bot_tag']}\n{output_val}<|endoftext|>"
-            
-            st.code(prompt_preview, language="text")
-            
-        except Exception as e:
-            st.error(f"Ошибка генерации превью: {e}")
-    
-    return {
-        "sft_columns": sft_columns,
-        "sft_template": sft_template
-    }
+    return {"sft_columns": sft_columns, "sft_template": sft_template}
 
 
 def render_model_config():
@@ -823,69 +825,113 @@ def render_model_config():
             
             st.sidebar.caption(f"Путь: `{base_model_path}`")
     
+    # Флаг, что параметры загружены из конфига
+    loaded_config = None
+    
+    if selected_stage == "sft" and base_model_path:
+        # Пытаемся загрузить конфиг
+        try:
+            base_path = Path(base_model_path)
+            # Вариант 1: config.json прямо в папке (final_model)
+            cfg_path = base_path / "config.json"
+            # Вариант 2: это чекпоинт
+            if not cfg_path.exists():
+                # Пробуем найти run_config.json в родительской
+                if (base_path.parent / "run_config.json").exists():
+                    cfg_path = base_path.parent / "run_config.json"
+                elif (base_path / "run_config.json").exists(): # иногда сохраняем так
+                     cfg_path = base_path / "run_config.json"
+            
+            if cfg_path.exists():
+                with open(cfg_path) as f:
+                    loaded_config = json.load(f)
+                st.sidebar.success("✅ Параметры загружены из базовой модели")
+            else:
+                st.sidebar.warning("⚠️ config.json не найден, введите параметры вручную")
+        except Exception as e:
+             st.sidebar.error(f"Ошибка чтения config.json: {e}")
+
     st.sidebar.subheader("⚙️ Параметры модели")
     
-    # Дефолтные значения
-    d_hid, d_layers = 512, 8
-    
-    # Если SFT и модель загружена (в теории), можно было бы подтянуть конфиг.
-    # Но пока оставим ручной выбор/пресеты, чтобы пользователь видел, что происходит.
-    # В идеале при SFT эти параметры должны быть заблокированы и читаться из конфига модели.
-    # Но так как config.json читается только в worker-е, оставим возможность "угадать" или настроить.
-    # Для улучшения UX добавим подсказку.
-    if selected_stage == "sft":
-        st.sidebar.caption("⚠️ Убедитесь, что параметры совпадают с базовой моделью!")
-
-    # Пресеты
-    preset = st.sidebar.selectbox(
-        "Пресет",
-        ["Tiny (25M)", "Small (80M)", "Medium (200M)", "Large (400M)", "Custom"],
-        index=0
-    )
-    
-    presets = {
-        "Tiny (25M)": (512, 8, 8),
-        "Small (80M)": (768, 12, 12),
-        "Medium (200M)": (1024, 16, 16),
-        "Large (400M)": (1280, 20, 20),
-    }
-    
-    if preset != "Custom" and preset in presets:
-        default_h, default_l, default_n = presets[preset]
+    if loaded_config:
+        # Режим только чтения для SFT с загруженным конфигом
+        # Используем значения из конфига (поддержка разных имен ключей)
+        hidden_size = loaded_config.get("hidden_size", 512)
+        # num_hidden_layers - HF, num_layers - наш конфиг
+        num_layers = loaded_config.get("num_hidden_layers", loaded_config.get("num_layers", 8))
+        num_attention_heads = loaded_config.get("num_attention_heads", loaded_config.get("n_heads", 8))
+        max_position_embeddings = loaded_config.get("max_position_embeddings", loaded_config.get("seq_len", 512))
+        
+        # Для совместимости возвращаем имена переменных как ожидается
+        n_heads = num_attention_heads
+        seq_len = max_position_embeddings
+        
+        # Отображаем просто текстом/метриками
+        c1, c2 = st.sidebar.columns(2)
+        c1.metric("Hidden Size", hidden_size)
+        c2.metric("Layers", num_layers)
+        c1.metric("Heads", n_heads)
+        c2.metric("Seq Len", seq_len)
+        
+        st.sidebar.info("🔒 Параметры зафиксированы (наследуются от базы)")
+        
     else:
-        default_h, default_l, default_n = 512, 8, 8
-    
-    hidden_size = st.sidebar.slider(
-        "Hidden Size", 
-        min_value=128, 
-        max_value=2048, 
-        value=default_h, 
-        step=64,
-        help="Размерность скрытого слоя"
-    )
-    
-    num_layers = st.sidebar.slider(
-        "Num Layers", 
-        min_value=2, 
-        max_value=32, 
-        value=default_l,
-        help="Количество слоёв трансформера"
-    )
-    
-    n_heads = st.sidebar.slider(
-        "Attention Heads", 
-        min_value=2, 
-        max_value=32, 
-        value=default_n,
-        help="Количество голов внимания"
-    )
-    
-    seq_len = st.sidebar.selectbox(
-        "Seq Length",
-        [256, 512, 1024, 2048],
-        index=1,
-        help="Максимальная длина последовательности"
-    )
+        # Дефолтные значения
+        d_hid, d_layers = 512, 8
+        
+        if selected_stage == "sft":
+            st.sidebar.caption("⚠️ Убедитесь, что параметры совпадают с базовой моделью!")
+
+        # Пресеты
+        preset = st.sidebar.selectbox(
+            "Пресет",
+            ["Tiny (25M)", "Small (80M)", "Medium (200M)", "Large (400M)", "Custom"],
+            index=0
+        )
+        
+        presets = {
+            "Tiny (25M)": (512, 8, 8),
+            "Small (80M)": (768, 12, 12),
+            "Medium (200M)": (1024, 16, 16),
+            "Large (400M)": (1280, 20, 20),
+        }
+        
+        if preset != "Custom" and preset in presets:
+            default_h, default_l, default_n = presets[preset]
+        else:
+            default_h, default_l, default_n = 512, 8, 8
+        
+        hidden_size = st.sidebar.slider(
+            "Hidden Size", 
+            min_value=128, 
+            max_value=2048, 
+            value=default_h, 
+            step=64,
+            help="Размерность скрытого слоя"
+        )
+        
+        num_layers = st.sidebar.slider(
+            "Num Layers", 
+            min_value=2, 
+            max_value=32, 
+            value=default_l,
+            help="Количество слоёв трансформера"
+        )
+        
+        n_heads = st.sidebar.slider(
+            "Attention Heads", 
+            min_value=2, 
+            max_value=32, 
+            value=default_n,
+            help="Количество голов внимания"
+        )
+        
+        seq_len = st.sidebar.selectbox(
+            "Seq Length",
+            [256, 512, 1024, 2048],
+            index=1,
+            help="Максимальная длина последовательности"
+        )
     
     # Оценка параметров
     est_params = estimate_parameters(hidden_size, num_layers)
@@ -1280,7 +1326,8 @@ def render_metrics_dashboard(metrics: dict):
     
     with col4:
         eta = metrics.get("eta_seconds", 0)
-        st.metric("ETA", format_time(eta))
+        elapsed = metrics.get("elapsed_seconds", 0)
+        st.metric("Время", f"{format_time(elapsed)}", delta=f"Ост: {format_time(eta)}", delta_color="normal")
     
     # Progress bar
     st.progress(min(progress / 100, 1.0))
@@ -1307,7 +1354,7 @@ def render_metrics_dashboard(metrics: dict):
                 height=300,
                 margin=dict(l=0, r=0, t=40, b=0)
             )
-            st.plotly_chart(fig_loss, use_container_width=True, key=f"loss_chart_{metrics.get('current_step')}")
+            st.plotly_chart(fig_loss, key=f"loss_chart_{metrics.get('current_step')}")
         
         with col2:
             # LR chart
@@ -1327,7 +1374,7 @@ def render_metrics_dashboard(metrics: dict):
                 height=300,
                 margin=dict(l=0, r=0, t=40, b=0)
             )
-            st.plotly_chart(fig_lr, use_container_width=True, key=f"lr_chart_{metrics.get('current_step')}")
+            st.plotly_chart(fig_lr, key=f"lr_chart_{metrics.get('current_step')}")
     
     # Checkpoints
     if metrics.get("checkpoints"):
@@ -1497,9 +1544,7 @@ def render_data_manager():
             "🟢 Pretrain: FineWeb-2 (Russian)": "HuggingFaceFW/fineweb-2",
             "🟢 Pretrain: FineWeb-Edu (Educational)": "HuggingFaceFW/fineweb-edu",
             "🟢 Pretrain: Wikitext-103": "wikitext",
-            "🔵 SFT: Alpaca (English)": "tatsu-lab/alpaca",
-            "🔵 SFT: OpenAssistant (Multilingual)": "OpenAssistant/oasst1",
-            "🔵 SFT: Dolly-15k (Instruct)": "databricks/databricks-dolly-15k",
+            "🔵 SFT: OpenOrca-ru (перевод OpenOrca на русском языке)": "d0rj/OpenOrca-ru",
         }
         def on_preset_change():
             """Callback для обновления поля ввода при выборе пресета."""
@@ -1733,6 +1778,78 @@ def render_data_manager():
                         st.error(f"Ошибка чтения файла: {e}")
 
 
+def calculate_memory_footprint(config, batch_size, distributed_mode="default", num_gpus=1):
+    """
+    Рассчитывает потребление VRAM (в ГБ) для обучения.
+    Учитывает: веса, оптимизатор, градиенты и активации.
+    """
+    try:
+        hidden_size = config["hidden_size"]
+        num_layers = config["num_layers"]
+        n_heads = config["n_heads"]
+        seq_len = config["seq_len"]
+        vocab_size = 50257  # Примерно для GPT-2 / Llama
+        
+        # 1. Параметры модели (P)
+        embed_params = vocab_size * hidden_size
+        layer_params = 12 * hidden_size**2 + 13 * hidden_size # Упрощенная формула для блока трансформера
+        total_params = embed_params + num_layers * layer_params
+        
+        # 2. Статическая память (Веса + Градиенты + Оптимизатор)
+        # Базовая Mixed Precision (fp16/bf16):
+        # - Weights (fp16): 2 bytes
+        # - Gradients (fp16): 2 bytes
+        # - Optimizer (AdamW):
+        #    - FP32 Master weights: 4 bytes
+        #    - Momentum (fp32): 4 bytes
+        #    - Variance (fp32): 4 bytes
+        # Итого: ~16-18 байт на параметр.
+        
+        bytes_per_param = 18 
+        
+        # Учет Distributed стратегий
+        if "deepspeed_zero3" in distributed_mode:
+            # ZeRO-3 шардирует все (веса, градиенты, оптимизатор)
+            static_mem_bytes = (total_params * bytes_per_param) / max(1, num_gpus)
+        elif "deepspeed_zero2" in distributed_mode:
+            # ZeRO-2 шардирует градиенты и оптимизатор (8+4+4=16 bytes), но веса (2 bytes) дублируются
+            sharded_part = (total_params * 16) / max(1, num_gpus)
+            replicated_part = total_params * 2
+            static_mem_bytes = sharded_part + replicated_part
+        elif distributed_mode == "fsdp":
+            # FSDP похож на ZeRO-3
+            static_mem_bytes = (total_params * bytes_per_param) / max(1, num_gpus)
+        else:
+            # DDP или Single GPU: полная копия у всех
+            static_mem_bytes = total_params * bytes_per_param
+
+        # 3. Динамическая память (Активации)
+        # Зависит от Batch Size и Seq Len.
+        # Формула: Batch * Seq * Hidden * Layers * Bytes * Overhead_Factor
+        # Overhead_Factor для трансформеров без checkpointing ~34 (храним все промежуточные состояния)
+        # С checkpointing ~4 (храним только входы слоев + пересчет)
+        
+        overhead_factor = 4 if config.get("grad_checkpoint") else 34
+        activation_bytes = batch_size * seq_len * hidden_size * num_layers * 2 * overhead_factor
+        
+        # Конвертация в ГБ
+        static_gb = static_mem_bytes / (1024**3)
+        act_gb = activation_bytes / (1024**3)
+        buffer_gb = 1.5  # Буфер для PyTorch context, cuda kernels fragmentation
+        
+        total_gb = static_gb + act_gb + buffer_gb
+        
+        return {
+            "total_gb": round(total_gb, 2),
+            "model_gb": round(static_gb, 2),
+            "act_gb": round(act_gb, 2),
+            "params": total_params
+        }
+    except Exception as e:
+        print(f"Error calculating VRAM: {e}")
+        return {"total_gb": 0, "model_gb": 0, "act_gb": 0, "params": 0}
+
+
 def render_model_preview(config: dict, distributed_config: dict = None):
     """Превью архитектуры модели и настроек параллелизма."""
     st.subheader("📐 Архитектура модели")
@@ -1743,7 +1860,13 @@ def render_model_preview(config: dict, distributed_config: dict = None):
     else:
         st.success("🏗️ **Режим Pretraining** (С нуля)")
 
-    params = estimate_parameters(config["hidden_size"], config["num_layers"])
+    # Рассчитываем память
+    # Нам нужен batch_size из конфига (это батч на девайс)
+    batch_size = config.get("batch_size", 1)
+    dist_mode = distributed_config.get("distributed_mode", "default") if distributed_config else "default"
+    n_gpus = distributed_config.get("num_gpus", 1) if distributed_config else 1
+    
+    mem_info = calculate_memory_footprint(config, batch_size, dist_mode, n_gpus)
     
     col1, col2, col3 = st.columns(3)
     
@@ -1756,29 +1879,67 @@ def render_model_preview(config: dict, distributed_config: dict = None):
         st.metric("Head Dim", config["hidden_size"] // config["n_heads"])
     
     with col3:
-        st.metric("Параметры", format_params(params))
-        vram_est = params * 4 / 1e9  # fp32
-        st.metric("VRAM (≈ fp32)", f"{vram_est:.1f} GB")
+        st.metric("Параметры", format_params(mem_info["params"]))
+        
+        # Цвет метрики в зависимости от размера (примерно для 24GB карты)
+        val = mem_info["total_gb"]
+        color = "normal"
+        if val > 24: color = "off" # красный оттенок в дельте обычно
+        
+        st.metric(
+            "VRAM (Estimate)", 
+            f"{val:.1f} GB", 
+            delta=f"M: {mem_info['model_gb']} + A: {mem_info['act_gb']} GB",
+            delta_color=color,
+            help="M: Static Model Memory (Weights+Optim)\nA: Activations (Batch Size dependent)"
+        )
+    
+    # Визуализация использования памяти
+    if mem_info["total_gb"] > 0:
+        st.caption("📊 Примерное распределение памяти GPU:")
+        
+        # Создаем простой бар чарт через HTML/CSS для наглядности
+        total = mem_info["total_gb"]
+        p_model = (mem_info["model_gb"] / total) * 100
+        p_act = (mem_info["act_gb"] / total) * 100
+        p_buff = 100 - p_model - p_act
+        
+        st.markdown(f"""
+        <div style="display: flex; height: 20px; width: 100%; background: #333; border-radius: 4px; overflow: hidden; margin-top: 5px;">
+            <div style="width: {p_model}%; background: #3b82f6; text-align: center; color: white; font-size: 10px; line-height: 20px;" title="Model & Optim">Model</div>
+            <div style="width: {p_act}%; background: #e94560; text-align: center; color: white; font-size: 10px; line-height: 20px;" title="Activations">Act</div>
+            <div style="width: {p_buff}%; background: #777; text-align: center; color: white; font-size: 10px; line-height: 20px;" title="Buffer">Buf</div>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 12px; color: #888; margin-top: 2px;">
+            <span>Model + Optim: {mem_info['model_gb']} GB</span>
+            <span>Activations: {mem_info['act_gb']} GB</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if mem_info["act_gb"] > mem_info["model_gb"] * 2:
+            st.warning("⚠️ Активации занимают много памяти! Включите Gradient Checkpointing или уменьшите Batch Size.")
+
     
     # Визуальная схема архитектуры
     st.markdown(f"""
-<div class="model-ascii">
-┌─────────────────────────────────────┐
-│         HomeForCausalLM             │
-├─────────────────────────────────────┤
-│  Embedding: 50257 → {config['hidden_size']:4d}           │
-│  ┌─────────────────────────────┐    │
-│  │ HomeBlock × {config['num_layers']:2d}              │    │
-│  │  • RMSNorm → Attention      │    │
-│  │  • {config['n_heads']:2d} heads × {config['hidden_size']//config['n_heads']:3d} dim      │    │
-│  │  • RMSNorm → FFN (SwiGLU)   │    │
-│  └─────────────────────────────┘    │
-│  RMSNorm → LM Head                  │
-└─────────────────────────────────────┘
-</div>
-    """, unsafe_allow_html=True)
+    <div class="model-ascii">
+    ┌─────────────────────────────────────┐
+    │         HomeForCausalLM             │
+    ├─────────────────────────────────────┤
+    │  Embedding: 50257 → {config['hidden_size']:4d}           │
+    │  ┌─────────────────────────────┐    │
+    │  │ HomeBlock × {config['num_layers']:2d}              │    │
+    │  │  • RMSNorm → Attention      │    │
+    │  │  • {config['n_heads']:2d} heads × {config['hidden_size']//config['n_heads']:3d} dim      │    │
+    │  │  • RMSNorm → FFN (SwiGLU)   │    │
+    │  └─────────────────────────────┘    │
+    │  RMSNorm → LM Head                  │
+    └─────────────────────────────────────┘
+    </div>
+        """, unsafe_allow_html=True)
     
     # Информация о параллелизме
+
     if distributed_config:
         st.subheader("⚡ Параллелизм")
         
@@ -1885,6 +2046,32 @@ def render_model_preview(config: dict, distributed_config: dict = None):
             """, unsafe_allow_html=True)
 
 
+def export_model_to_hf(model, tokenizer, source_path: str):
+    """Экспортирует модель и токенизатор в стандартный HF формат."""
+    try:
+        source = Path(source_path)
+        # Создаем имя для экспорта: export_TIMESTAMP
+        export_name = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Если это чекпоинт, сохраняем рядом с ним, но в отдельную папку
+        # out/model/run/checkpoint_X -> out/model/run/export_X
+        if "checkpoint" in source.name:
+            export_dir = source.parent / f"export_{source.name}"
+        else:
+            export_dir = source.parent / export_name
+            
+        export_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Сохраняем
+        model.save_pretrained(export_dir)
+        tokenizer.save_pretrained(export_dir)
+        
+        return str(export_dir)
+    except Exception as e:
+        st.error(f"Ошибка экспорта: {e}")
+        return None
+
+
 # ============================================================================
 # Main App
 # ============================================================================
@@ -1917,7 +2104,8 @@ def main():
         col1, col2 = st.columns([2, 1])
         
         with col1:
-            render_model_preview(model_config, distributed_config)
+            # Передаем full_config, чтобы калькулятор памяти видел batch_size и grad_checkpoint
+            render_model_preview(full_config, distributed_config)
             
             # SFT Config (Main Area)
             if model_config.get("stage") == "sft" and dataset_config.get("data_path"):
@@ -2167,7 +2355,26 @@ def main():
                                 
                                 # Загружаем веса
                                 state_dict = load_file(str(model_safetensors))
-                                st.session_state.chat_model.load_state_dict(state_dict)
+                                missing, unexpected = st.session_state.chat_model.load_state_dict(state_dict, strict=False)
+                                
+                                # Умная проверка пропущенных ключей
+                                if missing:
+                                    # Игнорируем lm_head.weight, так как он связан с embed_tokens
+                                    real_missing = [k for k in missing if k != "lm_head.weight"]
+                                    if real_missing:
+                                        st.warning(f"⚠️ Внимание! Отсутствуют веса: {real_missing[:5]}... (всего {len(real_missing)})")
+                                        logger.warning(f"Missing keys: {real_missing}")
+                                    else:
+                                        # Если не хватает только lm_head, значит все ок
+                                        logger.info("Missing only lm_head.weight (expected for tied weights)")
+                                
+                                if unexpected:
+                                    st.warning(f"⚠️ Найдены лишние ключи в чекпоинте: {unexpected[:5]}...")
+
+                                # Явно связываем веса после загрузки
+                                if hasattr(st.session_state.chat_model, "tie_weights"):
+                                    st.session_state.chat_model.tie_weights()
+                                    
                                 st.session_state.chat_model = st.session_state.chat_model.to(device)
                             else:
                                 raise ValueError(f"Не найден config.json или model.safetensors в {model_path}")
@@ -2184,6 +2391,19 @@ def main():
             else:
                 st.success(f"✅ Модель загружена: {selected_model_name}")
                 
+                # Кнопка экспорта (для чекпоинтов особенно полезна)
+                if st.button("💾 Экспортировать в HF формат", help="Сохранить как полноценную модель (с конфигом и токенизатором)"):
+                    with st.spinner("Экспорт модели..."):
+                        export_path = export_model_to_hf(
+                            st.session_state.chat_model, 
+                            st.session_state.chat_tokenizer, 
+                            st.session_state.chat_model_path
+                        )
+                        if export_path:
+                            st.success(f"Модель успешно экспортирована в:\n`{export_path}`")
+                            time.sleep(2)
+                            st.rerun() # Обновить список моделей чтобы увидеть экспорт
+
                 # --- ИНТЕРФЕЙС ЧАТА С ФИКСИРОВАННЫМ СКРОЛЛОМ ---
                 chat_container = st.container(height=500) # Прокручиваемый контейнер
                 

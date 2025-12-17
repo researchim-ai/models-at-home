@@ -88,6 +88,7 @@ class MetricsLogger:
     
     def __init__(self, log_path: Path):
         self.log_path = log_path
+        self.start_timestamp = time.time()
         self.metrics = {
             "status": "initializing",
             "start_time": datetime.now().isoformat(),
@@ -123,6 +124,9 @@ class MetricsLogger:
         self.metrics["loss_history"].append(loss)
         self.metrics["lr_history"].append(lr)
         self.metrics["steps_history"].append(step)
+        
+        # Elapsed
+        self.metrics["elapsed_seconds"] = time.time() - self.start_timestamp
         
         # GPU stats
         self.metrics["gpu_stats"] = get_gpu_stats()
@@ -315,6 +319,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         global_step = 0
         start_time = time.time()
         
+        # Переменные для накопления метрик (Loss)
+        accumulated_loss = 0.0
+        accumulation_steps_count = 0
+        update_start_time = time.time()
+
         training_complete = False
         
         for epoch in range(config["epochs"]):
@@ -325,45 +334,88 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             model.train()
             
             for step, batch in enumerate(train_loader):
-                step_start = time.time()
                 
                 with accelerator.accumulate(model):
                     outputs = model(**batch)
                     loss = outputs.loss
+                    
+                    # Накапливаем loss для логирования (среднее по шагам аккумуляции)
+                    loss_val = loss.detach().float().item()
+                    
+                    # Проверка на NaN / Infinity (Divergence Check)
+                    if math.isnan(loss_val) or math.isinf(loss_val):
+                        # Если это единичный случай, мы можем пропустить (как ниже), 
+                        # но если это происходит постоянно или при accum step - это проблема.
+                        # В данной реализации мы пока просто игнорируем для подсчета среднего,
+                        # но если ВСЕ шаги будут NaN, то accumulated_loss останется 0 (или NaN при делении).
+                        pass
+                    else:
+                        accumulated_loss += loss_val
+                        accumulation_steps_count += 1
+                    
                     accelerator.backward(loss)
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
                 
-                global_step += 1
-                
-                # Логирование
-                step_time = time.time() - step_start
-                if global_step % config.get("log_every", 10) == 0 or global_step == 1:
-                    samples_per_sec = config["batch_size"] / step_time if step_time > 0 else 0
+                # Проверяем, произошел ли шаг оптимизатора (синхронизация градиентов)
+                if accelerator.sync_gradients:
+                    global_step += 1
                     
-                    metrics.log_step(
-                        step=global_step,
-                        loss=loss.detach().float().item(),
-                        lr=lr_scheduler.get_last_lr()[0],
-                        samples_per_sec=samples_per_sec,
-                        step_time=step_time
-                    )
-                
-                # Checkpoint
-                if global_step % config.get("save_every", 5000) == 0:
-                    ckpt_path = output_dir / f"checkpoint_step{global_step}"
-                    accelerator.save_state(ckpt_path)
+                    # Время выполнения одного шага обновления (update step)
+                    update_time = time.time() - update_start_time
+                    update_start_time = time.time()
                     
-                    # Сохраняем конфигурацию модели для загрузки чекпоинта
-                    model_config.save_pretrained(ckpt_path)
+                    # Проверка на критический сбой обучения (NaN Loss)
+                    # Если accumulation_steps_count == 0, значит все микро-шаги были NaN/Inf
+                    if accumulation_steps_count == 0:
+                        logger.error(f"Loss is NaN or Inf at step {global_step}. Stopping training to prevent bad model.")
+                        metrics.update(status="error", error="Training Diverged: Loss is NaN or Infinity. Try lowering learning rate or changing precision.")
+                        raise ValueError("Training Diverged: Loss is NaN or Infinity.")
+
+                    # Логирование
+                    if global_step % config.get("log_every", 10) == 0 or global_step == 1:
+                        # Считаем средний loss
+                        avg_loss = accumulated_loss / accumulation_steps_count
+                        
+                        # Samples per second (Effective Batch / Time)
+                        effective_batch = config["batch_size"] * config["gradient_accumulation"]
+                        samples_per_sec = effective_batch / update_time if update_time > 0 else 0
+                        
+                        metrics.log_step(
+                            step=global_step,
+                            loss=avg_loss,
+                            lr=lr_scheduler.get_last_lr()[0],
+                            samples_per_sec=samples_per_sec,
+                            step_time=update_time
+                        )
                     
-                    metrics.log_checkpoint(str(ckpt_path))
-                
-                # Проверяем достигли ли лимита шагов
-                if global_step >= max_train_steps:
-                    training_complete = True
-                    break
+                    # Сброс аккумуляторов (только после логирования? Нет, после каждого апдейта, но мы логируем не каждый)
+                    # Но если мы логируем раз в N шагов, нам нужно решить:
+                    # 1. Логировать loss только за ПОСЛЕДНИЙ update?
+                    # 2. Или накапливать за все N шагов?
+                    # В стандартных тренерах обычно логируют loss за интервал.
+                    # Но для простоты сбросим здесь, и будем показывать loss текущего шага обновления.
+                    # Или лучше: если мы не логируем, мы все равно сбрасываем, чтобы accumulated_loss не рос бесконечно.
+                    # Но если мы хотим сглаженный loss в логах...
+                    # Давайте сбрасывать после логирования? Нет, тогда avg_loss будет за N шагов. Это даже лучше (сглаживание).
+                    # Давайте так: Сбрасываем ТОЛЬКО если залогировали.
+                    
+                    if global_step % config.get("log_every", 10) == 0 or global_step == 1:
+                         accumulated_loss = 0.0
+                         accumulation_steps_count = 0
+                    
+                    # Checkpoint
+                    if global_step % config.get("save_every", 5000) == 0:
+                        ckpt_path = output_dir / f"checkpoint_step{global_step}"
+                        accelerator.save_state(ckpt_path)
+                        model_config.save_pretrained(ckpt_path)
+                        metrics.log_checkpoint(str(ckpt_path))
+                    
+                    # Проверяем достигли ли лимита шагов
+                    if global_step >= max_train_steps:
+                        training_complete = True
+                        break
         
         # Final save
         metrics.update(status="saving_model")
