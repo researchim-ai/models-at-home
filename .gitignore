@@ -205,6 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-datasets/
-out/
-.runs/
+# Папки с данными (игнорируем содержимое, но НЕ .gitkeep)
+datasets/*
+!datasets/.gitkeep
+out/*
+!out/.gitkeep
+.runs/*
+!.runs/.gitkeep

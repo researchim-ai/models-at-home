@@ -1,4 +1,9 @@
-version: '3.8'
+# Models at Home - Docker Compose
+# 
+# ВАЖНО для Windows: перед первым запуском создайте папки:
+#   mkdir datasets, out, .runs
+#
+# Запуск: docker compose up --build
 
 services:
   studio:
@@ -10,7 +15,7 @@ services:
       - ./datasets:/app/datasets  # Ваши данные
       - ./out:/app/out            # Чекпоинты и модели
       - ./.runs:/app/.runs        # Логи и метрики
-      # Можно раскомментировать для разработки (live reload кода)
+      # Раскомментируйте для разработки (live reload кода):
       # - ./homellm:/app/homellm 
       # - ./configs:/app/configs
     environment:
@@ -24,4 +29,3 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
-
