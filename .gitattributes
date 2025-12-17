@@ -1,0 +1,17 @@
+# Автоматически нормализовать окончания строк
+* text=auto
+
+# Shell-скрипты ВСЕГДА с Unix-окончаниями (LF)
+*.sh text eol=lf
+
+# Python тоже лучше с LF
+*.py text eol=lf
+
+# Конфиги
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+
+# Dockerfile
+Dockerfile text eol=lf
+

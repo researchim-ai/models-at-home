@@ -36,6 +36,9 @@ RUN pip install --no-cache-dir deepspeed
 # Копируем исходный код
 COPY . .
 
+# Исправляем Windows-окончания строк в скриптах (CRLF -> LF)
+RUN sed -i 's/\r$//' scripts/*.sh && chmod +x scripts/*.sh
+
 # Устанавливаем наш пакет
 RUN pip install -e .
 

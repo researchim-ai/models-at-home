@@ -24,4 +24,3 @@ streamlit run homellm/app/main.py \
     --server.headless true \
     --browser.gatherUsageStats false \
     "$@"
-
