@@ -524,14 +524,63 @@ def render_header():
 
 
 def get_nested_value(data: dict, path: str):
-    """Получает значение по пути 'a.b.c'."""
+    """Получает значение по пути.
+    
+    Поддерживает:
+    - 'key1.key2' - вложенные словари
+    - 'messages [список из N эл.]' - возвращает весь список
+    - 'messages[].content' - возвращает список значений поля из каждого элемента
+    - 'messages[0]' - первый элемент списка
+    """
     if not path: return None
+    
+    # Убираем суффиксы типа " [список]" или " [список из 3 эл.]"
+    import re
+    path = re.sub(r' \[список.*?\]$', '', path)
+    
+    # Обработка путей типа 'messages[].content' (все элементы списка)
+    if "[]." in path:
+        parts = path.split("[].", 1)
+        list_path = parts[0]
+        remaining_path = parts[1]
+        
+        list_val = get_nested_value(data, list_path)
+        if isinstance(list_val, list):
+            results = []
+            for item in list_val:
+                if isinstance(item, dict):
+                    val = get_nested_value(item, remaining_path)
+                    results.append(val)
+            return results
+        return None
+    
+    # Обработка путей типа 'messages[0]' (конкретный индекс)
+    if "[" in path and "]" in path:
+        # Парсим индекс
+        match = re.search(r'\[(\d+)\]', path)
+        if match:
+            idx = int(match.group(1))
+            base_path = path[:match.start()]
+            after_path = path[match.end():]
+            if after_path.startswith('.'):
+                after_path = after_path[1:]
+            
+            base_val = get_nested_value(data, base_path)
+            if isinstance(base_val, list) and 0 <= idx < len(base_val):
+                if after_path:
+                    return get_nested_value(base_val[idx], after_path)
+                return base_val[idx]
+            return None
+    
+    # Обычный путь через точки
     keys = path.split('.')
     curr = data
     try:
         for k in keys:
             if isinstance(curr, dict):
                 curr = curr.get(k)
+            elif isinstance(curr, list) and k.isdigit():
+                curr = curr[int(k)]
             else:
                 return None
             if curr is None: return None
@@ -610,179 +659,262 @@ def flatten_json_structure(d: dict, parent_path: str = '', depth: int = 0) -> li
     return items
 
 
+def get_all_leaf_paths(data, parent_path: str = '', depth: int = 0, max_depth: int = 10) -> list:
+    """Рекурсивно получает ВСЕ пути к значениям, включая глубокую вложенность."""
+    if depth > max_depth:
+        return []
+    
+    paths = []
+    
+    if isinstance(data, dict):
+        for k, v in data.items():
+            current_path = f"{parent_path}.{k}" if parent_path else k
+            
+            if isinstance(v, dict):
+                # Вложенный словарь - рекурсивно
+                paths.extend(get_all_leaf_paths(v, current_path, depth + 1, max_depth))
+            elif isinstance(v, list):
+                # Добавляем сам список как опцию (для chat-формата)
+                paths.append(f"{current_path} [список из {len(v)} эл.]")
+                # Раскрываем структуру первого элемента
+                if v:
+                    if isinstance(v[0], dict):
+                        # Показываем поля внутри элементов списка
+                        for inner_k, inner_v in v[0].items():
+                            inner_path = f"{current_path}[].{inner_k}"
+                            if isinstance(inner_v, dict):
+                                paths.extend(get_all_leaf_paths(inner_v, inner_path, depth + 2, max_depth))
+                            elif isinstance(inner_v, list):
+                                paths.append(f"{inner_path} [список]")
+                                if inner_v and isinstance(inner_v[0], dict):
+                                    paths.extend(get_all_leaf_paths(inner_v[0], f"{inner_path}[]", depth + 3, max_depth))
+                            else:
+                                paths.append(inner_path)
+                    else:
+                        # Список примитивов
+                        paths.append(f"{current_path}[0]")
+            else:
+                # Простое значение
+                paths.append(current_path)
+    
+    return paths
+
+
 def render_sft_main_config(data_path: str):
-    """Отображает конфигурацию SFT — ПРОСТОЙ интерфейс."""
+    """Универсальный конфигуратор SFT — автодетект + ручной выбор."""
     st.markdown("### 🛠️ Настройка данных для SFT")
     
-    # 1. Анализ файла
     columns, sample = get_dataset_columns(data_path)
     
     if not sample:
         st.error("Не удалось прочитать файл или он пуст.")
         return {}
     
-    # State initialization — только 3 поля!
-    if "sft_user_path" not in st.session_state: st.session_state.sft_user_path = ""
-    if "sft_assistant_path" not in st.session_state: st.session_state.sft_assistant_path = ""
-    if "sft_system_path" not in st.session_state: st.session_state.sft_system_path = ""
-
-    # Callbacks для кнопок [U] [A] [S]
-    def set_user(path): st.session_state.sft_user_path = path
-    def set_assistant(path): st.session_state.sft_assistant_path = path
-    def set_system(path): st.session_state.sft_system_path = path
-    def clear_user(): st.session_state.sft_user_path = ""
-    def clear_assistant(): st.session_state.sft_assistant_path = ""
-    def clear_system(): st.session_state.sft_system_path = ""
-
-    col_tree, col_result = st.columns([3, 2])
+    # ===== АВТОДЕТЕКТ ФОРМАТА =====
+    def detect_chat_field(data: dict) -> tuple:
+        """Ищет поле со списком сообщений (chat-формат)."""
+        for key, value in data.items():
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                first_item = value[0]
+                # Проверяем есть ли поля похожие на role/content
+                has_role = any(k.lower() in ['role', 'from', 'type'] for k in first_item.keys())
+                has_content = any(k.lower() in ['content', 'value', 'text', 'message'] for k in first_item.keys())
+                if has_role and has_content:
+                    return key, value
+        return None, None
     
-    # --- Левая колонка: Дерево JSON ---
-    with col_tree:
-        st.markdown("**📂 Структура JSON** — нажмите кнопку чтобы назначить роль:")
-        st.caption("**[U]** = User, **[A]** = Assistant, **[S]** = System")
-        st.markdown("---")
-        
-        tree_items = flatten_json_structure(sample)
-        
-        for item in tree_items:
-            # Только leaf (конечные поля) показываем с кнопками
-            if item['type'] != 'leaf':
-                # Папки и списки просто показываем как заголовки
-                indent = "&nbsp;" * (item['depth'] * 4)
-                icon = "📁" if item['type'] == 'folder' else "📋"
-                st.markdown(f"{indent}{icon} **{item['key']}** {item['val']}", unsafe_allow_html=True)
-                continue
-            
-            # Для leaf полей — строка с кнопками
-            indent = "&nbsp;" * (item['depth'] * 4)
-            
-            # Определяем, выбрано ли это поле
-            current_role = None
-            if item['path'] == st.session_state.sft_user_path:
-                current_role = "user"
-            elif item['path'] == st.session_state.sft_assistant_path:
-                current_role = "assistant"
-            elif item['path'] == st.session_state.sft_system_path:
-                current_role = "system"
-            
-            # Превью значения
-            val_preview = item['val']
-            if len(val_preview) > 40:
-                val_preview = val_preview[:40] + "..."
-            
-            # Создаем строку
-            cols = st.columns([0.5 + item['depth'] * 0.3, 2.5, 2, 0.6, 0.6, 0.6])
-            
-            with cols[1]:
-                st.markdown(f"📄 **{item['key']}**")
-            
-            with cols[2]:
-                st.caption(f"`{val_preview}`")
-            
-            # Кнопки [U] [A] [S]
-            with cols[3]:
-                if current_role == "user":
-                    st.button("✅U", key=f"u_{item['path']}", on_click=clear_user, help="Убрать User")
-                else:
-                    st.button("U", key=f"u_{item['path']}", on_click=set_user, args=(item['path'],), help="Назначить User")
-            
-            with cols[4]:
-                if current_role == "assistant":
-                    st.button("✅A", key=f"a_{item['path']}", on_click=clear_assistant, help="Убрать Assistant")
-                else:
-                    st.button("A", key=f"a_{item['path']}", on_click=set_assistant, args=(item['path'],), help="Назначить Assistant")
-            
-            with cols[5]:
-                if current_role == "system":
-                    st.button("✅S", key=f"s_{item['path']}", on_click=clear_system, help="Убрать System")
-                else:
-                    st.button("S", key=f"s_{item['path']}", on_click=set_system, args=(item['path'],), help="Назначить System")
-
-    # --- Правая колонка: Результат выбора ---
-    with col_result:
-        st.markdown("**🎯 Выбранные поля:**")
-        
-        # User
-        if st.session_state.sft_user_path:
-            st.success(f"👤 **User:** `{st.session_state.sft_user_path}`")
+    chat_field, chat_value = detect_chat_field(sample)
+    detected_format = "chat" if chat_field else "instruct"
+    
+    # Получаем все пути для instruct режима
+    all_paths = get_all_leaf_paths(sample)
+    simple_fields = [k for k in sample.keys() if not isinstance(sample[k], (dict, list))]
+    
+    col_json, col_config = st.columns([1, 1])
+    
+    # ===== ЛЕВАЯ КОЛОНКА: JSON превью =====
+    with col_json:
+        st.markdown("#### 📄 Пример записи:")
+        with st.container(height=500):
+            st.json(sample, expanded=True)
+    
+    # ===== ПРАВАЯ КОЛОНКА: Конфигурация =====
+    with col_config:
+        # Показываем что автодетект нашел
+        if detected_format == "chat":
+            st.success(f"🔍 **Автодетект:** найден Chat-формат в поле `{chat_field}`")
         else:
-            st.warning("👤 **User:** не выбрано")
+            st.info("🔍 **Автодетект:** Instruct-формат (отдельные поля)")
         
-        # Assistant
-        if st.session_state.sft_assistant_path:
-            st.success(f"🤖 **Assistant:** `{st.session_state.sft_assistant_path}`")
-        else:
-            st.warning("🤖 **Assistant:** не выбрано")
+        # Переключатель режима
+        format_choice = st.radio(
+            "Формат данных:",
+            ["💬 Chat (список сообщений)", "📝 Instruct (отдельные поля)"],
+            index=0 if detected_format == "chat" else 1,
+            key="sft_format_choice",
+            horizontal=True
+        )
         
-        # System (опционально)
-        if st.session_state.sft_system_path:
-            st.info(f"⚙️ **System:** `{st.session_state.sft_system_path}`")
-        else:
-            st.caption("⚙️ **System:** не выбрано (опционально)")
+        is_chat = "Chat" in format_choice
         
         st.markdown("---")
         
-        # Template Config
-        with st.expander("⚙️ Настройки шаблона", expanded=False):
-            sys_p = st.text_area("System Prompt (по умолчанию)", "You are a helpful assistant.", height=80)
+        sft_columns = {}
+        
+        if is_chat:
+            # ===== CHAT РЕЖИМ =====
+            st.markdown("#### 💬 Настройка Chat-формата")
+            
+            # Выбор поля со списком сообщений
+            list_fields = [k for k, v in sample.items() if isinstance(v, list) and v and isinstance(v[0], dict)]
+            
+            if not list_fields:
+                st.error("❌ Не найдено полей со списком сообщений!")
+                return {}
+            
+            messages_field = st.selectbox(
+                "📋 Поле с сообщениями:",
+                list_fields,
+                index=list_fields.index(chat_field) if chat_field in list_fields else 0,
+                key="sft_messages_field"
+            )
+            
+            messages = sample[messages_field]
+            first_msg = messages[0]
+            inner_fields = list(first_msg.keys())
+            
+            st.caption(f"Найдено {len(messages)} сообщений")
+            
+            # Маппинг полей
             c1, c2 = st.columns(2)
-            u_tag = c1.text_input("User Tag", "### User:")
-            a_tag = c2.text_input("Assistant Tag", "### Assistant:")
-            sep = st.text_input("Separator", "\\n\\n")
+            
+            role_guess = next((f for f in inner_fields if f.lower() in ['role', 'from', 'type']), inner_fields[0])
+            content_guess = next((f for f in inner_fields if f.lower() in ['content', 'value', 'text', 'message']), inner_fields[-1])
+            
+            role_field = c1.selectbox(
+                "Поле **роли**:",
+                inner_fields,
+                index=inner_fields.index(role_guess) if role_guess in inner_fields else 0,
+                key="sft_chat_role"
+            )
+            content_field = c2.selectbox(
+                "Поле **текста**:",
+                inner_fields,
+                index=inner_fields.index(content_guess) if content_guess in inner_fields else 0,
+                key="sft_chat_content"
+            )
+            
+            # Уникальные роли
+            unique_roles = sorted(set(str(m.get(role_field, "")) for m in messages))
+            st.caption(f"Роли в данных: `{', '.join(unique_roles)}`")
+            
+            # Маппинг ролей
+            st.markdown("**Соответствие ролей:**")
+            c1, c2, c3 = st.columns(3)
+            
+            sys_guess = next((r for r in unique_roles if 'system' in r.lower()), None)
+            user_guess = next((r for r in unique_roles if r.lower() in ['user', 'human']), unique_roles[0] if unique_roles else "")
+            asst_guess = next((r for r in unique_roles if r.lower() in ['assistant', 'gpt', 'bot']), unique_roles[-1] if len(unique_roles) > 1 else "")
+            
+            role_system = c1.selectbox("⚙️ System =", ["(нет)"] + unique_roles,
+                index=(unique_roles.index(sys_guess) + 1) if sys_guess in unique_roles else 0, key="sft_map_sys")
+            role_user = c2.selectbox("👤 User =", unique_roles,
+                index=unique_roles.index(user_guess) if user_guess in unique_roles else 0, key="sft_map_user")
+            role_assistant = c3.selectbox("🤖 Assistant =", unique_roles,
+                index=unique_roles.index(asst_guess) if asst_guess in unique_roles else 0, key="sft_map_asst")
+            
+            sft_columns = {
+                "format": "chat",
+                "messages_path": messages_field,
+                "role_field": role_field,
+                "content_field": content_field,
+                "role_system": role_system if role_system != "(нет)" else "",
+                "role_user": role_user,
+                "role_assistant": role_assistant
+            }
+            
+        else:
+            # ===== INSTRUCT РЕЖИМ =====
+            st.markdown("#### 📝 Настройка Instruct-формата")
+            st.caption("Выберите поля для каждой роли:")
+            
+            # Все доступные пути
+            field_options = ["(не выбрано)"] + all_paths
+            
+            system_path = st.selectbox("⚙️ **System** (опционально):", field_options, index=0, key="sft_inst_sys")
+            user_path = st.selectbox("👤 **User** (вопрос/инструкция):", field_options, index=0, key="sft_inst_user")
+            assistant_path = st.selectbox("🤖 **Assistant** (ответ):", field_options, index=0, key="sft_inst_asst")
+            
+            if user_path == "(не выбрано)" or assistant_path == "(не выбрано)":
+                st.warning("👆 Выберите поля **User** и **Assistant**")
+                return {}
+            
+            sft_columns = {
+                "format": "instruct",
+                "instruction": user_path,
+                "output": assistant_path,
+                "system_field": system_path if system_path != "(не выбрано)" else ""
+            }
         
-        # Если expander закрыт, используем defaults
-        if 'sys_p' not in dir():
-            sys_p = "You are a helpful assistant."
-            u_tag = "### User:"
-            a_tag = "### Assistant:"
-            sep = "\\n\\n"
+        # ===== НАСТРОЙКИ ШАБЛОНА =====
+        st.markdown("---")
+        with st.expander("🏷️ Теги и системный промпт", expanded=False):
+            default_system = st.text_input("System prompt (по умолч.):", "You are a helpful assistant.", key="sft_def_sys")
+            tc1, tc2 = st.columns(2)
+            user_tag = tc1.text_input("User tag:", "### User:", key="sft_tag_user")
+            assistant_tag = tc2.text_input("Assistant tag:", "### Assistant:", key="sft_tag_asst")
+        
+        if 'default_system' not in dir():
+            default_system, user_tag, assistant_tag = "You are a helpful assistant.", "### User:", "### Assistant:"
         
         sft_template = {
-            "system": sys_p,
-            "separator": sep.replace("\\n", "\n"),
-            "user_tag": u_tag,
-            "bot_tag": a_tag
+            "system": default_system,
+            "separator": "\n\n",
+            "user_tag": user_tag,
+            "bot_tag": assistant_tag
         }
         
-        sft_columns = {
-            "format": "alpaca",
-            "instruction": st.session_state.sft_user_path,
-            "output": st.session_state.sft_assistant_path,
-            "system_field": st.session_state.sft_system_path
-        }
-
-    # --- Превью итогового промпта ---
-    st.markdown("---")
-    st.markdown("### 👁️ Превью итогового промпта")
-    
-    user_path = st.session_state.sft_user_path
-    asst_path = st.session_state.sft_assistant_path
-    sys_path = st.session_state.sft_system_path
-    
-    if user_path and asst_path:
+        # ===== ПРЕВЬЮ =====
+        st.markdown("---")
+        st.markdown("#### 👁️ Превью:")
+        
         try:
-            user_val = str(get_nested_value(sample, user_path) or "")
-            asst_val = str(get_nested_value(sample, asst_path) or "")
+            sep = "\n\n"
+            preview = ""
             
-            # System: из поля или дефолтный
-            sys_val = sft_template["system"]
-            if sys_path:
-                field_sys = get_nested_value(sample, sys_path)
-                if field_sys:
-                    sys_val = str(field_sys)
+            if sft_columns["format"] == "chat":
+                messages = sample[sft_columns["messages_path"]]
+                sys_text = default_system
+                
+                for msg in messages:
+                    role = str(msg.get(sft_columns["role_field"], ""))
+                    content = str(msg.get(sft_columns["content_field"], ""))
+                    
+                    if role == sft_columns["role_system"]:
+                        sys_text = content
+                    elif role == sft_columns["role_user"]:
+                        preview += f"{user_tag}\n{content[:200]}{'...' if len(content) > 200 else ''}{sep}"
+                    elif role == sft_columns["role_assistant"]:
+                        preview += f"{assistant_tag}\n{content[:200]}{'...' if len(content) > 200 else ''}{sep}"
+                
+                preview = f"{sys_text}{sep}" + preview + "<|endoftext|>"
+            else:
+                user_val = str(get_nested_value(sample, sft_columns["instruction"]) or "")[:300]
+                asst_val = str(get_nested_value(sample, sft_columns["output"]) or "")[:300]
+                sys_val = default_system
+                if sft_columns.get("system_field"):
+                    field_sys = get_nested_value(sample, sft_columns["system_field"])
+                    if field_sys: sys_val = str(field_sys)[:200]
+                
+                preview = f"{sys_val}{sep}{user_tag}\n{user_val}{sep}{assistant_tag}\n{asst_val}<|endoftext|>"
             
-            sep = sft_template["separator"]
+            with st.container(height=180):
+                st.code(preview, language=None)
             
-            preview = f"{sys_val}{sep}"
-            preview += f"{sft_template['user_tag']}\n{user_val}{sep}"
-            preview += f"{sft_template['bot_tag']}\n{asst_val}<|endoftext|>"
-            
-            st.code(preview, language=None)
+            st.success("✅ Готово!")
             
         except Exception as e:
             st.error(f"Ошибка: {e}")
-    else:
-        st.info("👈 Выберите поля **User** и **Assistant** в дереве слева")
 
     return {"sft_columns": sft_columns, "sft_template": sft_template}
 
@@ -1070,8 +1202,8 @@ def render_output_config(model_name="training_run"):
         "Save Checkpoint Every N Steps",
         min_value=100,
         max_value=50000,
-        value=2000,
-        step=500,
+        value=200,
+        step=100,
         help="Как часто сохранять чекпоинты"
     )
     
@@ -1544,7 +1676,9 @@ def render_data_manager():
             "🟢 Pretrain: FineWeb-2 (Russian)": "HuggingFaceFW/fineweb-2",
             "🟢 Pretrain: FineWeb-Edu (Educational)": "HuggingFaceFW/fineweb-edu",
             "🟢 Pretrain: Wikitext-103": "wikitext",
-            "🔵 SFT: OpenOrca-ru (перевод OpenOrca на русском языке)": "d0rj/OpenOrca-ru",
+            "🔵 SFT: OpenOrca-ru (перевод OpenOrca на русском языке от d0rj)": "d0rj/OpenOrca-ru",
+            "🔵 SFT: ru-instruct (сборный датасет из разных источников от d0rj)": "d0rj/ru-instruct",
+            "🔵 SFT: GrandMaster-PRO-MAX (набор данных для SFT от VikhrModels)": "Vikhrmodels/GrandMaster-PRO-MAX",
         }
         def on_preset_change():
             """Callback для обновления поля ввода при выборе пресета."""
