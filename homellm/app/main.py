@@ -1665,11 +1665,6 @@ def render_data_manager():
 
         # Секция 2: Загрузка с HuggingFace
         st.subheader("🤗 Скачать с HuggingFace")
-        
-        # Интерактивное состояние для репозитория
-        if "ds_repo_info" not in st.session_state:
-            st.session_state.ds_repo_info = {} 
-
         # Словарь пресетов: {название: (repo_id, subset, split)}
         presets = {
             "🟢 Pretrain: FineWeb-2 (Russian)": ("HuggingFaceFW/fineweb-2", "rus_Cyrl", "train"),
@@ -1689,6 +1684,20 @@ def render_data_manager():
         if "hf_split_default" not in st.session_state:
             st.session_state.hf_split_default = "train"
         
+        # Предзаполняем кэш для дефолтного пресета (FineWeb-2)
+        # чтобы пользователь мог сразу скачивать без нажатия "Проверить"
+        if "ds_repo_info" not in st.session_state:
+            st.session_state.ds_repo_info = {}
+        
+        default_repo = "HuggingFaceFW/fineweb-2"
+        if default_repo not in st.session_state.ds_repo_info:
+            st.session_state.ds_repo_info[default_repo] = {
+                "configs": ["rus_Cyrl"],  # Дефолтный язык
+                "splits": ["train", "test"],  # Известные splits
+                "features": {},  # Заполнится при проверке
+                "selected_config": "rus_Cyrl"
+            }
+        
         def on_preset_change():
             """Callback для обновления всех полей при выборе пресета."""
             sel = st.session_state.dataset_preset_selector
@@ -1697,6 +1706,12 @@ def render_data_manager():
                 st.session_state.hf_repo_id_input = preset_data[0]
                 st.session_state.hf_subset_default = preset_data[1]
                 st.session_state.hf_split_default = preset_data[2]
+                
+                # Сбрасываем selectbox чтобы применились новые дефолты
+                if "hf_split_select" in st.session_state:
+                    del st.session_state.hf_split_select
+                if "hf_subset_select" in st.session_state:
+                    del st.session_state.hf_subset_select
 
         # Селектор пресетов (по умолчанию FineWeb-2 Russian)
         st.selectbox(
@@ -1717,16 +1732,22 @@ def render_data_manager():
                     # 1. Получаем конфиги
                     configs = get_dataset_config_names(repo_id)
                     
-                    # 2. Получаем сплиты (берем первый конфиг по дефолту)
-                    default_config = configs[0] if configs else None
+                    # 2. Выбираем конфиг для получения splits/features
+                    # Приоритет: дефолтный (rus_Cyrl) > первый в списке
+                    default_subset = st.session_state.hf_subset_default
+                    if default_subset in configs:
+                        selected_config = default_subset
+                    else:
+                        selected_config = configs[0] if configs else None
+                    
                     splits = []
                     features_info = {}
                     
-                    if default_config:
-                        splits = get_dataset_split_names(repo_id, default_config)
+                    if selected_config:
+                        splits = get_dataset_split_names(repo_id, selected_config)
                         # 3. Пытаемся получить информацию о структуре (features)
                         try:
-                            ds_builder = load_dataset_builder(repo_id, default_config)
+                            ds_builder = load_dataset_builder(repo_id, selected_config)
                             if ds_builder.info.features:
                                 features_info = ds_builder.info.features
                         except Exception as e:
@@ -1735,9 +1756,18 @@ def render_data_manager():
                     st.session_state.ds_repo_info[repo_id] = {
                         "configs": configs,
                         "splits": splits,
-                        "features": features_info
+                        "features": features_info,
+                        "selected_config": selected_config  # Запоминаем для какого конфига splits
                     }
-                    st.success(f"Найдено {len(configs)} конфигураций")
+                    
+                    # ВАЖНО: Сбрасываем выбор виджетов чтобы применились новые данные
+                    # Устанавливаем дефолтные значения
+                    if "hf_split_select" in st.session_state:
+                        del st.session_state.hf_split_select
+                    if "hf_subset_select" in st.session_state:
+                        del st.session_state.hf_subset_select
+                    
+                    st.success(f"✅ Найдено {len(configs)} конфигураций, splits: {splits}")
             except Exception as e:
                 st.error(f"Не удалось получить информацию: {e}")
 

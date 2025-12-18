@@ -426,38 +426,48 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         # Чтобы при инференсе (в чате) модель знала свои теги (User/Assistant)
         if stage == "sft" and config.get("sft_template"):
             tmpl = config["sft_template"]
-            # Формируем Jinja2 шаблон для HuggingFace
-            # Он будет автоматически подставлять system, user_tag, bot_tag и separator
-            # Обратите внимание: мы жестко вшиваем значения из конфига в строку шаблона
             
-            sys = tmpl.get('system', '')
+            # Получаем настройки шаблона
+            default_sys = tmpl.get('system', 'You are a helpful assistant.')
             u_tag = tmpl.get('user_tag', '### User:')
             b_tag = tmpl.get('bot_tag', '### Assistant:')
-            sep = tmpl.get('separator', '\n\n').replace('\n', '\\n') # Экранируем для json
             
-            # Шаблон:
-            # 1. System prompt (если есть)
-            # 2. Цикл по сообщениям
-            # 3. Generation prompt (тег ассистента в конце)
+            # Экранируем специальные символы для jinja (одинарные кавычки)
+            default_sys_escaped = default_sys.replace("'", "\\'")
+            u_tag_escaped = u_tag.replace("'", "\\'")
+            b_tag_escaped = b_tag.replace("'", "\\'")
+            
+            # Jinja2 шаблон для HuggingFace
+            # Структура:
+            # 1. System prompt: из messages[0] если role=='system', иначе дефолтный
+            # 2. Цикл по user/assistant сообщениям
+            # 3. Generation prompt (тег ассистента в конце если add_generation_prompt)
+            #
+            # ВАЖНО: В jinja используем '\n' как реальные переносы строк через \\n в Python
             
             jinja_template = (
-                f"{{% if messages[0]['role'] == 'system' %}}"
-                f"{{{{ messages[0]['content'] + '{sep}' }}}}"
-                f"{{% endif %}}"
-                f"{{% for message in messages %}}"
-                f"{{% if message['role'] == 'user' %}}"
-                f"{{{{ '{u_tag}\\n' + message['content'] + '{sep}' }}}}"
-                f"{{% elif message['role'] == 'assistant' %}}"
-                f"{{{{ '{b_tag}\\n' + message['content'] + '{sep}' }}}}"
-                f"{{% endif %}}"
-                f"{{% endfor %}}"
-                f"{{% if add_generation_prompt %}}"
-                f"{{{{ '{b_tag}\\n' }}}}"
-                f"{{% endif %}}"
+                # System prompt
+                "{% if messages[0]['role'] == 'system' %}"
+                "{{ messages[0]['content'] }}\n\n"
+                "{% else %}"
+                f"{{{{ '{default_sys_escaped}' }}}}\n\n"
+                "{% endif %}"
+                # Messages loop (skip system in loop)
+                "{% for message in messages %}"
+                "{% if message['role'] == 'user' %}"
+                f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                "{% elif message['role'] == 'assistant' %}"
+                f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                "{% endif %}"
+                "{% endfor %}"
+                # Generation prompt (без лишних \n т.к. уже есть после последнего сообщения)
+                "{% if add_generation_prompt %}"
+                f"{b_tag_escaped}\n"
+                "{% endif %}"
             )
             
             tokenizer.chat_template = jinja_template
-            logger.info("Saved custom chat_template to tokenizer")
+            logger.info(f"Saved chat_template: user_tag='{u_tag}', bot_tag='{b_tag}'")
 
         unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_model.save_pretrained(final_dir, save_function=accelerator.save)

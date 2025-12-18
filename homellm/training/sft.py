@@ -102,7 +102,9 @@ class SFTDataset(IterableDataset):
                         role_assistant = self.cols.get("role_assistant", "assistant")
                         
                         # Формируем текст
-                        sys_text = self.tmpl.get("system", "")
+                        # Дефолтный system prompt из конфига (всегда используем для консистентности с инференсом)
+                        default_system = self.tmpl.get("system", "You are a helpful assistant.")
+                        sys_text = default_system  # Начинаем с дефолтного
                         user_texts = []
                         assistant_texts = []
                         
@@ -112,8 +114,8 @@ class SFTDataset(IterableDataset):
                             role = str(m.get(role_field, ""))
                             content = str(m.get(content_field, ""))
                             
-                            if role == role_system:
-                                sys_text = content
+                            if role == role_system and content.strip():
+                                sys_text = content  # Переопределяем если есть в данных
                             elif role == role_user:
                                 user_texts.append(content)
                             elif role == role_assistant:
@@ -123,8 +125,9 @@ class SFTDataset(IterableDataset):
                             continue
                         
                         # Строим промпт
+                        # Формат: {system}\n\n{user_tag}\n{user}\n\n{bot_tag}\n{assistant}\n\n<eos>
                         sep = self.tmpl.get("separator", "\n\n")
-                        text = f"{sys_text}{sep}" if sys_text else ""
+                        text = f"{sys_text}{sep}"  # System всегда есть (как при инференсе)
                         
                         # Чередуем user/assistant
                         for i in range(max(len(user_texts), len(assistant_texts))):
@@ -133,28 +136,31 @@ class SFTDataset(IterableDataset):
                             if i < len(assistant_texts):
                                 text += f"{self.tmpl['bot_tag']}\n{assistant_texts[i]}{sep}"
                         
-                        text = text.rstrip(sep) + self.tokenizer.eos_token
+                        text += self.tokenizer.eos_token
                     
                     # 2. Instruct Format (отдельные поля)
                     else:
                         instr = self._get_nested(data, self.cols.get("instruction", "instruction")) or ""
                         out = self._get_nested(data, self.cols.get("output", "output")) or ""
                         
-                        # System Prompt
+                        # System Prompt (всегда используем для консистентности с инференсом)
+                        default_system = self.tmpl.get("system", "You are a helpful assistant.")
+                        sys_val = default_system  # Начинаем с дефолтного
+                        
                         sys_field = self.cols.get("system_field")
-                        sys_val = self.tmpl.get("system", "")
                         if sys_field:
                             val_in_data = self._get_nested(data, sys_field)
-                            if val_in_data:
-                                sys_val = str(val_in_data)
+                            if val_in_data and str(val_in_data).strip():
+                                sys_val = str(val_in_data)  # Переопределяем если есть в данных
                         
                         if not instr and not out:
                             continue
                         
+                        # Формат: {system}\n\n{user_tag}\n{instr}\n\n{bot_tag}\n{out}\n\n<eos>
                         sep = self.tmpl.get("separator", "\n\n")
-                        text = f"{sys_val}{sep}" if sys_val else ""
+                        text = f"{sys_val}{sep}"  # System всегда есть (как при инференсе)
                         text += f"{self.tmpl['user_tag']}\n{instr}{sep}"
-                        text += f"{self.tmpl['bot_tag']}\n{out}{self.tokenizer.eos_token}"
+                        text += f"{self.tmpl['bot_tag']}\n{out}{sep}{self.tokenizer.eos_token}"
                     
                     if not text or len(text.strip()) < 10:
                         continue
