@@ -1087,8 +1087,8 @@ def render_training_config():
     batch_size = st.sidebar.slider(
         "Batch Size",
         min_value=1,
-        max_value=64,
-        value=16,
+        max_value=256,
+        value=4,
         help="Размер батча"
     )
     
@@ -1096,7 +1096,7 @@ def render_training_config():
         "Gradient Accumulation",
         min_value=1,
         max_value=32,
-        value=4,
+        value=8,
         help="Шаги накопления градиента"
     )
     
@@ -1670,33 +1670,45 @@ def render_data_manager():
         if "ds_repo_info" not in st.session_state:
             st.session_state.ds_repo_info = {} 
 
-        # Словарь пресетов
+        # Словарь пресетов: {название: (repo_id, subset, split)}
         presets = {
-            "👇 Выберите из списка или введите вручную...": None,
-            "🟢 Pretrain: FineWeb-2 (Russian)": "HuggingFaceFW/fineweb-2",
-            "🟢 Pretrain: FineWeb-Edu (Educational)": "HuggingFaceFW/fineweb-edu",
-            "🟢 Pretrain: Wikitext-103": "wikitext",
-            "🔵 SFT: OpenOrca-ru (перевод OpenOrca на русском языке от d0rj)": "d0rj/OpenOrca-ru",
-            "🔵 SFT: ru-instruct (сборный датасет из разных источников от d0rj)": "d0rj/ru-instruct",
-            "🔵 SFT: GrandMaster-PRO-MAX (набор данных для SFT от VikhrModels)": "Vikhrmodels/GrandMaster-PRO-MAX",
+            "🟢 Pretrain: FineWeb-2 (Russian)": ("HuggingFaceFW/fineweb-2", "rus_Cyrl", "train"),
+            "🟢 Pretrain: FineWeb-Edu (Educational)": ("HuggingFaceFW/fineweb-edu", "default", "train"),
+            "🟢 Pretrain: Wikitext-103": ("wikitext", "wikitext-103-v1", "train"),
+            "🔵 SFT: OpenOrca-ru": ("d0rj/OpenOrca-ru", "default", "train"),
+            "🔵 SFT: ru-instruct": ("d0rj/ru-instruct", "default", "train"),
+            "🔵 SFT: GrandMaster-PRO-MAX": ("Vikhrmodels/GrandMaster-PRO-MAX", "default", "train"),
+            "📝 Ввести вручную...": (None, None, None),
         }
+        
+        # Инициализация дефолтных значений (FineWeb-2 Russian)
+        if "hf_repo_id_input" not in st.session_state:
+            st.session_state.hf_repo_id_input = "HuggingFaceFW/fineweb-2"
+        if "hf_subset_default" not in st.session_state:
+            st.session_state.hf_subset_default = "rus_Cyrl"
+        if "hf_split_default" not in st.session_state:
+            st.session_state.hf_split_default = "train"
+        
         def on_preset_change():
-            """Callback для обновления поля ввода при выборе пресета."""
+            """Callback для обновления всех полей при выборе пресета."""
             sel = st.session_state.dataset_preset_selector
-            if presets.get(sel):
-                st.session_state.hf_repo_id_input = presets[sel]
+            preset_data = presets.get(sel)
+            if preset_data and preset_data[0]:
+                st.session_state.hf_repo_id_input = preset_data[0]
+                st.session_state.hf_subset_default = preset_data[1]
+                st.session_state.hf_split_default = preset_data[2]
 
-        # Селектор пресетов
+        # Селектор пресетов (по умолчанию FineWeb-2 Russian)
         st.selectbox(
             "📚 Популярные датасеты",
             options=list(presets.keys()),
-            index=0,
+            index=0,  # FineWeb-2 Russian первый
             key="dataset_preset_selector",
             on_change=on_preset_change,
-            help="Выберите готовый датасет для автоматического заполнения ID"
+            help="Выберите готовый датасет — все поля заполнятся автоматически"
         )
 
-        repo_id = st.text_input("Репозиторий (ID)", value="HuggingFaceFW/fineweb-2", key="hf_repo_id_input")
+        repo_id = st.text_input("Репозиторий (ID)", key="hf_repo_id_input")
         
         # Кнопка проверки репозитория
         if st.button("🔍 Проверить репозиторий"):
@@ -1736,14 +1748,21 @@ def render_data_manager():
         features = repo_info.get("features", {})
         
         if available_configs:
-            subset = st.selectbox("Subset (конфиг)", available_configs, key="hf_subset_select")
+            # Если есть дефолтный subset, пытаемся найти его в списке
+            default_idx = 0
+            if st.session_state.hf_subset_default in available_configs:
+                default_idx = available_configs.index(st.session_state.hf_subset_default)
+            subset = st.selectbox("Subset (конфиг)", available_configs, index=default_idx, key="hf_subset_select")
         else:
-            subset = st.text_input("Subset (конфиг)", "default", key="hf_subset_input")
+            subset = st.text_input("Subset (конфиг)", st.session_state.hf_subset_default, key="hf_subset_input")
         
         if available_splits:
-             split = st.selectbox("Split", available_splits, key="hf_split_select")
+            default_idx = 0
+            if st.session_state.hf_split_default in available_splits:
+                default_idx = available_splits.index(st.session_state.hf_split_default)
+            split = st.selectbox("Split", available_splits, index=default_idx, key="hf_split_select")
         else:
-             split = st.text_input("Split", "train", key="hf_split_input")
+            split = st.text_input("Split", st.session_state.hf_split_default, key="hf_split_input")
 
         # --- УМНЫЕ ФИЛЬТРЫ ---
         with st.expander("🛠️ Фильтры и Лимиты", expanded=True):
