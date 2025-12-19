@@ -206,6 +206,7 @@ class HomeModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([HomeBlock(config) for _ in range(config.num_hidden_layers)])
         self.final_norm = RMSNorm(config.hidden_size)
+        self.gradient_checkpointing = False  # Флаг для checkpointing
 
         # Precompute RoPE
         cos, sin = precompute_freqs_cis(
@@ -227,16 +228,41 @@ class HomeModel(nn.Module):
             position_ids = torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0)
 
         hidden_states = self.embed_tokens(input_ids)
+        
         presents = [] if use_cache else None
+        cos_sin = (self.rope_cos, self.rope_sin)
+        
         for i, layer in enumerate(self.layers):
             past = past_key_values[i] if past_key_values is not None else None
-            hidden_states, present = layer(
-                hidden_states,
-                (self.rope_cos, self.rope_sin),
-                position_ids,
-                past,
-                use_cache,
-            )
+            
+            if self.gradient_checkpointing and self.training and not use_cache:
+                # Простая обёртка - передаём layer через замыкание с немедленным захватом
+                def make_ckpt_fn(block, cs):
+                    def fn(hidden, pos_ids):
+                        out, _ = block(hidden, cs, pos_ids, None, False)
+                        return out
+                    return fn
+                
+                # Создаём функцию с захватом текущего layer
+                ckpt_forward = make_ckpt_fn(layer, cos_sin)
+                
+                # Вызываем checkpoint
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    ckpt_forward, 
+                    hidden_states, 
+                    position_ids,
+                    use_reentrant=False,
+                )
+                present = None
+            else:
+                hidden_states, present = layer(
+                    hidden_states,
+                    cos_sin,
+                    position_ids,
+                    past,
+                    use_cache,
+                )
+            
             if use_cache:
                 presents.append(present)
 
@@ -248,6 +274,7 @@ class HomeForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = HomeConfig
     base_model_prefix = "home_model"
     _tied_weights_keys = ["lm_head.weight"]
+    _supports_gradient_checkpointing = True  # Новый формат
 
     def __init__(self, config: HomeConfig):
         super().__init__(config)
@@ -258,6 +285,25 @@ class HomeForCausalLM(PreTrainedModel, GenerationMixin):
         self.lm_head.weight = self.home_model.embed_tokens.weight
 
         self.post_init()
+    
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Включает gradient checkpointing для модели."""
+        # Устанавливаем флаг на HomeModel
+        self.home_model.gradient_checkpointing = True
+        # Сохраняем kwargs для checkpointing
+        if gradient_checkpointing_kwargs is None:
+            gradient_checkpointing_kwargs = {"use_reentrant": False}
+        
+        def ckpt_func(fn, *args):
+            return torch.utils.checkpoint.checkpoint(fn, *args, **gradient_checkpointing_kwargs)
+        
+        self.home_model._gradient_checkpointing_func = ckpt_func
+    
+    def gradient_checkpointing_disable(self):
+        """Выключает gradient checkpointing."""
+        self.home_model.gradient_checkpointing = False
+        if hasattr(self.home_model, '_gradient_checkpointing_func'):
+            delattr(self.home_model, '_gradient_checkpointing_func')
     
     def tie_weights(self):
         """Привязать веса lm_head к embed_tokens."""
