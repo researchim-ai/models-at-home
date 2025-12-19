@@ -225,7 +225,15 @@ class HomeModel(nn.Module):
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         if position_ids is None:
-            position_ids = torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+            past_len = 0
+            if past_key_values is not None and len(past_key_values) > 0 and past_key_values[0] is not None:
+                pk, _ = past_key_values[0]
+                # pk: [bs, heads, past_len, head_dim]
+                past_len = int(pk.size(2))
+            position_ids = torch.arange(
+                past_len, past_len + input_ids.shape[1],
+                device=input_ids.device
+            ).unsqueeze(0)
 
         hidden_states = self.embed_tokens(input_ids)
         

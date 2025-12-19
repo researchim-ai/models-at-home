@@ -396,11 +396,11 @@ def start_training(config: dict) -> str:
     
     if distributed_mode != "default" and config_file:
         # Используем accelerate launch с конфигом
+        # ВАЖНО: gradient_accumulation_steps передается через config.json, не через CLI флаги
         cmd = [
             "accelerate", "launch",
             "--config_file", config_file,
             "--num_processes", str(num_gpus),
-            "--gradient_accumulation_steps", str(config.get("gradient_accumulation", 1)),
             "-m", "homellm.app.trainer_worker",
             "--config", str(config_path),
             "--metrics", str(metrics_path)
@@ -428,6 +428,10 @@ def start_training(config: dict) -> str:
         stderr=stderr_file,
         start_new_session=True,  # Отделяем от родительского процесса
     )
+    
+    # Сохраняем файловые дескрипторы для закрытия при остановке
+    st.session_state[f"stdout_file_{run_id}"] = stdout_file
+    st.session_state[f"stderr_file_{run_id}"] = stderr_file
     
     # Сохраняем PID для мониторинга
     pid_path = run_dir / "pid"
@@ -1229,12 +1233,13 @@ def render_output_config(model_name="training_run"):
     # Показываем информацию о чекпоинтах
     output_path = PROJECT_ROOT / output_dir
     if output_path.exists():
-        checkpoints = list(output_path.glob("checkpoint_*"))
-        final_model = output_path / "final_model"
+        checkpoints = list(output_path.rglob("checkpoint_step*"))
+        final_models = list(output_path.rglob("final_model"))
+        final_model = final_models[0] if final_models else None
         
-        if checkpoints or final_model.exists():
+        if checkpoints or final_model:
             st.sidebar.caption(f"📦 Найдено чекпоинтов: {len(checkpoints)}")
-            if final_model.exists():
+            if final_model and final_model.exists():
                 st.sidebar.caption("✅ Финальная модель сохранена")
     
     return {
@@ -1400,7 +1405,14 @@ def render_distributed_config():
     }
 
 
-@st.fragment(run_every=3)  # Автообновление каждые 3 секунды
+# Graceful fallback для @st.fragment (работает только в новых версиях Streamlit)
+try:
+    fragment = st.fragment
+except (AttributeError, Exception):
+    # Fallback для старых версий Streamlit
+    fragment = lambda *args, **kwargs: lambda fn: fn
+
+@fragment(run_every=3)  # Автообновление каждые 3 секунды
 def live_metrics_fragment():
     """Fragment для живого обновления метрик без перезагрузки всей страницы."""
     if not st.session_state.current_run_id:
@@ -1902,29 +1914,15 @@ def render_data_manager():
                 spl = st.session_state.get('hf_split_input')
                 
             l_type = st.session_state.get('limit_type')
-            l_val = st.session_state.get('limit_val')
+            l_val = st.session_state.get('limit_val', 0) or 0
             
             l_gb = st.session_state.get('limit_gb', 2.0)
             l_bytes = int(l_gb * 1024**3)
 
             s_path = st.session_state.get('save_filename')
             
-            # Собираем фильтры
-            filters_to_pass = {}
-            
-            # 1. Динамические фильтры
-            if active_filters_map:
-                if "score_col" in active_filters_map:
-                    filters_to_pass["score_col"] = active_filters_map["score_col"]
-                    filters_to_pass["min_score"] = st.session_state.get("filter_score", 0.0)
-                
-                if "lang_col" in active_filters_map:
-                    filters_to_pass["lang_col"] = active_filters_map["lang_col"]
-                    filters_to_pass["target_lang"] = st.session_state.get("filter_lang", "ru")
-            
-            # 2. Фолбэк для FineWeb (удален, так как вызывал путаницу)
-            # elif "fineweb" in r_id.lower():
-            #      pass
+            # Передаём фильтры как есть (active_filters_map уже содержит нужные ключи)
+            filters_to_pass = active_filters_map or None
             
             download_hf_dataset(r_id, sub, spl, l_type, l_val, l_bytes, s_path, filters=filters_to_pass)
 
@@ -2299,6 +2297,10 @@ def main():
     full_config["num_gpus"] = distributed_config["num_gpus"]
     full_config["config_file"] = distributed_config["config_file"]
     
+    # Для SFT используем токенизатор базовой модели (если он там сохранён)
+    if model_config.get("stage") == "sft" and model_config.get("base_model_path"):
+        full_config["tokenizer_path"] = model_config["base_model_path"]
+    
     # Main content
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🚀 Запуск", "📊 Мониторинг", "💬 Чат", "📜 История", "💾 Данные", "📚 Учебник"])
     
@@ -2499,6 +2501,7 @@ def main():
                             # Определяем тип чекпоинта
                             config_json = model_path / "config.json"
                             model_safetensors = model_path / "model.safetensors"
+                            model_bin = model_path / "pytorch_model.bin"
                             tokenizer_json = model_path / "tokenizer.json"
                             tokenizer_config = model_path / "tokenizer_config.json"
                             
@@ -2515,7 +2518,7 @@ def main():
                                 st.session_state.chat_model = HomeForCausalLM.from_pretrained(
                                     str(model_path)
                                 ).to(device)
-                            elif model_safetensors.exists():
+                            elif model_safetensors.exists() or model_bin.exists():
                                 # Accelerate checkpoint формат
                                 st.info("Загружаем Accelerate чекпоинт...")
                                 
@@ -2556,7 +2559,10 @@ def main():
                                 st.session_state.chat_model = HomeForCausalLM(config)
                                 
                                 # Загружаем веса
-                                state_dict = load_file(str(model_safetensors))
+                                if model_safetensors.exists():
+                                    state_dict = load_file(str(model_safetensors))
+                                else:
+                                    state_dict = torch.load(str(model_bin), map_location="cpu")
                                 missing, unexpected = st.session_state.chat_model.load_state_dict(state_dict, strict=False)
                                 
                                 # Умная проверка пропущенных ключей

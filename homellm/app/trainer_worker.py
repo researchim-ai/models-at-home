@@ -84,10 +84,15 @@ def get_gpu_stats():
 
 
 class MetricsLogger:
-    """Логгер метрик в JSON файл для визуализации."""
+    """Логгер метрик в JSON файл для визуализации.
     
-    def __init__(self, log_path: Path):
+    ВАЖНО: В Multi-GPU режиме должен использоваться только на main process (rank 0),
+    чтобы избежать гонок при записи в один файл.
+    """
+    
+    def __init__(self, log_path: Path, enabled: bool = True):
         self.log_path = log_path
+        self.enabled = enabled
         self.start_timestamp = time.time()
         self.metrics = {
             "status": "initializing",
@@ -109,14 +114,39 @@ class MetricsLogger:
         self._save()
     
     def _save(self):
-        with open(self.log_path, "w") as f:
-            json.dump(self.metrics, f, indent=2)
+        """Атомарная запись через временный файл для избежания гонок."""
+        if not self.enabled:
+            return
+        
+        # Создаём родительскую директорию если нужно
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Атомарная запись через временный файл
+        tmp_path = self.log_path.with_suffix(".tmp")
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(self.metrics, f, indent=2)
+            os.replace(tmp_path, self.log_path)
+        except Exception as e:
+            # Если не удалось записать, пытаемся удалить tmp файл
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except:
+                pass
+            # Логируем ошибку, но не падаем
+            logger.warning(f"Failed to save metrics: {e}")
     
     def update(self, **kwargs):
+        if not self.enabled:
+            return
         self.metrics.update(kwargs)
         self._save()
     
     def log_step(self, step: int, loss: float, lr: float, samples_per_sec: float = 0, step_time: float = 0):
+        if not self.enabled:
+            return
+        
         self.metrics["current_step"] = step
         self.metrics["current_loss"] = loss
         self.metrics["current_lr"] = lr
@@ -139,6 +169,9 @@ class MetricsLogger:
         self._save()
     
     def log_checkpoint(self, path: str):
+        if not self.enabled:
+            return
+        
         self.metrics["checkpoints"].append({
             "path": path,
             "step": self.metrics["current_step"],
@@ -150,29 +183,40 @@ class MetricsLogger:
 def run_training(config: Dict[str, Any], metrics_path: Path):
     """Запуск тренировки с записью метрик."""
     
-    metrics = MetricsLogger(metrics_path)
+    # Mixed precision
+    mixed_precision = config.get("mixed_precision", "no")
+    stage = config.get("stage", "pretrain") # pretrain | sft
+    
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config["gradient_accumulation"],
+        mixed_precision=mixed_precision,
+    )
+    
+    # ВАЖНО: MetricsLogger только на main process для избежания гонок при Multi-GPU
+    metrics = MetricsLogger(metrics_path, enabled=accelerator.is_main_process)
     
     try:
         metrics.update(status="loading_tokenizer")
         
-        # Mixed precision
-        mixed_precision = config.get("mixed_precision", "no")
-        stage = config.get("stage", "pretrain") # pretrain | sft
-        
-        accelerator = Accelerator(
-            gradient_accumulation_steps=config["gradient_accumulation"],
-            mixed_precision=mixed_precision,
-        )
-        
         # Tokenizer
-        tokenizer_path = config.get("tokenizer_path", "gpt2") # Fallback to gpt2 if missing
+        # Для SFT важно использовать токенизатор базовой модели (если он там сохранён)
+        tokenizer_path = config.get("tokenizer_path", "gpt2")
+        
+        if stage == "sft" and config.get("base_model_path"):
+            bp = Path(config["base_model_path"])
+            # Проверяем наличие файлов токенизатора в базовой модели
+            if (bp / "tokenizer.json").exists() or (bp / "tokenizer_config.json").exists() or (bp / "vocab.json").exists():
+                tokenizer_path = str(bp)
+                logger.info(f"Using tokenizer from base model: {tokenizer_path}")
+        
         try:
-             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        except:
-             # Если путь к токенизатору кривой или это путь к чекпоинту без токенизатора
-             logger.warning(f"Failed to load tokenizer from {tokenizer_path}, falling back to gpt2")
-             tokenizer = AutoTokenizer.from_pretrained("gpt2")
-             
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+        except Exception as e:
+            # Если путь к токенизатору кривой или это путь к чекпоинту без токенизатора
+            logger.warning(f"Failed to load tokenizer from {tokenizer_path}, falling back to gpt2: {e}")
+            tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        
+        # pad token: лучше иметь, иначе паддинг/коллатор могут чудить
         if tokenizer.pad_token is None:
             tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
         
@@ -185,7 +229,9 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 tokenizer,
                 seq_len=config["seq_len"],
                 sft_columns=config.get("sft_columns"),
-                sft_template=config.get("sft_template")
+                sft_template=config.get("sft_template"),
+                num_replicas=accelerator.num_processes,
+                rank=accelerator.process_index
             )
             
             # Получаем пример сформированного промпта для отображения
@@ -196,6 +242,9 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     logger.info("Sample prompt saved to metrics")
             except Exception as e:
                 logger.warning(f"Failed to get sample prompt: {e}")
+            
+            # Логируем статистику датасета (после первого прохода будет обновлена)
+            logger.info(f"SFTDataset initialized: num_replicas={train_dataset.num_replicas}, rank={train_dataset.rank}")
             
             # Для SFT data collator не нужен специальный masking, 
             # но нужно просто паддить тензоры в батче.
@@ -280,6 +329,16 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             )
             model = HomeForCausalLM(model_config)
         
+        # Если vocab токенизатора изменился (например добавили pad_token) — расширяем эмбеддинги
+        # Это важно для обоих случаев: pretrain (vocab может измениться после добавления pad_token)
+        # и SFT (vocab базовой модели может отличаться от токенизатора)
+        if model.config.vocab_size != len(tokenizer):
+            logger.info(f"Resizing token embeddings: {model.config.vocab_size} -> {len(tokenizer)}")
+            model.resize_token_embeddings(len(tokenizer))
+            model.config.vocab_size = len(tokenizer)
+            if hasattr(model, "tie_weights"):
+                model.tie_weights()
+        
         # Подсчёт параметров
         num_params = sum(p.numel() for p in model.parameters())
         metrics.update(num_parameters=num_params)
@@ -329,9 +388,13 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         global_step = 0
         start_time = time.time()
         
-        # Переменные для накопления метрик (Loss)
-        accumulated_loss = 0.0
-        accumulation_steps_count = 0
+        # Loss tracking:
+        # - micro_* для проверки divergence на КАЖДОМ update-step
+        # - log_* для сглаженного лога (усреднение по update-step-ам между логами)
+        micro_loss_sum = 0.0
+        micro_count = 0
+        log_loss_sum = 0.0
+        log_updates = 0
         update_start_time = time.time()
 
         training_complete = False
@@ -349,24 +412,20 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     outputs = model(**batch)
                     loss = outputs.loss
                     
-                    # Накапливаем loss для логирования (среднее по шагам аккумуляции)
                     loss_val = loss.detach().float().item()
                     
-                    # Проверка на NaN / Infinity (Divergence Check)
-                    if math.isnan(loss_val) or math.isinf(loss_val):
-                        # Если это единичный случай, мы можем пропустить (как ниже), 
-                        # но если это происходит постоянно или при accum step - это проблема.
-                        # В данной реализации мы пока просто игнорируем для подсчета среднего,
-                        # но если ВСЕ шаги будут NaN, то accumulated_loss останется 0 (или NaN при делении).
-                        pass
-                    else:
-                        accumulated_loss += loss_val
-                        accumulation_steps_count += 1
+                    # micro-аккумулятор: только для текущего update-step
+                    if not (math.isnan(loss_val) or math.isinf(loss_val)):
+                        micro_loss_sum += loss_val
+                        micro_count += 1
                     
                     accelerator.backward(loss)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
+                    
+                    # ВАЖНО: шаг оптимизатора только на update-step
+                    if accelerator.sync_gradients:
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
                 
                 # Проверяем, произошел ли шаг оптимизатора (синхронизация градиентов)
                 if accelerator.sync_gradients:
@@ -376,21 +435,29 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     update_time = time.time() - update_start_time
                     update_start_time = time.time()
                     
-                    # Проверка на критический сбой обучения (NaN Loss)
-                    # Если accumulation_steps_count == 0, значит все микро-шаги были NaN/Inf
-                    if accumulation_steps_count == 0:
+                    # Если на ВСЕХ микро-шагах update-step был NaN/Inf — останавливаемся
+                    if micro_count == 0:
                         logger.error(f"Loss is NaN or Inf at step {global_step}. Stopping training to prevent bad model.")
                         metrics.update(status="error", error="Training Diverged: Loss is NaN or Infinity. Try lowering learning rate or changing precision.")
                         raise ValueError("Training Diverged: Loss is NaN or Infinity.")
 
+                    update_loss = micro_loss_sum / micro_count
+                    micro_loss_sum = 0.0
+                    micro_count = 0
+
+                    # накопление для сглаженного лога
+                    log_loss_sum += update_loss
+                    log_updates += 1
+
                     # Логирование
                     if global_step % config.get("log_every", 10) == 0 or global_step == 1:
-                        # Считаем средний loss
-                        avg_loss = accumulated_loss / accumulation_steps_count
+                        avg_loss = log_loss_sum / max(1, log_updates)
                         
                         # Samples per second (Effective Batch / Time)
+                        # Учитываем multi-GPU: реальный глобальный batch = effective_batch * num_processes
                         effective_batch = config["batch_size"] * config["gradient_accumulation"]
-                        samples_per_sec = effective_batch / update_time if update_time > 0 else 0
+                        global_batch = effective_batch * accelerator.num_processes
+                        samples_per_sec = global_batch / update_time if update_time > 0 else 0
                         
                         metrics.log_step(
                             step=global_step,
@@ -399,103 +466,81 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                             samples_per_sec=samples_per_sec,
                             step_time=update_time
                         )
-                    
-                    # Сброс аккумуляторов (только после логирования? Нет, после каждого апдейта, но мы логируем не каждый)
-                    # Но если мы логируем раз в N шагов, нам нужно решить:
-                    # 1. Логировать loss только за ПОСЛЕДНИЙ update?
-                    # 2. Или накапливать за все N шагов?
-                    # В стандартных тренерах обычно логируют loss за интервал.
-                    # Но для простоты сбросим здесь, и будем показывать loss текущего шага обновления.
-                    # Или лучше: если мы не логируем, мы все равно сбрасываем, чтобы accumulated_loss не рос бесконечно.
-                    # Но если мы хотим сглаженный loss в логах...
-                    # Давайте сбрасывать после логирования? Нет, тогда avg_loss будет за N шагов. Это даже лучше (сглаживание).
-                    # Давайте так: Сбрасываем ТОЛЬКО если залогировали.
-                    
-                    if global_step % config.get("log_every", 10) == 0 or global_step == 1:
-                         accumulated_loss = 0.0
-                         accumulation_steps_count = 0
+                        
+                        log_loss_sum = 0.0
+                        log_updates = 0
                     
                     # Checkpoint
                     if global_step % config.get("save_every", 5000) == 0:
                         ckpt_path = output_dir / f"checkpoint_step{global_step}"
                         accelerator.save_state(ckpt_path)
-                        model_config.save_pretrained(ckpt_path)
-                        metrics.log_checkpoint(str(ckpt_path))
+                        accelerator.wait_for_everyone()
+                        if accelerator.is_main_process:
+                            model_config.save_pretrained(ckpt_path)
+                            metrics.log_checkpoint(str(ckpt_path))
                     
                     # Проверяем достигли ли лимита шагов
                     if global_step >= max_train_steps:
                         training_complete = True
                         break
         
-        # Final save
-        metrics.update(status="saving_model")
-        final_dir = output_dir / "final_model"
-        final_dir.mkdir(parents=True, exist_ok=True)
-        
-        # --- ВАЖНО: Сохраняем Chat Template в токенизатор ---
-        # Чтобы при инференсе (в чате) модель знала свои теги (User/Assistant)
-        if stage == "sft" and config.get("sft_template"):
-            tmpl = config["sft_template"]
+        # Final save - только на main process
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            metrics.update(status="saving_model")
+            final_dir = output_dir / "final_model"
+            final_dir.mkdir(parents=True, exist_ok=True)
             
-            # Получаем настройки шаблона
-            default_sys = tmpl.get('system', 'You are a helpful assistant.')
-            u_tag = tmpl.get('user_tag', '### User:')
-            b_tag = tmpl.get('bot_tag', '### Assistant:')
+            # --- (опционально) сохраняем chat_template для SFT ---
+            if stage == "sft" and config.get("sft_template"):
+                tmpl = config["sft_template"]
+                
+                default_sys = tmpl.get("system", "You are a helpful assistant.")
+                u_tag = tmpl.get("user_tag", "### User:")
+                b_tag = tmpl.get("bot_tag", "### Assistant:")
+                
+                default_sys_escaped = default_sys.replace("'", "\\'")
+                u_tag_escaped = u_tag.replace("'", "\\'")
+                b_tag_escaped = b_tag.replace("'", "\\'")
+                
+                tokenizer.chat_template = (
+                    "{% if messages and messages[0]['role'] == 'system' %}"
+                    "{{ messages[0]['content'] }}\n\n"
+                    "{% else %}"
+                    f"{{{{ '{default_sys_escaped}' }}}}\n\n"
+                    "{% endif %}"
+                    "{% for message in messages %}"
+                    "{% if message['role'] == 'user' %}"
+                    f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                    "{% elif message['role'] == 'assistant' %}"
+                    f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                    "{% endif %}"
+                    "{% endfor %}"
+                    "{% if add_generation_prompt %}"
+                    f"{b_tag_escaped}\n"
+                    "{% endif %}"
+                )
+                logger.info(f"Saved chat_template: user_tag='{u_tag}', bot_tag='{b_tag}'")
             
-            # Экранируем специальные символы для jinja (одинарные кавычки)
-            default_sys_escaped = default_sys.replace("'", "\\'")
-            u_tag_escaped = u_tag.replace("'", "\\'")
-            b_tag_escaped = b_tag.replace("'", "\\'")
+            # --- ВСЕГДА сохраняем финальную модель (и для pretrain тоже) ---
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(final_dir, save_function=accelerator.save)
+            model_config.save_pretrained(final_dir)
+            tokenizer.save_pretrained(final_dir)
             
-            # Jinja2 шаблон для HuggingFace
-            # Структура:
-            # 1. System prompt: из messages[0] если role=='system', иначе дефолтный
-            # 2. Цикл по user/assistant сообщениям
-            # 3. Generation prompt (тег ассистента в конце если add_generation_prompt)
-            #
-            # ВАЖНО: В jinja используем '\n' как реальные переносы строк через \\n в Python
+            total_time = time.time() - start_time
+            hours, rem = divmod(total_time, 3600)
+            minutes, seconds = divmod(rem, 60)
+            duration_str = "{:0>2}:{:0>2}:{:05.2f}".format(int(hours), int(minutes), seconds)
             
-            jinja_template = (
-                # System prompt
-                "{% if messages[0]['role'] == 'system' %}"
-                "{{ messages[0]['content'] }}\n\n"
-                "{% else %}"
-                f"{{{{ '{default_sys_escaped}' }}}}\n\n"
-                "{% endif %}"
-                # Messages loop (skip system in loop)
-                "{% for message in messages %}"
-                "{% if message['role'] == 'user' %}"
-                f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
-                "{% elif message['role'] == 'assistant' %}"
-                f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
-                "{% endif %}"
-                "{% endfor %}"
-                # Generation prompt (без лишних \n т.к. уже есть после последнего сообщения)
-                "{% if add_generation_prompt %}"
-                f"{b_tag_escaped}\n"
-                "{% endif %}"
+            metrics.update(
+                status="completed",
+                total_time_seconds=total_time,
+                training_duration=duration_str,
+                final_model_path=str(final_dir),
             )
-            
-            tokenizer.chat_template = jinja_template
-            logger.info(f"Saved chat_template: user_tag='{u_tag}', bot_tag='{b_tag}'")
-
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(final_dir, save_function=accelerator.save)
-        tokenizer.save_pretrained(final_dir)
         
-        total_time = time.time() - start_time
-        
-        # Форматируем время (чч:мм:сс)
-        hours, rem = divmod(total_time, 3600)
-        minutes, seconds = divmod(rem, 60)
-        duration_str = "{:0>2}:{:0>2}:{:05.2f}".format(int(hours), int(minutes), seconds)
-        
-        metrics.update(
-            status="completed",
-            total_time_seconds=total_time,
-            training_duration=duration_str,
-            final_model_path=str(final_dir)
-        )
+        accelerator.wait_for_everyone()
         
     except Exception as e:
         import traceback
