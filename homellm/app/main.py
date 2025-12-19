@@ -901,11 +901,22 @@ def render_sft_main_config(data_path: str):
             else:
                 user_val = str(get_nested_value(sample, sft_columns["instruction"]) or "")[:300]
                 asst_val = str(get_nested_value(sample, sft_columns["output"]) or "")[:300]
-                sys_val = default_system
-                if sft_columns.get("system_field"):
-                    field_sys = get_nested_value(sample, sft_columns["system_field"])
-                    if field_sys: sys_val = str(field_sys)[:200]
                 
+                # System prompt: сначала пытаемся получить из семпла, если указано поле
+                sys_val = default_system
+                system_field = sft_columns.get("system_field")
+                
+                # Если указано поле system_field, пытаемся получить значение из семпла
+                if system_field and system_field != "(не выбрано)" and system_field.strip():
+                    field_sys = get_nested_value(sample, system_field)
+                    # Если значение найдено и не пустое, используем его вместо дефолтного
+                    if field_sys is not None:
+                        field_sys_str = str(field_sys).strip()
+                        if field_sys_str:
+                            sys_val = field_sys_str[:200]
+                
+                # Формируем превью: системный промпт всегда показываем в начале
+                # ВАЖНО: системный промпт должен быть виден, даже если он дефолтный
                 preview = f"{sys_val}{sep}{user_tag}\n{user_val}{sep}{assistant_tag}\n{asst_val}<|endoftext|>"
             
             with st.container(height=400):
@@ -1513,6 +1524,14 @@ def render_metrics_dashboard(metrics: dict):
         with st.expander("📦 Checkpoints"):
             for ckpt in metrics["checkpoints"]:
                 st.text(f"Step {ckpt['step']}: {ckpt['path']}")
+    
+    # Пример сформированного промпта (для SFT)
+    sample_prompt = metrics.get("sample_prompt")
+    if sample_prompt:
+        with st.expander("📝 Пример сформированного промпта (SFT)", expanded=True):
+            st.caption("Это пример того, как выглядит промпт, который видит модель во время обучения:")
+            st.code(sample_prompt, language=None)
+            st.caption("💡 Модель учится генерировать текст после тега ассистента в том же формате")
     
     # GPU статистика
     gpu_stats = metrics.get("gpu_stats", [])
@@ -2587,6 +2606,20 @@ def main():
                             time.sleep(2)
                             st.rerun() # Обновить список моделей чтобы увидеть экспорт
 
+                # --- НАСТРОЙКИ СИСТЕМНОГО ПРОМПТА ---
+                with st.expander("⚙️ Системный промпт", expanded=False):
+                    system_prompt_input = st.text_area(
+                        "Системный промпт (опционально):",
+                        value=st.session_state.get("system_prompt", ""),
+                        help="Если заполнено, будет использоваться вместо дефолтного системного промпта модели. Оставьте пустым для использования дефолтного.",
+                        key="system_prompt_input"
+                    )
+                    st.session_state.system_prompt = system_prompt_input.strip()
+                    if system_prompt_input.strip():
+                        st.info("✅ Будет использован введенный системный промпт")
+                    else:
+                        st.caption("Используется дефолтный системный промпт из модели")
+                
                 # --- ИНТЕРФЕЙС ЧАТА С ФИКСИРОВАННЫМ СКРОЛЛОМ ---
                 chat_container = st.container(height=500) # Прокручиваемый контейнер
                 
@@ -2620,7 +2653,21 @@ def main():
                                     # Иначе просто склеиваем текст (для Pretrain моделей)
                                     
                                     # Берем историю + новое сообщение
-                                    conversation = st.session_state.messages # [{"role": "user", ...}, ...]
+                                    conversation = st.session_state.messages.copy() # [{"role": "user", ...}, ...]
+                                    
+                                    # Обработка системного промпта (только для моделей с chat_template)
+                                    if tokenizer.chat_template:
+                                        system_prompt = st.session_state.get("system_prompt", "").strip()
+                                        
+                                        # Удаляем существующее системное сообщение из conversation (если есть)
+                                        # чтобы не было конфликта с введенным системным промптом
+                                        if conversation and conversation[0].get("role") == "system":
+                                            conversation.pop(0)
+                                        
+                                        # Если указан системный промпт, добавляем его в начало
+                                        if system_prompt:
+                                            conversation.insert(0, {"role": "system", "content": system_prompt})
+                                        # Если системный промпт пустой, шаблон использует дефолтный из модели
                                     
                                     if tokenizer.chat_template:
                                         # Для SFT модели: применяем шаблон с тегами

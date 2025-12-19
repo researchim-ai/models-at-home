@@ -187,6 +187,16 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 sft_columns=config.get("sft_columns"),
                 sft_template=config.get("sft_template")
             )
+            
+            # Получаем пример сформированного промпта для отображения
+            try:
+                sample_prompt = train_dataset.get_sample_prompt(max_samples=20)
+                if sample_prompt:
+                    metrics.update(sample_prompt=sample_prompt)
+                    logger.info("Sample prompt saved to metrics")
+            except Exception as e:
+                logger.warning(f"Failed to get sample prompt: {e}")
+            
             # Для SFT data collator не нужен специальный masking, 
             # но нужно просто паддить тензоры в батче.
             # SFTDataset уже возвращает тензоры, DataCollatorForLanguageModeling с mlm=False подойдет
