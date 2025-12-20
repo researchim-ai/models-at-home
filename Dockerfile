@@ -1,58 +1,81 @@
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+# syntax=docker/dockerfile:1
 
-# Установка системных зависимостей
+############################
+# 1) Builder stage
+############################
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04 AS builder
+
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    ninja-build \
+    ca-certificates \
+    curl \
     python3.10 \
     python3-pip \
-    libgl1-mesa-glx \
+    python3.10-venv \
+    build-essential \
+    ninja-build \
+    libgl1 \
     libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
-# Симлинк для python
-RUN ln -s /usr/bin/python3.10 /usr/bin/python
+# venv для зависимостей (удобно копировать в финальный образ)
+ENV VENV_PATH=/opt/venv
+RUN python3.10 -m venv ${VENV_PATH}
+ENV PATH="${VENV_PATH}/bin:${PATH}"
 
-# Рабочая директория
 WORKDIR /app
 
-# Копируем зависимости
-COPY requirements.txt .
+# Сначала зависимости (для кеширования слоёв)
+COPY requirements.txt /app/requirements.txt
 
-# Обновляем pip и устанавливаем PyTorch (пре-релиз или nightly, чтобы соответствовать твоей версии)
-# Но для стабильности в Docker лучше использовать стабильную версию, если нет жесткой привязки к 2.9.1.
-# Если нужна именно 2.9.1 (которая вероятно 2.6.0-nightly или опечатка, т.к. 2.9 еще очень далеко),
-# то лучше поставить стабильный 2.4/2.5.
-# Твоя версия `2.9.1` выглядит очень странно (может 2.1.2?), но допустим мы ставим свежий стейбл.
+RUN python -m pip install --upgrade pip \
+ && python -m pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 \
+ && python -m pip install --no-cache-dir -r /app/requirements.txt \
+ && python -m pip install --no-cache-dir deepspeed
 
-RUN pip install --upgrade pip
-RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Теперь код (ВАЖНО: .dockerignore должен исключать datasets/out/.runs и т.п.)
+COPY . /app
 
-# Устанавливаем остальные зависимости
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir deepspeed
+# Нормализуем sh-скрипты, но не падаем, если папки нет
+RUN if [ -d scripts ]; then \
+      find scripts -type f -name "*.sh" -exec sed -i 's/\r$//' {} \; -exec chmod +x {} \;; \
+    fi
 
-# Копируем исходный код
-COPY . .
+# Установим проект (можно оставить editable, но обычно достаточно обычной установки)
+RUN python -m pip install --no-cache-dir -e .
 
-# Исправляем Windows-окончания строк в скриптах (CRLF -> LF)
-RUN sed -i 's/\r$//' scripts/*.sh && chmod +x scripts/*.sh
+############################
+# 2) Runtime stage
+############################
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04 AS runtime
 
-# Устанавливаем наш пакет
-RUN pip install -e .
+LABEL com.modelsathome.image="models-at-home-studio"
 
-# Создаем директории
-RUN mkdir -p datasets out .runs
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    libgl1 \
+    libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
 
-# Переменные окружения
+# Подхватываем venv из builder
+ENV VENV_PATH=/opt/venv
+COPY --from=builder ${VENV_PATH} ${VENV_PATH}
+ENV PATH="${VENV_PATH}/bin:${PATH}"
+
+WORKDIR /app
+COPY --from=builder /app /app
+
+# Директории под монтирования (не обязательно, но удобно)
+RUN mkdir -p /app/datasets /app/out /app/.runs
+
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ENV MKL_THREADING_LAYER=GNU
+ENV PYTHONUNBUFFERED=1
 
-# Порт
 EXPOSE 8501
-
 CMD ["./scripts/run_studio.sh"]

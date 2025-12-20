@@ -1,0 +1,22 @@
+# Не тащим данные/артефакты в image
+datasets/
+out/
+.runs/
+
+# Часто огромные штуки
+**/*.ckpt
+**/*.pt
+**/*.bin
+**/*.safetensors
+**/*.pth
+**/*.tar
+**/*.zip
+
+# Мусор
+.git/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/

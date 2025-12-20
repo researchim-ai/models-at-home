@@ -110,6 +110,9 @@ class MetricsLogger:
             "error": None,
             "checkpoints": [],
             "gpu_stats": [],
+            "current_val_loss": None,
+            "val_loss_history": [],
+            "val_steps_history": [],
         }
         self._save()
     
@@ -178,6 +181,16 @@ class MetricsLogger:
             "time": datetime.now().isoformat()
         })
         self._save()
+    
+    def log_eval(self, step: int, val_loss: float):
+        """Логировать результат валидации."""
+        if not self.enabled:
+            return
+        
+        self.metrics["current_val_loss"] = val_loss
+        self.metrics["val_loss_history"].append(val_loss)
+        self.metrics["val_steps_history"].append(step)
+        self._save()
 
 
 def run_training(config: Dict[str, Any], metrics_path: Path):
@@ -196,7 +209,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
     metrics = MetricsLogger(metrics_path, enabled=accelerator.is_main_process)
     
     try:
-        metrics.update(status="loading_tokenizer")
+        metrics.update(status="loading_tokenizer", stage=stage)
         
         # Tokenizer
         # Для SFT важно использовать токенизатор базовой модели (если он там сохранён)
@@ -234,17 +247,19 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 rank=accelerator.process_index
             )
             
-            # Получаем пример сформированного промпта для отображения
+            # Получаем пример сформированного промпта для отображения (для SFT)
             try:
-                sample_prompt = train_dataset.get_sample_prompt(max_samples=20)
-                if sample_prompt:
-                    metrics.update(sample_prompt=sample_prompt)
-                    logger.info("Sample prompt saved to metrics")
+                if hasattr(train_dataset, 'get_sample_prompt'):
+                    sample_prompt = train_dataset.get_sample_prompt(max_samples=20)
+                    if sample_prompt:
+                        metrics.update(sample_prompt=sample_prompt)
+                        logger.info("Sample prompt saved to metrics")
             except Exception as e:
                 logger.warning(f"Failed to get sample prompt: {e}")
             
             # Логируем статистику датасета (после первого прохода будет обновлена)
-            logger.info(f"SFTDataset initialized: num_replicas={train_dataset.num_replicas}, rank={train_dataset.rank}")
+            if hasattr(train_dataset, 'num_replicas'):
+                logger.info(f"Dataset initialized: num_replicas={train_dataset.num_replicas}, rank={train_dataset.rank}")
             
             # Для SFT data collator не нужен специальный masking, 
             # но нужно просто паддить тензоры в батче.
@@ -261,7 +276,62 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 num_replicas=accelerator.num_processes,
                 rank=accelerator.process_index
             )
+            
+            # Получаем пример текста для отображения (для pretrain)
+            try:
+                if hasattr(train_dataset, 'get_sample_prompt'):
+                    sample_prompt = train_dataset.get_sample_prompt(max_samples=20)
+                    if sample_prompt:
+                        metrics.update(sample_prompt=sample_prompt)
+                        logger.info("Sample prompt saved to metrics")
+            except Exception as e:
+                logger.warning(f"Failed to get sample prompt: {e}")
+            
             collate_fn = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+        
+        # Создаем validation loader если нужно
+        val_ratio = float(config.get("val_ratio", 0.0))
+        eval_every = int(config.get("eval_every", 0) or 0)
+        eval_batches = int(config.get("eval_batches", 20) or 20)
+        val_loader = None
+        
+        if val_ratio > 0.0 and eval_every > 0:
+            if stage == "sft":
+                from homellm.training.sft import SFTDataset
+                val_dataset = SFTDataset(
+                    config["data_path"],
+                    tokenizer,
+                    seq_len=config["seq_len"],
+                    sft_columns=config.get("sft_columns"),
+                    sft_template=config.get("sft_template"),
+                    num_replicas=1,  # важно!
+                    rank=0,
+                    split="val",
+                    val_ratio=val_ratio,
+                    shard=False,     # важно!
+                )
+                from transformers import default_data_collator
+                val_collate = default_data_collator
+            else:
+                # Используем уже импортированный StreamingTextDataset
+                val_dataset = StreamingTextDataset(
+                    config["data_path"],
+                    tokenizer,
+                    seq_len=config["seq_len"],
+                    num_replicas=1,
+                    rank=0,
+                    split="val",
+                    val_ratio=val_ratio,
+                    shard=False,
+                )
+                val_collate = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+            
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=config["batch_size"],
+                collate_fn=val_collate,
+                num_workers=2,
+            )
             
         train_loader = DataLoader(
             train_dataset,
@@ -376,14 +446,38 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             num_training_steps=max_train_steps,
         )
         
-        model, optimizer, train_loader, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_loader, lr_scheduler
-        )
+        if val_loader is not None:
+            model, optimizer, train_loader, val_loader, lr_scheduler = accelerator.prepare(
+                model, optimizer, train_loader, val_loader, lr_scheduler
+            )
+        else:
+            model, optimizer, train_loader, lr_scheduler = accelerator.prepare(
+                model, optimizer, train_loader, lr_scheduler
+            )
         
         output_dir = Path(config["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
         
         metrics.update(status="training")
+        
+        # Функция для валидации (использует eval_batches из замыкания)
+        def evaluate(val_loader):
+            """Выполнить валидацию на val_loader."""
+            model.eval()
+            losses = []
+            with torch.no_grad():
+                for i, batch in enumerate(val_loader):
+                    if i >= eval_batches:
+                        break
+                    out = model(**batch)
+                    loss = out.loss.detach()
+                    # на всякий: усреднить по ранкам
+                    loss = accelerator.reduce(loss, reduction="mean")
+                    losses.append(loss.item())
+            model.train()
+            if not losses:
+                return None
+            return sum(losses) / len(losses)
         
         global_step = 0
         start_time = time.time()
@@ -478,6 +572,13 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                         if accelerator.is_main_process:
                             model_config.save_pretrained(ckpt_path)
                             metrics.log_checkpoint(str(ckpt_path))
+                    
+                    # Validation
+                    if val_loader is not None and eval_every > 0 and (global_step % eval_every == 0):
+                        val_loss = evaluate(val_loader)
+                        if accelerator.is_main_process and val_loss is not None:
+                            metrics.log_eval(global_step, float(val_loss))
+                            logger.info(f"Validation at step {global_step}: val_loss={val_loss:.4f}")
                     
                     # Проверяем достигли ли лимита шагов
                     if global_step >= max_train_steps:

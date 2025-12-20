@@ -4,14 +4,17 @@
 
 services:
   studio:
-    build: .
+    image: models-at-home-studio:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: models-at-home
     ports:
       - "8501:8501"
     volumes:
-      - ./datasets:/app/datasets  # Ваши данные
-      - ./out:/app/out            # Чекпоинты и модели
-      - ./.runs:/app/.runs        # Логи и метрики
+      - ./datasets:/app/datasets
+      - ./out:/app/out
+      - ./.runs:/app/.runs
     environment:
       - PYTHONUNBUFFERED=1
       - MKL_THREADING_LAYER=GNU

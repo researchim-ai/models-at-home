@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import random
 from pathlib import Path
 from typing import Iterable, List, Dict
 
@@ -57,13 +58,26 @@ logging.basicConfig(
 class StreamingTextDataset(IterableDataset):
     """Поточно читает текст/JSONL файл построчно, не загружая всё в память."""
 
-    def __init__(self, file_path: str, tokenizer, seq_len: int, num_replicas: int = 1, rank: int = 0):
+    def __init__(
+        self,
+        file_path: str,
+        tokenizer,
+        seq_len: int,
+        num_replicas: int = 1,
+        rank: int = 0,
+        split: str = "train",      # "train" | "val"
+        val_ratio: float = 0.0,    # если >0, часть строк уходит в val
+        shard: bool = True,        # для val поставим False
+    ):
         super().__init__()
         self.file_path = Path(file_path)
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.num_replicas = num_replicas
         self.rank = rank
+        self.split = split
+        self.val_ratio = float(val_ratio or 0.0)
+        self.shard = bool(shard)
 
         if not self.file_path.exists():
             raise FileNotFoundError(f"Dataset {self.file_path} not found")
@@ -90,18 +104,36 @@ class StreamingTextDataset(IterableDataset):
         # Получаем информацию о воркере DataLoader
         worker_info = torch.utils.data.get_worker_info()
         
-        # Общее количество "читателей" = num_replicas * num_workers
+        # shard only if enabled
         total_workers = self.num_replicas
         current_worker_id = self.rank
         
-        if worker_info is not None:
+        if self.shard and worker_info is not None:
             total_workers *= worker_info.num_workers
             current_worker_id = self.rank * worker_info.num_workers + worker_info.id
+        elif not self.shard:
+            total_workers = 1
+            current_worker_id = 0
+        
+        # детерминированный split по глобальному idx
+        scale = 10000
+        threshold = int(self.val_ratio * scale)
+        seen = 0  # счетчик только выбранного split (важно!)
         
         for idx, text in enumerate(self._read_lines()):
-            # Шардинг данных между процессами и воркерами
-            if idx % total_workers != current_worker_id:
+            is_val = (threshold > 0) and ((idx % scale) < threshold)
+            
+            if self.split == "val" and not is_val:
                 continue
+            if self.split == "train" and is_val:
+                continue
+            
+            # shard по seen (а не по idx), чтобы равномернее
+            if self.shard:
+                if (seen % total_workers) != current_worker_id:
+                    seen += 1
+                    continue
+                seen += 1
             
             tokens = self.tokenizer(
                 text,
@@ -112,6 +144,57 @@ class StreamingTextDataset(IterableDataset):
             )["input_ids"]
             
             yield torch.tensor(tokens, dtype=torch.long)
+
+    def get_sample_prompt(self, max_samples: int = 10) -> str | None:
+        """Получить пример текста из датасета для отображения в UI.
+        
+        Использует reservoir sampling для больших файлов.
+        """
+        try:
+            samples = []
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                for idx, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # Парсим JSONL если нужно
+                    if self._is_jsonl:
+                        try:
+                            obj = json.loads(line)
+                            line = obj.get("text", "")
+                        except json.JSONDecodeError:
+                            continue
+                    
+                    if not line:
+                        continue
+                    
+                    # Reservoir sampling для больших файлов
+                    if len(samples) < max_samples:
+                        samples.append(line)
+                    else:
+                        # С вероятностью max_samples/(idx+1) заменяем случайный элемент
+                        r = random.randint(0, idx)
+                        if r < max_samples:
+                            samples[r] = line
+                    
+                    # Останавливаемся после проверки достаточного количества строк
+                    if idx >= max_samples * 10:
+                        break
+            
+            if samples:
+                # Возвращаем первый непустой семпл
+                for sample in samples:
+                    if sample.strip():
+                        # Обрезаем до разумной длины для отображения
+                        if len(sample) > 500:
+                            return sample[:500] + "..."
+                        return sample
+        except Exception as e:
+            logger.warning(f"Failed to get sample prompt: {e}")
+            return None
+        
+        return None
 
     def __len__(self):
         """При первом обращении быстро подсчитывает количество строк в файле. Может быть медленно для очень больших файлов."""

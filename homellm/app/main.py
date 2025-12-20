@@ -1170,6 +1170,37 @@ def render_training_config():
         help="Экономит VRAM, но медленнее"
     )
     
+    # Validation / Eval
+    st.sidebar.divider()
+    st.sidebar.subheader("📊 Валидация")
+    
+    val_ratio = st.sidebar.slider(
+        "Validation fraction",
+        min_value=0.0,
+        max_value=0.2,
+        value=0.01,
+        step=0.005,
+        help="Доля данных под validation, если отдельный val-файл не задан"
+    )
+    
+    eval_every = st.sidebar.number_input(
+        "Eval Every N Steps",
+        min_value=0,
+        max_value=50000,
+        value=200,
+        step=10,
+        help="Как часто запускать валидацию (0 = отключить)"
+    )
+    
+    eval_batches = st.sidebar.number_input(
+        "Eval Batches",
+        min_value=1,
+        max_value=500,
+        value=20,
+        step=1,
+        help="Сколько батчей прогонять на валидации (чтобы не было слишком долго)"
+    )
+    
     return {
         "batch_size": batch_size,
         "gradient_accumulation": grad_accum,
@@ -1179,6 +1210,9 @@ def render_training_config():
         "max_steps": max_steps,
         "mixed_precision": mixed_precision,
         "grad_checkpoint": grad_checkpoint,
+        "val_ratio": val_ratio,
+        "eval_every": eval_every,
+        "eval_batches": eval_batches,
     }
 
 
@@ -1473,9 +1507,16 @@ def render_metrics_dashboard(metrics: dict):
     
     with col2:
         loss = metrics.get("current_loss", 0)
-        st.metric("Loss", f"{loss:.4f}")
+        st.metric("Train Loss", f"{loss:.4f}")
     
     with col3:
+        vloss = metrics.get("current_val_loss", None)
+        if vloss is None:
+            st.metric("Val Loss", "—")
+        else:
+            st.metric("Val Loss", f"{vloss:.4f}")
+    
+    with col4:
         lr = metrics.get("current_lr", 0)
         st.metric("Learning Rate", f"{lr:.2e}")
     
@@ -1498,11 +1539,19 @@ def render_metrics_dashboard(metrics: dict):
                 x=metrics["steps_history"],
                 y=metrics["loss_history"],
                 mode='lines',
-                name='Loss',
+                name='Train Loss',
                 line=dict(color='#e94560', width=2)
             ))
+            if metrics.get("val_loss_history"):
+                fig_loss.add_trace(go.Scatter(
+                    x=metrics["val_steps_history"],
+                    y=metrics["val_loss_history"],
+                    mode='lines',
+                    name='Val Loss',
+                    line=dict(width=2, dash="dash", color='#60a5fa')
+                ))
             fig_loss.update_layout(
-                title="Training Loss",
+                title="Training & Validation Loss",
                 xaxis_title="Step",
                 yaxis_title="Loss",
                 template="plotly_dark",
@@ -1540,10 +1589,21 @@ def render_metrics_dashboard(metrics: dict):
     # Пример сформированного промпта (для SFT)
     sample_prompt = metrics.get("sample_prompt")
     if sample_prompt:
-        with st.expander("📝 Пример сформированного промпта (SFT)", expanded=True):
-            st.caption("Это пример того, как выглядит промпт, который видит модель во время обучения:")
+        # Определяем тип датасета по наличию stage в метриках
+        stage = metrics.get("stage", "pretrain")
+        if stage == "sft":
+            title = "📝 Пример сформированного промпта (SFT)"
+            caption = "Это пример того, как выглядит промпт, который видит модель во время обучения:"
+            tip = "💡 Модель учится генерировать текст после тега ассистента в том же формате"
+        else:
+            title = "📝 Пример текста из датасета (Pretrain)"
+            caption = "Это пример текста, который видит модель во время обучения:"
+            tip = "💡 Модель учится предсказывать следующий токен в тексте"
+        
+        with st.expander(title, expanded=True):
+            st.caption(caption)
             st.code(sample_prompt, language=None)
-            st.caption("💡 Модель учится генерировать текст после тега ассистента в том же формате")
+            st.caption(tip)
     
     # GPU статистика
     gpu_stats = metrics.get("gpu_stats", [])

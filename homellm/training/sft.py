@@ -27,12 +27,18 @@ class SFTDataset(IterableDataset):
         sft_template: Optional[dict] = None,
         num_replicas: int = 1,
         rank: int = 0,
+        split: str = "train",      # "train" | "val"
+        val_ratio: float = 0.0,    # если >0, часть строк уходит в val
+        shard: bool = True,        # для val поставим False
     ):
         self.file_path = file_path
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.num_replicas = max(1, int(num_replicas))
         self.rank = int(rank)
+        self.split = split
+        self.val_ratio = float(val_ratio or 0.0)
+        self.shard = bool(shard)
 
         # Дефолтные настройки
         self.cols = sft_columns or {"format": "instruct", "instruction": "instruction", "output": "output"}
@@ -252,17 +258,39 @@ class SFTDataset(IterableDataset):
         num_workers = worker_info.num_workers if worker_info is not None else 1
         worker_id = worker_info.id if worker_info is not None else 0
 
+        # shard only if enabled
+        total_readers = self.num_replicas
+        reader_id = self.rank
+        
+        if self.shard and worker_info is not None:
+            total_readers *= num_workers
+            reader_id = self.rank * num_workers + worker_id
+        elif not self.shard:
+            total_readers = 1
+            reader_id = 0
+
+        # детерминированный split по глобальному idx
+        scale = 10000
+        threshold = int(self.val_ratio * scale)
+        seen = 0  # счетчик только выбранного split (важно!)
+
         with open(self.file_path, "r", encoding="utf-8") as f:
             for idx, line in enumerate(f):
                 self.stats["total_lines"] += 1
-
-                # Каждый line должен попасть ровно одному "читателю":
-                # total_readers = num_replicas * num_workers
-                total_readers = self.num_replicas * num_workers
-                reader_id = self.rank * num_workers + worker_id
-
-                if idx % total_readers != reader_id:
+                
+                is_val = (threshold > 0) and ((idx % scale) < threshold)
+                
+                if self.split == "val" and not is_val:
                     continue
+                if self.split == "train" and is_val:
+                    continue
+
+                # shard по seen (а не по idx), чтобы равномернее
+                if self.shard:
+                    if (seen % total_readers) != reader_id:
+                        seen += 1
+                        continue
+                    seen += 1
 
                 try:
                     data = json.loads(line)
