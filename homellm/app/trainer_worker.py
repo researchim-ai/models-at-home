@@ -235,7 +235,16 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         
         metrics.update(status=f"loading_dataset ({stage})")
         
+        # ВАЖНО: Вычисляем val_ratio ДО создания train_dataset, чтобы избежать data leakage
+        val_ratio = float(config.get("val_ratio", 0.0))
+        eval_every = int(config.get("eval_every", 0) or 0)
+        eval_batches = int(config.get("eval_batches", 20) or 20)
+        
+        # Держим holdout только если реально используем eval
+        holdout_ratio = val_ratio if (val_ratio > 0.0 and eval_every > 0) else 0.0
+        
         # Dataset Selection based on Stage
+        # ВАЖНО: Шардирование делает accelerate.prepare(), датасеты только делают train/val split
         if stage == "sft":
             train_dataset = SFTDataset(
                 config["data_path"],
@@ -243,8 +252,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 seq_len=config["seq_len"],
                 sft_columns=config.get("sft_columns"),
                 sft_template=config.get("sft_template"),
-                num_replicas=accelerator.num_processes,
-                rank=accelerator.process_index
+                num_replicas=1,  # Не шардируем вручную, это сделает accelerate
+                rank=0,
+                split="train",
+                val_ratio=holdout_ratio,  # ✅ ВАЖНО: исключаем val-часть из train
+                shard=False,  # Шардирование делает accelerate
             )
             
             # Получаем пример сформированного промпта для отображения (для SFT)
@@ -273,8 +285,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 config["data_path"], 
                 tokenizer, 
                 seq_len=config["seq_len"],
-                num_replicas=accelerator.num_processes,
-                rank=accelerator.process_index
+                num_replicas=1,  # Не шардируем вручную, это сделает accelerate
+                rank=0,
+                split="train",
+                val_ratio=holdout_ratio,  # ✅ ВАЖНО: исключаем val-часть из train
+                shard=False,  # Шардирование делает accelerate
             )
             
             # Получаем пример текста для отображения (для pretrain)
@@ -290,12 +305,9 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             collate_fn = DataCollatorForLanguageModeling(tokenizer, mlm=False)
         
         # Создаем validation loader если нужно
-        val_ratio = float(config.get("val_ratio", 0.0))
-        eval_every = int(config.get("eval_every", 0) or 0)
-        eval_batches = int(config.get("eval_batches", 20) or 20)
         val_loader = None
         
-        if val_ratio > 0.0 and eval_every > 0:
+        if holdout_ratio > 0.0:
             if stage == "sft":
                 from homellm.training.sft import SFTDataset
                 val_dataset = SFTDataset(
@@ -307,7 +319,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     num_replicas=1,  # важно!
                     rank=0,
                     split="val",
-                    val_ratio=val_ratio,
+                    val_ratio=holdout_ratio,  # ✅ Используем тот же holdout_ratio
                     shard=False,     # важно!
                 )
                 from transformers import default_data_collator
@@ -321,23 +333,25 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     num_replicas=1,
                     rank=0,
                     split="val",
-                    val_ratio=val_ratio,
+                    val_ratio=holdout_ratio,  # ✅ Используем тот же holdout_ratio
                     shard=False,
                 )
                 val_collate = DataCollatorForLanguageModeling(tokenizer, mlm=False)
             
+            # ВАЖНО: num_workers=0 для val, чтобы избежать дубликатов при shard=False
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=config["batch_size"],
                 collate_fn=val_collate,
-                num_workers=2,
+                num_workers=0,  # Без workers для валидации, чтобы избежать дубликатов
             )
             
+        # ВАЖНО: num_workers=0 для IterableDataset, чтобы избежать дублирования данных
         train_loader = DataLoader(
             train_dataset,
             batch_size=config["batch_size"],
             collate_fn=collate_fn,
-            num_workers=2,
+            num_workers=0,  # IterableDataset + num_workers>0 = дублирование данных
         )
         
         metrics.update(status="building_model")
@@ -422,9 +436,16 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             max_train_steps = config["max_steps"]
         else:
             # Пробуем получить длину датасета
+            # ВАЖНО: len(train_dataset) возвращает полную длину для выбранного split
+            # Но при DDP/FSDP/ZeRO accelerate.prepare() шардирует данные между процессами
+            # Каждый процесс увидит примерно dataset_len / num_processes примеров
             try:
-                dataset_len = len(train_dataset)  # Количество примеров (если доступно)
-                steps_per_epoch = math.ceil(dataset_len / config["batch_size"])
+                dataset_len = len(train_dataset)  # Полная длина для выбранного split
+                # Учитываем распределение по процессам (для IterableDataset это критично)
+                per_proc_len = math.ceil(dataset_len / accelerator.num_processes)
+                
+                # batch_size здесь per-device, gradient_accumulation уже учтен
+                steps_per_epoch = math.ceil(per_proc_len / config["batch_size"])
                 num_update_steps_per_epoch = math.ceil(steps_per_epoch / config["gradient_accumulation"])
                 max_train_steps = config["epochs"] * num_update_steps_per_epoch
             except (TypeError, AttributeError):
@@ -508,15 +529,25 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     
                     loss_val = loss.detach().float().item()
                     
+                    # КРИТИЧНО: если loss NaN/Inf - пропускаем этот шаг и останавливаемся
+                    if math.isnan(loss_val) or math.isinf(loss_val):
+                        logger.error(f"Loss is NaN or Inf at step {global_step}. Stopping training to prevent bad model.")
+                        metrics.update(status="error", error=f"Training Diverged: Loss is NaN or Infinity at step {global_step}. Try lowering learning rate or changing precision.")
+                        raise ValueError(f"Training Diverged: Loss is NaN or Infinity at step {global_step}.")
+                    
                     # micro-аккумулятор: только для текущего update-step
-                    if not (math.isnan(loss_val) or math.isinf(loss_val)):
-                        micro_loss_sum += loss_val
-                        micro_count += 1
+                    micro_loss_sum += loss_val
+                    micro_count += 1
                     
                     accelerator.backward(loss)
                     
                     # ВАЖНО: шаг оптимизатора только на update-step
                     if accelerator.sync_gradients:
+                        # Gradient clipping для стабильности
+                        max_grad_norm = config.get("max_grad_norm", 1.0)
+                        if max_grad_norm > 0:
+                            accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        
                         optimizer.step()
                         lr_scheduler.step()
                         optimizer.zero_grad()
@@ -529,13 +560,16 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     update_time = time.time() - update_start_time
                     update_start_time = time.time()
                     
-                    # Если на ВСЕХ микро-шагах update-step был NaN/Inf — останавливаемся
+                    # Проверка на случай если все микро-шаги были пропущены (не должно случиться после фикса выше)
                     if micro_count == 0:
-                        logger.error(f"Loss is NaN or Inf at step {global_step}. Stopping training to prevent bad model.")
-                        metrics.update(status="error", error="Training Diverged: Loss is NaN or Infinity. Try lowering learning rate or changing precision.")
-                        raise ValueError("Training Diverged: Loss is NaN or Infinity.")
+                        logger.warning(f"No valid loss values at step {global_step}, skipping update")
+                        continue
 
                     update_loss = micro_loss_sum / micro_count
+                    # ВАЖНО: усредняем loss по всем процессам в Multi-GPU
+                    update_loss_t = torch.tensor(update_loss, device=accelerator.device)
+                    update_loss = accelerator.reduce(update_loss_t, reduction="mean").item()
+                    
                     micro_loss_sum = 0.0
                     micro_count = 0
 

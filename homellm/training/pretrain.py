@@ -82,12 +82,23 @@ class StreamingTextDataset(IterableDataset):
         if not self.file_path.exists():
             raise FileNotFoundError(f"Dataset {self.file_path} not found")
 
-        # Определяем формат
-        self._is_jsonl = self.file_path.suffix.lower() in {".jsonl", ".json"}
+        # Определяем формат (правильно обрабатываем .jsonl.gz)
+        suffixes = self.file_path.suffixes  # например [".jsonl", ".gz"]
+        self._is_gz = bool(suffixes) and suffixes[-1] == ".gz"
+        
+        # определяем "базовое" расширение без .gz
+        base_suffix = suffixes[-2].lower() if self._is_gz and len(suffixes) >= 2 else self.file_path.suffix.lower()
+        self._is_jsonl = (base_suffix == ".jsonl")  # НЕ поддерживаем ".json" для pretrain (это массив, не JSONL)
 
     def _read_lines(self) -> Iterable[str]:
-        mode = "r" if self.file_path.suffix != ".gz" else "rt"
-        with open(self.file_path, mode, encoding="utf-8") as f:
+        # Поддержка .gz файлов (включая .jsonl.gz)
+        if self._is_gz:
+            import gzip
+            f = gzip.open(self.file_path, "rt", encoding="utf-8")
+        else:
+            f = open(self.file_path, "r", encoding="utf-8")
+        
+        try:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -99,41 +110,23 @@ class StreamingTextDataset(IterableDataset):
                     except json.JSONDecodeError:
                         continue
                 yield line
+        finally:
+            f.close()
 
     def __iter__(self):
-        # Получаем информацию о воркере DataLoader
-        worker_info = torch.utils.data.get_worker_info()
-        
-        # shard only if enabled
-        total_workers = self.num_replicas
-        current_worker_id = self.rank
-        
-        if self.shard and worker_info is not None:
-            total_workers *= worker_info.num_workers
-            current_worker_id = self.rank * worker_info.num_workers + worker_info.id
-        elif not self.shard:
-            total_workers = 1
-            current_worker_id = 0
-        
+        # ВАЖНО: Шардирование делает accelerate.prepare(), мы только делаем train/val split
         # детерминированный split по глобальному idx
         scale = 10000
         threshold = int(self.val_ratio * scale)
-        seen = 0  # счетчик только выбранного split (важно!)
         
         for idx, text in enumerate(self._read_lines()):
             is_val = (threshold > 0) and ((idx % scale) < threshold)
             
+            # Фильтруем по split (train/val)
             if self.split == "val" and not is_val:
                 continue
             if self.split == "train" and is_val:
                 continue
-            
-            # shard по seen (а не по idx), чтобы равномернее
-            if self.shard:
-                if (seen % total_workers) != current_worker_id:
-                    seen += 1
-                    continue
-                seen += 1
             
             tokens = self.tokenizer(
                 text,
@@ -152,7 +145,13 @@ class StreamingTextDataset(IterableDataset):
         """
         try:
             samples = []
-            with open(self.file_path, "r", encoding="utf-8") as f:
+            # Поддержка .gz файлов
+            if self._is_gz:
+                import gzip
+                f = gzip.open(self.file_path, "rt", encoding="utf-8")
+            else:
+                f = open(self.file_path, "r", encoding="utf-8")
+            
                 for idx, line in enumerate(f):
                     line = line.strip()
                     if not line:
@@ -181,6 +180,8 @@ class StreamingTextDataset(IterableDataset):
                     # Останавливаемся после проверки достаточного количества строк
                     if idx >= max_samples * 10:
                         break
+            finally:
+                f.close()
             
             if samples:
                 # Возвращаем первый непустой семпл
@@ -197,14 +198,43 @@ class StreamingTextDataset(IterableDataset):
         return None
 
     def __len__(self):
-        """При первом обращении быстро подсчитывает количество строк в файле. Может быть медленно для очень больших файлов."""
+        """При первом обращении быстро подсчитывает количество строк в файле.
+        
+        Учитывает val_ratio и split для корректной оценки длины на один rank.
+        """
         if not hasattr(self, "_length"):
             logger.info("Подсчёт строк в датасете %s — может занять время...", self.file_path)
             cnt = 0
-            with open(self.file_path, "r", encoding="utf-8") as f:
+            # Поддержка .gz файлов
+            if self._is_gz:
+                import gzip
+                f = gzip.open(self.file_path, "rt", encoding="utf-8")
+            else:
+                f = open(self.file_path, "r", encoding="utf-8")
+            
+            try:
                 for _ in f:
                     cnt += 1
-            self._length = cnt
+            finally:
+                f.close()
+            
+            # Учитываем val_ratio и split
+            if self.val_ratio > 0:
+                val_cnt = int(cnt * self.val_ratio)
+                train_cnt = cnt - val_cnt
+            else:
+                train_cnt = cnt
+                val_cnt = 0
+            
+            # Выбираем нужный split
+            if self.split == "train":
+                effective = train_cnt
+            else:  # val
+                effective = val_cnt if self.val_ratio > 0 else 0
+            
+            # ВАЖНО: Не делим на num_replicas, т.к. шардирование делает accelerate.prepare()
+            # Возвращаем полную длину для выбранного split
+            self._length = effective
         return self._length
 
 
@@ -274,11 +304,12 @@ def main():
     # Dataset / Dataloader
     train_dataset = StreamingTextDataset(args.data_path, tokenizer, seq_len=args.seq_len)
     data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+    # ВАЖНО: num_workers=0 для IterableDataset, чтобы избежать дублирования данных
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         collate_fn=data_collator,
-        num_workers=2,
+        num_workers=0,  # IterableDataset + num_workers>0 = дублирование данных
     )
 
     # Выбор архитектуры

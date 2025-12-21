@@ -23,6 +23,8 @@ import os
 import signal
 from pathlib import Path
 from datetime import datetime
+from typing import Tuple
+from contextlib import suppress
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -184,10 +186,9 @@ def restore_session_state():
                         pid = int(f.read().strip())
                     os.kill(pid, 0)  # Проверка существования процесса
                     process_alive = True
-                except PermissionError:
-                    process_alive = True
                 except (ProcessLookupError, ValueError, PermissionError):
-                    pass
+                    # PermissionError может означать, что процесс существует, но у нас нет прав
+                    process_alive = True
             
             # Восстанавливаем состояние
             st.session_state.current_run_id = run_id
@@ -236,7 +237,17 @@ def get_available_datasets():
         for f in DATASET_DIR.glob("*.jsonl"):
             size_mb = f.stat().st_size / (1024 * 1024)
             datasets.append((f.name, f"{size_mb:.1f} MB"))
+        # ВАЖНО: не показываем .json, т.к. это обычно массив, а не JSONL (построчный формат)
+        # для f in DATASET_DIR.glob("*.json"):
+        #     size_mb = f.stat().st_size / (1024 * 1024)
+        #     datasets.append((f.name, f"{size_mb:.1f} MB"))
         for f in DATASET_DIR.glob("*.txt"):
+            size_mb = f.stat().st_size / (1024 * 1024)
+            datasets.append((f.name, f"{size_mb:.1f} MB"))
+        for f in DATASET_DIR.glob("*.txt.gz"):
+            size_mb = f.stat().st_size / (1024 * 1024)
+            datasets.append((f.name, f"{size_mb:.1f} MB"))
+        for f in DATASET_DIR.glob("*.jsonl.gz"):
             size_mb = f.stat().st_size / (1024 * 1024)
             datasets.append((f.name, f"{size_mb:.1f} MB"))
     return datasets
@@ -357,7 +368,18 @@ def load_metrics(run_id: str) -> dict:
     return None
 
 
-def start_training(config: dict) -> str:
+def _close_run_log_files(run_id: str):
+    """Закрыть файловые дескрипторы stdout/stderr, если они есть в session_state."""
+    for k in (f"stdout_file_{run_id}", f"stderr_file_{run_id}"):
+        f = st.session_state.get(k)
+        if f:
+            with suppress(Exception):
+                f.close()
+            with suppress(Exception):
+                del st.session_state[k]
+
+
+def start_training(config: dict) -> tuple[str, subprocess.Popen]:
     """Запустить тренировку в фоне."""
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     
@@ -421,12 +443,19 @@ def start_training(config: dict) -> str:
     stdout_file = open(stdout_path, "w")
     stderr_file = open(stderr_path, "w")
     
+    # ВАЖНО: применяем выбор GPU из UI
+    env = os.environ.copy()
+    gpu_ids = config.get("gpu_ids") or []
+    if gpu_ids:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+    
     process = subprocess.Popen(
         cmd,
         cwd=str(PROJECT_ROOT),
         stdout=stdout_file,
         stderr=stderr_file,
         start_new_session=True,  # Отделяем от родительского процесса
+        env=env,
     )
     
     # Сохраняем файловые дескрипторы для закрытия при остановке
@@ -452,15 +481,29 @@ def stop_training():
             try:
                 with open(pid_path) as f:
                     pid = int(f.read().strip())
-                # Сначала SIGTERM, потом SIGKILL если не помогло
-                os.kill(pid, signal.SIGTERM)
-                stopped = True
+                # Убиваем process group (важно для accelerate/DDP)
+                try:
+                    # Пытаемся убить process group
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                    stopped = True
+                except (ProcessLookupError, OSError):
+                    # Если не получилось (процесс не в группе или уже завершился), пробуем по PID
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        stopped = True
+                    except ProcessLookupError:
+                        pass
                 
                 # Ждём немного и проверяем
                 time.sleep(0.5)
                 try:
-                    os.kill(pid, 0)  # Проверяем жив ли процесс
-                    os.kill(pid, signal.SIGKILL)  # Принудительно убиваем
+                    # Проверяем жив ли процесс
+                    os.kill(pid, 0)
+                    # Если жив, убиваем принудительно (process group)
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass  # Процесс уже завершился
             except Exception as e:
@@ -494,6 +537,10 @@ def stop_training():
     
     # Очищаем active_run
     clear_active_run()
+    
+    # Закрываем файловые дескрипторы логов
+    if st.session_state.current_run_id:
+        _close_run_log_files(st.session_state.current_run_id)
     
     return stopped
 
@@ -1080,6 +1127,13 @@ def render_model_config():
             help="Максимальная длина последовательности"
         )
     
+    # Проверка совместимости hidden_size и n_heads
+    if hidden_size % n_heads != 0:
+        st.sidebar.error(f"⚠️ hidden_size ({hidden_size}) должен делиться на n_heads ({n_heads}) без остатка!")
+        valid_heads = [str(i) for i in range(1, min(33, hidden_size+1)) if hidden_size % i == 0][:10]
+        if valid_heads:
+            st.sidebar.info(f"Рекомендуемые значения n_heads: {', '.join(valid_heads)}")
+    
     # Оценка параметров
     est_params = estimate_parameters(hidden_size, num_layers)
     st.sidebar.metric("Параметры (≈)", format_params(est_params))
@@ -1170,6 +1224,15 @@ def render_training_config():
         help="Экономит VRAM, но медленнее"
     )
     
+    max_grad_norm = st.sidebar.number_input(
+        "Max Gradient Norm",
+        min_value=0.0,
+        max_value=10.0,
+        value=1.0,
+        step=0.1,
+        help="Gradient clipping для стабильности (0 = отключить)"
+    )
+    
     # Validation / Eval
     st.sidebar.divider()
     st.sidebar.subheader("📊 Валидация")
@@ -1210,6 +1273,7 @@ def render_training_config():
         "max_steps": max_steps,
         "mixed_precision": mixed_precision,
         "grad_checkpoint": grad_checkpoint,
+        "max_grad_norm": max_grad_norm,
         "val_ratio": val_ratio,
         "eval_every": eval_every,
         "eval_batches": eval_batches,
@@ -1464,10 +1528,16 @@ def live_metrics_fragment():
         if metrics and metrics.get("status") == "completed":
             duration = metrics.get("training_duration", "unknown")
             st.success(f"✅ Тренировка завершена за {duration} (Run: {run_id})")
+            clear_active_run()  # Очищаем active_run.json при завершении
+            _close_run_log_files(run_id)  # Закрываем файловые дескрипторы
         elif metrics and metrics.get("status") == "error":
             st.error(f"❌ Ошибка (Run: {run_id})")
+            clear_active_run()  # Очищаем active_run.json при ошибке
+            _close_run_log_files(run_id)  # Закрываем файловые дескрипторы
         elif metrics and metrics.get("status") == "stopped":
             st.warning(f"⏹️ Тренировка остановлена (Run: {run_id})")
+            clear_active_run()  # Очищаем active_run.json при остановке
+            _close_run_log_files(run_id)  # Закрываем файловые дескрипторы
         else:
             st.info(f"📋 Просмотр метрик (Run: {run_id})")
     
@@ -1497,7 +1567,7 @@ def render_metrics_dashboard(metrics: dict):
     st.subheader(f"{status_emoji} Статус: {status.upper()}")
     
     # Metrics cards
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
         current_step = metrics.get("current_step", 0)
@@ -1520,7 +1590,7 @@ def render_metrics_dashboard(metrics: dict):
         lr = metrics.get("current_lr", 0)
         st.metric("Learning Rate", f"{lr:.2e}")
     
-    with col4:
+    with col5:
         eta = metrics.get("eta_seconds", 0)
         elapsed = metrics.get("elapsed_seconds", 0)
         st.metric("Время", f"{format_time(elapsed)}", delta=f"Ост: {format_time(eta)}", delta_color="normal")
@@ -1529,6 +1599,9 @@ def render_metrics_dashboard(metrics: dict):
     st.progress(min(progress / 100, 1.0))
     
     # Charts
+    # ВАЖНО: используем стабильный ключ по run_id, чтобы избежать утечки памяти
+    rid = st.session_state.get("current_run_id", "active") or "active"
+    
     if metrics.get("loss_history"):
         col1, col2 = st.columns(2)
         
@@ -1558,7 +1631,7 @@ def render_metrics_dashboard(metrics: dict):
                 height=300,
                 margin=dict(l=0, r=0, t=40, b=0)
             )
-            st.plotly_chart(fig_loss, key=f"loss_chart_{metrics.get('current_step')}")
+            st.plotly_chart(fig_loss, key=f"loss_chart_{rid}")
         
         with col2:
             # LR chart
@@ -1578,7 +1651,7 @@ def render_metrics_dashboard(metrics: dict):
                 height=300,
                 margin=dict(l=0, r=0, t=40, b=0)
             )
-            st.plotly_chart(fig_lr, key=f"lr_chart_{metrics.get('current_step')}")
+            st.plotly_chart(fig_lr, key=f"lr_chart_{rid}")
     
     # Checkpoints
     if metrics.get("checkpoints"):
@@ -1740,7 +1813,7 @@ def render_data_manager():
         with st.expander("📤 Загрузка локальных файлов", expanded=False):
             uploaded_files = st.file_uploader(
                 "Перетащите файлы сюда", 
-                type=["jsonl", "txt", "json"], 
+                type=["jsonl", "txt"],  # ВАЖНО: не включаем .json, т.к. это обычно массив, а не JSONL 
                 accept_multiple_files=True
             )
             
@@ -2023,9 +2096,16 @@ def render_data_manager():
                     # Preview
                     try:
                         with open(ds['path'], "r", encoding="utf-8") as f:
-                            head = [next(f).strip() for _ in range(5)]
+                            head = []
+                            for i, line in enumerate(f):
+                                if i >= 5:
+                                    break
+                                head.append(line.strip())
                         st.markdown("**Preview (первые 5 строк):**")
-                        st.code("\n".join(head), language="json" if "JSON" in ds['type'] else "text")
+                        if head:
+                            st.code("\n".join(head), language="json" if "JSON" in ds['type'] else "text")
+                        else:
+                            st.info("Файл пуст")
                         
                         col_del, col_info = st.columns([1, 4])
                         with col_del:
@@ -2356,6 +2436,7 @@ def main():
     full_config["distributed_mode"] = distributed_config["distributed_mode"]
     full_config["num_gpus"] = distributed_config["num_gpus"]
     full_config["config_file"] = distributed_config["config_file"]
+    full_config["gpu_ids"] = distributed_config.get("gpu_ids", [])
     
     # Для SFT используем токенизатор базовой модели (если он там сохранён)
     if model_config.get("stage") == "sft" and model_config.get("base_model_path"):

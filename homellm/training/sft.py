@@ -1,12 +1,16 @@
 import json
+import logging
 import math
 import random
 import re
-from typing import Any, Dict, List, Optional, Union
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 import torch
 from torch.utils.data import IterableDataset
 from transformers import PreTrainedTokenizer
+
+logger = logging.getLogger(__name__)
 
 
 class SFTDataset(IterableDataset):
@@ -31,7 +35,7 @@ class SFTDataset(IterableDataset):
         val_ratio: float = 0.0,    # если >0, часть строк уходит в val
         shard: bool = True,        # для val поставим False
     ):
-        self.file_path = file_path
+        self.file_path = Path(file_path)
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.num_replicas = max(1, int(num_replicas))
@@ -39,6 +43,10 @@ class SFTDataset(IterableDataset):
         self.split = split
         self.val_ratio = float(val_ratio or 0.0)
         self.shard = bool(shard)
+        
+        # Определяем, является ли файл gzip-архивом
+        suffixes = self.file_path.suffixes
+        self._is_gz = suffixes and suffixes[-1] == ".gz"
 
         # Дефолтные настройки
         self.cols = sft_columns or {"format": "instruct", "instruction": "instruction", "output": "output"}
@@ -134,21 +142,40 @@ class SFTDataset(IterableDataset):
         return str(v)
 
     # ---------------------------------------------------------------------
-    # Prompt formatting
+    # Prompt formatting (+ spans)
     # ---------------------------------------------------------------------
 
+    def _segments_to_text_and_spans(self, segments: List[Tuple[str, bool]]) -> Tuple[str, List[Tuple[int, int]]]:
+        """Склеивает сегменты в текст и возвращает char-spans для trainable частей."""
+        spans: List[Tuple[int, int]] = []
+        cur = 0
+        parts: List[str] = []
+        for seg_text, trainable in segments:
+            if not seg_text:
+                continue
+            parts.append(seg_text)
+            if trainable:
+                spans.append((cur, cur + len(seg_text)))
+            cur += len(seg_text)
+        return "".join(parts), spans
+
     def _format_prompt_chat(self, data: Dict[str, Any]) -> Optional[str]:
+        """Обратная совместимость: возвращает только текст."""
+        text, _ = self._format_prompt_chat_with_spans(data)
+        return text
+
+    def _format_prompt_chat_with_spans(self, data: Dict[str, Any]) -> Tuple[Optional[str], List[Tuple[int, int]]]:
         msg_path = self.cols.get("messages_path") or self.cols.get("messages", "messages")
         msgs = self._get_nested(data, msg_path)
         if not msgs:
-            return None
+            return None, []
         if isinstance(msgs, str):
             try:
                 msgs = json.loads(msgs)
             except Exception:
-                return None
+                return None, []
         if not isinstance(msgs, list) or not msgs:
-            return None
+            return None, []
 
         role_field = self.cols.get("role_field", "role")
         content_field = self.cols.get("content_field", "content")
@@ -168,7 +195,8 @@ class SFTDataset(IterableDataset):
                     sys_text = c
                 break
 
-        parts: List[str] = [f"{sys_text}{sep}"]
+        # segments: (text, trainable?)
+        segments: List[Tuple[str, bool]] = [(f"{sys_text}{sep}", False)]
 
         has_asst = False
         for m in msgs:
@@ -180,25 +208,35 @@ class SFTDataset(IterableDataset):
             if role == role_system:
                 continue
             if role == role_user:
-                parts.append(f"{self.tmpl['user_tag']}\n{content}{sep}")
+                segments.append((f"{self.tmpl['user_tag']}\n{content}{sep}", False))
             elif role == role_assistant:
-                parts.append(f"{self.tmpl['bot_tag']}\n{content}{sep}")
+                # тег ассистента НЕ учим
+                segments.append((f"{self.tmpl['bot_tag']}\n", False))
+                # учим только сам ответ (+ sep)
+                segments.append((f"{content}{sep}", True))
                 has_asst = True
 
         if not has_asst:
-            return None
+            return None, []
 
-        parts.append(self.tokenizer.eos_token)
-        return "".join(parts)
+        # EOS — обучаемый
+        segments.append((self.tokenizer.eos_token, True))
+        text, spans = self._segments_to_text_and_spans(segments)
+        return text, spans
 
     def _format_prompt_instruct(self, data: Dict[str, Any]) -> Optional[str]:
+        """Обратная совместимость: возвращает только текст."""
+        text, _ = self._format_prompt_instruct_with_spans(data)
+        return text
+
+    def _format_prompt_instruct_with_spans(self, data: Dict[str, Any]) -> Tuple[Optional[str], List[Tuple[int, int]]]:
         instr_path = self.cols.get("instruction", "instruction")
         out_path = self.cols.get("output", "output")
         instr = self._as_text(self._get_nested(data, instr_path))
         out = self._as_text(self._get_nested(data, out_path))
 
         if not instr.strip() and not out.strip():
-            return None
+            return None, []
 
         default_system = self.tmpl.get("system", "You are a helpful assistant.")
         sys_val = default_system
@@ -210,14 +248,18 @@ class SFTDataset(IterableDataset):
                 sys_val = v
 
         sep = self.tmpl.get("separator", "\n\n")
-        # Важно: добавляем \n после bot_tag, чтобы граница ответа была однозначной
-        text = (
-            f"{sys_val}{sep}"
-            f"{self.tmpl['user_tag']}\n{instr}{sep}"
-            f"{self.tmpl['bot_tag']}\n{out}{sep}"
-            f"{self.tokenizer.eos_token}"
-        )
-        return text
+        if not out.strip():
+            return None, []
+
+        segments: List[Tuple[str, bool]] = [
+            (f"{sys_val}{sep}", False),
+            (f"{self.tmpl['user_tag']}\n{instr}{sep}", False),
+            (f"{self.tmpl['bot_tag']}\n", False),
+            (f"{out}{sep}", True),
+            (self.tokenizer.eos_token, True),
+        ]
+        text, spans = self._segments_to_text_and_spans(segments)
+        return text, spans
 
     def _format_prompt(self, data: Dict[str, Any]) -> Optional[str]:
         fmt = self.cols.get("format", "instruct")
@@ -225,27 +267,65 @@ class SFTDataset(IterableDataset):
             return self._format_prompt_chat(data)
         return self._format_prompt_instruct(data)
 
+    def _format_prompt_with_spans(self, data: Dict[str, Any]) -> Tuple[Optional[str], List[Tuple[int, int]]]:
+        fmt = self.cols.get("format", "instruct")
+        if fmt == "chat":
+            return self._format_prompt_chat_with_spans(data)
+        return self._format_prompt_instruct_with_spans(data)
+
     # ---------------------------------------------------------------------
     # Public helper for UI metrics
     # ---------------------------------------------------------------------
 
     def get_sample_prompt(self, max_samples: int = 10) -> Optional[str]:
+        """Получить пример промпта из датасета для отображения в UI.
+        
+        Использует reservoir sampling для больших файлов (безопасно для RAM).
+        """
         try:
-            with open(self.file_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            if not lines:
-                return None
-
-            attempts = min(max_samples, len(lines))
-            for idx in random.sample(range(len(lines)), attempts):
-                try:
-                    data = json.loads(lines[idx])
-                    prompt = self._format_prompt(data)
-                    if prompt and len(prompt.strip()) >= 10:
-                        return prompt
-                except Exception:
-                    continue
-        except Exception:
+            samples = []
+            # Поддержка .gz файлов
+            if self._is_gz:
+                import gzip
+                f = gzip.open(self.file_path, "rt", encoding="utf-8")
+            else:
+                f = open(self.file_path, "r", encoding="utf-8")
+            
+            try:
+                for idx, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    try:
+                        data = json.loads(line)
+                        prompt = self._format_prompt(data)
+                        if not prompt or len(prompt.strip()) < 10:
+                            continue
+                        
+                        # Reservoir sampling для больших файлов
+                        if len(samples) < max_samples:
+                            samples.append(prompt)
+                        else:
+                            # С вероятностью max_samples/(idx+1) заменяем случайный элемент
+                            r = random.randint(0, idx)
+                            if r < max_samples:
+                                samples[r] = prompt
+                        
+                        # Останавливаемся после проверки достаточного количества строк
+                        if idx >= max_samples * 10:
+                            break
+                    except (json.JSONDecodeError, Exception):
+                        continue
+            
+            finally:
+                f.close()
+            
+            if samples:
+                # Возвращаем первый валидный семпл
+                return samples[0]
+        except Exception as e:
+            logger.warning(f"Failed to get sample prompt: {e}")
             return None
         return None
 
@@ -254,43 +334,29 @@ class SFTDataset(IterableDataset):
     # ---------------------------------------------------------------------
 
     def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        num_workers = worker_info.num_workers if worker_info is not None else 1
-        worker_id = worker_info.id if worker_info is not None else 0
-
-        # shard only if enabled
-        total_readers = self.num_replicas
-        reader_id = self.rank
-        
-        if self.shard and worker_info is not None:
-            total_readers *= num_workers
-            reader_id = self.rank * num_workers + worker_id
-        elif not self.shard:
-            total_readers = 1
-            reader_id = 0
-
+        # ВАЖНО: Шардирование делает accelerate.prepare(), мы только делаем train/val split
         # детерминированный split по глобальному idx
         scale = 10000
         threshold = int(self.val_ratio * scale)
-        seen = 0  # счетчик только выбранного split (важно!)
 
-        with open(self.file_path, "r", encoding="utf-8") as f:
+        # Поддержка .gz файлов (включая .jsonl.gz)
+        if self._is_gz:
+            import gzip
+            f = gzip.open(self.file_path, "rt", encoding="utf-8")
+        else:
+            f = open(self.file_path, "r", encoding="utf-8")
+        
+        try:
             for idx, line in enumerate(f):
                 self.stats["total_lines"] += 1
                 
                 is_val = (threshold > 0) and ((idx % scale) < threshold)
                 
+                # Фильтруем по split (train/val)
                 if self.split == "val" and not is_val:
                     continue
                 if self.split == "train" and is_val:
                     continue
-
-                # shard по seen (а не по idx), чтобы равномернее
-                if self.shard:
-                    if (seen % total_readers) != reader_id:
-                        seen += 1
-                        continue
-                    seen += 1
 
                 try:
                     data = json.loads(line)
@@ -300,168 +366,66 @@ class SFTDataset(IterableDataset):
                     continue
 
                 fmt = self.cols.get("format", "instruct")
-                text = self._format_prompt(data)
+                text, train_spans = self._format_prompt_with_spans(data)
 
                 if not text or len(text.strip()) < 10:
                     self.stats["skipped"] += 1
                     continue
 
-                # Токенизация полного текста
-                # ВАЖНО: add_special_tokens=False, т.к. мы уже вручную добавили eos_token в текст
-                tokens = self.tokenizer(
+                # ВАЖНО: корректный masking делаем через offsets (fast tokenizer)
+                # Требуем fast tokenizer для SFT, иначе masking будет некорректным
+                use_offsets = bool(getattr(self.tokenizer, "is_fast", False))
+                if fmt in ("chat", "instruct") and not use_offsets:
+                    raise ValueError(
+                        f"SFTDataset requires a *fast* tokenizer for correct assistant-only masking. "
+                        f"Current tokenizer: {type(self.tokenizer).__name__}. "
+                        f"Please use AutoTokenizer.from_pretrained(..., use_fast=True) or a fast tokenizer class."
+                    )
+                enc = self.tokenizer(
                     text,
                     max_length=self.seq_len,
                     truncation=True,
                     padding="max_length",
                     add_special_tokens=False,
-                    return_tensors="pt",
+                    return_attention_mask=True,
+                    return_offsets_mapping=use_offsets,
                 )
 
-                input_ids = tokens["input_ids"].squeeze(0)
-                attention_mask = tokens["attention_mask"].squeeze(0)
-                labels = input_ids.clone()
-                
-                # Инициализируем labels: сначала всё маскируем, потом размаскируем обучаемые части
-                labels.fill_(-100)
+                input_ids = torch.tensor(enc["input_ids"], dtype=torch.long)
+                attention_mask = torch.tensor(enc["attention_mask"], dtype=torch.long)
+                labels = torch.full_like(input_ids, fill_value=-100)
 
                 # ---------------------------------------------------------
                 # Masking: учим только assistant output
                 # ---------------------------------------------------------
 
-                if fmt == "chat":
-                    # Для chat-формата мы строим более точную маску:
-                    # замаскировать всё, а затем "размаскировать" только ассистентские сегменты.
-                    # Для этого пересоберем сегменты как в форматере.
+                if use_offsets:
+                    offsets = enc.get("offset_mapping", [])
+                    if offsets:
+                        # offsets может быть списком списков или тензором, нормализуем
+                        if isinstance(offsets, list) and len(offsets) > 0:
+                            offsets_list = offsets[0] if isinstance(offsets[0], list) else offsets
+                        else:
+                            offsets_list = []
+                        
+                        # helper: токен trainable если он ПОЛНОСТЬЮ внутри любого train span
+                        def is_trainable_token(start: int, end: int) -> bool:
+                            if start >= end:
+                                return False
+                            for a, b in train_spans:
+                                if start >= a and end <= b:
+                                    return True
+                            return False
 
-                    msg_path = self.cols.get("messages_path") or self.cols.get("messages", "messages")
-                    msgs = self._get_nested(data, msg_path)
-                    if isinstance(msgs, str):
-                        try:
-                            msgs = json.loads(msgs)
-                        except Exception:
-                            self.stats["skipped"] += 1
-                            continue
+                        for i, (s, e) in enumerate(offsets_list):
+                            if i >= len(labels):
+                                break
+                            if is_trainable_token(int(s), int(e)):
+                                labels[i] = input_ids[i]
+                # Если use_offsets=False, то мы уже выбросили ValueError выше
 
-                    if not isinstance(msgs, list) or not msgs:
-                        self.stats["skipped"] += 1
-                        continue
-
-                    role_field = self.cols.get("role_field", "role")
-                    content_field = self.cols.get("content_field", "content")
-                    role_system = self.cols.get("role_system", "system")
-                    role_user = self.cols.get("role_user", "user")
-                    role_assistant = self.cols.get("role_assistant", "assistant")
-
-                    sep = self.tmpl.get("separator", "\n\n")
-                    default_system = self.tmpl.get("system", "You are a helpful assistant.")
-                    sys_text = default_system
-
-                    for m in msgs:
-                        if isinstance(m, dict) and str(m.get(role_field, "")) == role_system:
-                            c = self._as_text(m.get(content_field, ""))
-                            if c.strip():
-                                sys_text = c
-                            break
-
-                    # сегменты (text, trainable)
-                    segments: List[tuple[str, bool]] = [(f"{sys_text}{sep}", False)]
-
-                    has_asst = False
-                    for m in msgs:
-                        if not isinstance(m, dict):
-                            continue
-                        role = str(m.get(role_field, ""))
-                        content = self._as_text(m.get(content_field, ""))
-
-                        if role == role_system:
-                            continue
-                        if role == role_user:
-                            segments.append((f"{self.tmpl['user_tag']}\n{content}{sep}", False))
-                        elif role == role_assistant:
-                            # ТЕГ ассистента — это часть промпта, не обучаем
-                            segments.append((f"{self.tmpl['bot_tag']}\n", False))
-                            # Обучаем только сам ответ ассистента
-                            segments.append((f"{content}{sep}", True))
-                            has_asst = True
-
-                    if not has_asst:
-                        self.stats["skipped"] += 1
-                        continue
-                    
-                    # Добавляем EOS токен как trainable (чтобы модель училась завершаться)
-                    segments.append((self.tokenizer.eos_token, True))
-
-                    # теперь размаскируем только trainable сегменты по токен-границам
-                    cur = 0
-                    for seg_text, trainable in segments:
-                        seg_ids = self.tokenizer(seg_text, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze(0)
-                        seg_len = int(seg_ids.numel())
-                        if seg_len <= 0:
-                            continue
-                        end = min(cur + seg_len, labels.numel())
-                        if trainable and cur < labels.numel():
-                            # обучаемся на тех же токенах, что и в input_ids
-                            labels[cur:end] = input_ids[cur:end]
-                        cur += seg_len
-                        if cur >= labels.numel():
-                            break
-                    
-                    # Не обучаемся на паддинге
-                    labels = labels.masked_fill(attention_mask == 0, -100)
-
-                else:
-                    # -------- Instruct masking --------
-                    instr_path = self.cols.get("instruction", "instruction")
-                    out_path = self.cols.get("output", "output")
-                    instr = self._as_text(self._get_nested(data, instr_path))
-                    out = self._as_text(self._get_nested(data, out_path))
-                    
-                    # если ответа нет — смысла учить нет
-                    if not out.strip():
-                        self.stats["skipped"] += 1
-                        continue
-                    
-                    default_system = self.tmpl.get("system", "You are a helpful assistant.")
-                    sys_val = default_system
-                    
-                    sys_field = self.cols.get("system_field")
-                    if sys_field:
-                        v = self._as_text(self._get_nested(data, sys_field))
-                        if v.strip():
-                            sys_val = v
-                    
-                    sep = self.tmpl.get("separator", "\n\n")
-                    
-                    # ВАЖНО: маску строим в токен-границах так же, как собирали prompt в _format_prompt_instruct
-                    # сегменты (text, trainable)
-                    # ТЕГ ассистента не обучаем, обучаем только сам out (+ eos)
-                    segments: List[tuple[str, bool]] = [
-                        (f"{sys_val}{sep}", False),
-                        (f"{self.tmpl['user_tag']}\n{instr}{sep}", False),
-                        (f"{self.tmpl['bot_tag']}\n", False),
-                        (f"{out}{sep}", True),
-                        (self.tokenizer.eos_token, True),
-                    ]
-                    
-                    cur = 0
-                    for seg_text, trainable in segments:
-                        seg_ids = self.tokenizer(
-                            seg_text,
-                            add_special_tokens=False,
-                            return_tensors="pt",
-                        )["input_ids"].squeeze(0)
-                        seg_len = int(seg_ids.numel())
-                        if seg_len <= 0:
-                            continue
-                        end = min(cur + seg_len, labels.numel())
-                        if trainable and cur < labels.numel():
-                            labels[cur:end] = input_ids[cur:end]
-                        cur += seg_len
-                        if cur >= labels.numel():
-                            break
-                    
-                    # Не обучаемся на паддинге
-                    labels = labels.masked_fill(attention_mask == 0, -100)
+                # не учим паддинг
+                labels = labels.masked_fill(attention_mask == 0, -100)
 
                 # Если после масок не осталось обучаемых токенов — пропускаем
                 if not (labels != -100).any():
@@ -476,17 +440,46 @@ class SFTDataset(IterableDataset):
                     "attention_mask": attention_mask,
                     "labels": labels,
                 }
+        finally:
+            f.close()
 
     def __len__(self):
         """
         Возвращает приблизительное количество примеров, доступных ЭТОМУ ранку.
         (важно для расчёта max_train_steps в trainer_worker).
+        
+        Учитывает val_ratio и split для корректной оценки длины на один rank.
         """
         if not hasattr(self, "_length"):
             cnt = 0
-            with open(self.file_path, "r", encoding="utf-8") as f:
+            # Поддержка .gz файлов
+            if self._is_gz:
+                import gzip
+                f = gzip.open(self.file_path, "rt", encoding="utf-8")
+            else:
+                f = open(self.file_path, "r", encoding="utf-8")
+            
+            try:
                 for _ in f:
                     cnt += 1
-            # распределяем по replicas примерно поровну
-            self._length = int(math.ceil(cnt / self.num_replicas))
+            finally:
+                f.close()
+            
+            # Учитываем val_ratio и split
+            if self.val_ratio > 0:
+                val_cnt = int(cnt * self.val_ratio)
+                train_cnt = cnt - val_cnt
+            else:
+                train_cnt = cnt
+                val_cnt = 0
+            
+            # Выбираем нужный split
+            if self.split == "train":
+                effective = train_cnt
+            else:  # val
+                effective = val_cnt if self.val_ratio > 0 else 0
+            
+            # ВАЖНО: Не делим на num_replicas, т.к. шардирование делает accelerate.prepare()
+            # Возвращаем полную длину для выбранного split
+            self._length = effective
         return self._length
