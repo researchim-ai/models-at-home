@@ -177,18 +177,57 @@ def restore_session_state():
         # Проверяем существует ли run директория
         run_dir = RUNS_DIR / run_id
         if run_dir.exists():
-            # Проверяем жив ли процесс
+            # Проверяем жив ли процесс (более надёжная проверка через metrics.json)
             pid_path = run_dir / "pid"
+            metrics_path = run_dir / "metrics.json"
             process_alive = False
-            if pid_path.exists():
+            metrics = None
+            
+            # Проверяем статус из metrics.json (более надёжно)
+            if metrics_path.exists():
                 try:
-                    with open(pid_path) as f:
-                        pid = int(f.read().strip())
-                    os.kill(pid, 0)  # Проверка существования процесса
-                    process_alive = True
-                except (ProcessLookupError, ValueError, PermissionError):
-                    # PermissionError может означать, что процесс существует, но у нас нет прав
-                    process_alive = True
+                    import time
+                    metrics_mtime = metrics_path.stat().st_mtime
+                    metrics_age_minutes = (time.time() - metrics_mtime) / 60
+                    
+                    with open(metrics_path) as f:
+                        metrics = json.load(f)
+                    
+                    status = metrics.get("status", "")
+                    # Если статус завершённый - точно не жив
+                    if status in ("completed", "error", "stopped"):
+                        process_alive = False
+                    elif metrics_age_minutes > 5:
+                        # Метрики не обновлялись > 5 минут - вероятно процесс умер
+                        process_alive = False
+                        logger.warning(f"Metrics not updated for {metrics_age_minutes:.1f} minutes, assuming process dead")
+                        # Очищаем active_run если процесс умер тихо
+                        clear_active_run()
+                    else:
+                        # Проверяем процесс через PID
+                        if pid_path.exists():
+                            try:
+                                with open(pid_path) as f:
+                                    pid = int(f.read().strip())
+                                os.kill(pid, 0)  # Проверка существования процесса
+                                process_alive = True
+                            except ProcessLookupError:
+                                process_alive = False
+                            except (ValueError, PermissionError):
+                                # PermissionError может означать, что процесс существует, но у нас нет прав
+                                # Но если метрики свежие (< 5 минут) - считаем живым
+                                process_alive = metrics_age_minutes < 5
+                except Exception as e:
+                    logger.warning(f"Failed to check metrics: {e}")
+                    # Fallback на проверку PID
+                    if pid_path.exists():
+                        try:
+                            with open(pid_path) as f:
+                                pid = int(f.read().strip())
+                            os.kill(pid, 0)
+                            process_alive = True
+                        except (ProcessLookupError, ValueError, PermissionError):
+                            process_alive = False
             
             # Восстанавливаем состояние
             st.session_state.current_run_id = run_id
@@ -196,15 +235,8 @@ def restore_session_state():
             
             # Если процесс завершён, очищаем active_run
             if not process_alive:
-                metrics_path = run_dir / "metrics.json"
-                if metrics_path.exists():
-                    try:
-                        with open(metrics_path) as f:
-                            metrics = json.load(f)
-                        if metrics.get("status") in ["completed", "error", "stopped"]:
-                            clear_active_run()
-                    except:
-                        pass
+                if metrics and metrics.get("status") in ("completed", "error", "stopped"):
+                    clear_active_run()
 
 
 # ============================================================================
@@ -988,41 +1020,95 @@ def render_model_config():
     # Режим обучения
     stage_options = {
         "pretrain": "Pretraining (с нуля)",
+        "continual_pretrain": "Continual Pretraining (продолжение)",
         "sft": "SFT (Fine-Tuning)"
     }
     selected_stage = st.sidebar.selectbox(
         "Этап обучения",
         options=list(stage_options.keys()),
         format_func=lambda x: stage_options[x],
-        help="Выберите этап: обучение с нуля или дообучение существующей модели"
+        help="Выберите этап: обучение с нуля, продолжение pretrain или дообучение (SFT)"
     )
     
     # Имя модели (для папки эксперимента)
-    model_name_default = "home_pretrain" if selected_stage == "pretrain" else "home_sft"
+    if selected_stage == "pretrain":
+        model_name_default = "home_pretrain"
+    elif selected_stage == "continual_pretrain":
+        model_name_default = "home_continual_pretrain"
+    else:
+        model_name_default = "home_sft"
     model_name = st.sidebar.text_input("Название эксперимента", value=model_name_default, help="Имя папки для сохранения")
     
     base_model_path = None
     
-    if selected_stage == "sft":
+    if selected_stage in ("sft", "continual_pretrain"):
+        stage_label = "SFT" if selected_stage == "sft" else "Continual Pretraining"
         st.sidebar.subheader("📦 Базовая модель")
         available = get_available_models()
-        if not available:
-            st.sidebar.warning("Нет доступных моделей для SFT. Сначала обучите Pretrain модель!")
+        
+        if selected_stage == "continual_pretrain":
+            # Для continual_pretrain фильтруем: предпочитаем final/export модели
+            # Checkpoint'ы тоже разрешены (для resume), но с предупреждением
+            final_models = [m for m in available if m["type"] == "final"]
+            checkpoint_models = [m for m in available if m["type"] == "checkpoint"]
+            
+            if final_models:
+                st.sidebar.info("💡 Рекомендуется использовать final_model для continual pretraining")
+                available_filtered = final_models + checkpoint_models
+            else:
+                if checkpoint_models:
+                    st.sidebar.warning(
+                        "⚠️ Доступны только checkpoint'ы. Для resume это нормально, "
+                        "но для начала continual pretraining лучше использовать final_model."
+                    )
+                available_filtered = checkpoint_models if checkpoint_models else available
+        else:
+            # Для SFT показываем все модели
+            available_filtered = available
+        
+        if not available_filtered:
+            st.sidebar.warning(f"Нет доступных моделей для {stage_label}. Сначала обучите Pretrain модель!")
             # Можно дать возможность ввести путь вручную
             base_model_path = st.sidebar.text_input("Путь к модели вручную", placeholder="/path/to/model")
         else:
-            # Создаем список опций
-            model_options = [m["name"] for m in available]
-            selected_base_name = st.sidebar.selectbox("Выберите модель", options=model_options)
+            # Создаем список опций с пометками типов
+            if selected_stage == "continual_pretrain":
+                model_options = [
+                    f"{m['name']} ({'✅ final' if m['type'] == 'final' else '⚠️ checkpoint'})" 
+                    for m in available_filtered
+                ]
+            else:
+                model_options = [m["name"] for m in available_filtered]
+            
+            selected_base_name = st.sidebar.selectbox(
+                "Выберите модель", 
+                options=model_options,
+                help="Для continual_pretrain рекомендуется final_model (✅ final)"
+            )
+            
+            # Извлекаем реальное имя модели (убираем пометки)
+            if selected_stage == "continual_pretrain":
+                real_name = selected_base_name.split(" (")[0]
+            else:
+                real_name = selected_base_name
+            
             # Находим путь
-            base_model_path = next(m["path"] for m in available if m["name"] == selected_base_name)
+            base_model_path = next(m["path"] for m in available_filtered if m["name"] == real_name)
+            
+            # Показываем предупреждение для checkpoint в continual_pretrain
+            selected_model = next(m for m in available_filtered if m["name"] == real_name)
+            if selected_stage == "continual_pretrain" and selected_model["type"] == "checkpoint":
+                st.sidebar.info(
+                    "ℹ️ Выбран checkpoint. Будет выполнен resume (восстановление оптимизатора и scheduler). "
+                    "Для начала нового continual pretraining лучше использовать final_model."
+                )
             
             st.sidebar.caption(f"Путь: `{base_model_path}`")
     
     # Флаг, что параметры загружены из конфига
     loaded_config = None
     
-    if selected_stage == "sft" and base_model_path:
+    if selected_stage in ("sft", "continual_pretrain") and base_model_path:
         # Пытаемся загрузить конфиг
         try:
             base_path = Path(base_model_path)
@@ -1048,7 +1134,7 @@ def render_model_config():
     st.sidebar.subheader("⚙️ Параметры модели")
     
     if loaded_config:
-        # Режим только чтения для SFT с загруженным конфигом
+        # Режим только чтения для SFT/Continual Pretrain с загруженным конфигом
         # Используем значения из конфига (поддержка разных имен ключей)
         hidden_size = loaded_config.get("hidden_size", 512)
         # num_hidden_layers - HF, num_layers - наш конфиг
@@ -1138,14 +1224,71 @@ def render_model_config():
     est_params = estimate_parameters(hidden_size, num_layers)
     st.sidebar.metric("Параметры (≈)", format_params(est_params))
     
+    # Model ID для pretrain from scratch (опционально, для HF моделей)
+    model_id = None
+    if selected_stage == "pretrain":
+        st.sidebar.subheader("🔧 Инициализация модели")
+        use_hf_model = st.sidebar.checkbox(
+            "Использовать HuggingFace модель",
+            value=False,
+            help="Если включено, можно указать HF model_id для pretrain from scratch"
+        )
+        if use_hf_model:
+            model_id = st.sidebar.text_input(
+                "HF Model ID",
+                placeholder="gpt2, microsoft/DialoGPT-small, etc.",
+                help="HuggingFace model ID для инициализации с нуля"
+            )
+            if model_id:
+                st.sidebar.info(f"Будет использована архитектура: {model_id}")
+                # Предупреждение о безопасности
+                st.sidebar.warning(
+                    "⚠️ **Безопасность**: Загрузка моделей с `trust_remote_code=True` может выполнять "
+                    "чужой код. Используйте только проверенные репозитории."
+                )
+    
+    # Метод тюнинга (full/LoRA/QLoRA)
+    st.sidebar.subheader("🎯 Метод тюнинга")
+    tuning_method = st.sidebar.selectbox(
+        "Метод",
+        ["full", "lora", "qlora"],
+        index=0,
+        help="full: полный fine-tuning, lora: LoRA, qlora: QLoRA (4-bit + LoRA)"
+    )
+    
+    lora_r = None
+    lora_alpha = None
+    lora_dropout = None
+    lora_target_modules = None
+    
+    if tuning_method in ("lora", "qlora"):
+        st.sidebar.markdown("**LoRA параметры:**")
+        lora_r = st.sidebar.slider("LoRA r", min_value=4, max_value=128, value=16, step=4)
+        lora_alpha = st.sidebar.slider("LoRA alpha", min_value=4, max_value=256, value=32, step=4)
+        lora_dropout = st.sidebar.slider("LoRA dropout", min_value=0.0, max_value=0.5, value=0.1, step=0.05)
+        
+        lora_target_modules_input = st.sidebar.text_input(
+            "Target modules (опционально)",
+            placeholder="q_proj,k_proj,v_proj,o_proj",
+            help="Модули для LoRA (через запятую). Если пусто - автодетект"
+        )
+        if lora_target_modules_input:
+            lora_target_modules = [m.strip() for m in lora_target_modules_input.split(",")]
+    
     return {
         "stage": selected_stage,
         "base_model_path": base_model_path,
         "model_name_input": model_name,
+        "model_id": model_id if model_id else None,
         "hidden_size": hidden_size,
         "num_layers": num_layers,
         "n_heads": n_heads,
         "seq_len": seq_len,
+        "tuning_method": tuning_method,
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "lora_target_modules": lora_target_modules,
     }
 
 
@@ -1740,11 +1883,14 @@ def download_hf_dataset(repo_id, subset, split, limit_type, limit_val, limit_byt
         print(status_text)
         
         # Параметры stream=True чтобы не качать все в память
-        ds = load_dataset(repo_id, subset, split=split, streaming=True)
+        # Для многих датасетов "default" может ломать load_dataset - передаём None
+        subset_arg = None if (not subset or subset.strip() == "" or subset.lower() == "default") else subset
+        
+        ds = load_dataset(repo_id, subset_arg, split=split, streaming=True)
         
         # Создаем файл
         save_path = DATASET_DIR / save_path
-        save_path.parent.mkdir(exist_ok=True)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
         
         count = 0
         current_bytes = 0
@@ -2387,8 +2533,14 @@ def render_model_preview(config: dict, distributed_config: dict = None):
 
 
 def export_model_to_hf(model, tokenizer, source_path: str):
-    """Экспортирует модель и токенизатор в стандартный HF формат."""
+    """Экспортирует модель и токенизатор в стандартный HF формат.
+    
+    ВАЖНО: Если модель использует LoRA/QLoRA, мерджит адаптер в базу,
+    чтобы экспортированная модель была "готовой" и загружалась как обычная.
+    """
     try:
+        from peft import PeftModel
+        
         source = Path(source_path)
         # Создаем имя для экспорта: export_TIMESTAMP
         export_name = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -2402,8 +2554,19 @@ def export_model_to_hf(model, tokenizer, source_path: str):
             
         export_dir.mkdir(parents=True, exist_ok=True)
         
+        # Если это PEFT-модель (LoRA/QLoRA) — мерджим адаптер в базу
+        export_model = model
+        try:
+            if isinstance(model, PeftModel):
+                logger.info("Merging LoRA adapter into base model for export...")
+                export_model = model.merge_and_unload()
+                logger.info("LoRA adapter merged successfully")
+        except Exception as e:
+            logger.warning(f"LoRA merge failed during export, saving as-is: {e}")
+            # Продолжаем с исходной моделью
+        
         # Сохраняем
-        model.save_pretrained(export_dir)
+        export_model.save_pretrained(export_dir, safe_serialization=True)
         tokenizer.save_pretrained(export_dir)
         
         return str(export_dir)
@@ -2438,8 +2601,8 @@ def main():
     full_config["config_file"] = distributed_config["config_file"]
     full_config["gpu_ids"] = distributed_config.get("gpu_ids", [])
     
-    # Для SFT используем токенизатор базовой модели (если он там сохранён)
-    if model_config.get("stage") == "sft" and model_config.get("base_model_path"):
+    # Для SFT и Continual Pretrain используем токенизатор базовой модели (если он там сохранён)
+    if model_config.get("stage") in ("sft", "continual_pretrain") and model_config.get("base_model_path"):
         full_config["tokenizer_path"] = model_config["base_model_path"]
     
     # Main content
@@ -2498,7 +2661,8 @@ def main():
         st.header("📜 История запусков")
         st.markdown("---")
         
-        runs = sorted(RUNS_DIR.glob("*"), reverse=True)
+        # Фильтруем только директории (игнорируем файлы типа active_run.json)
+        runs = sorted([p for p in RUNS_DIR.iterdir() if p.is_dir()], reverse=True)
         
         if runs:
             for run_dir in runs[:10]:  # Last 10 runs
@@ -2600,6 +2764,8 @@ def main():
                     st.session_state.selected_chat_model = None
             
             with col2:
+                # Для чата используем только final_model/export (HF формат)
+                # Все модели сохраняются в HF формате, поэтому используем AutoModelForCausalLM
                 model_type = selected_model["type"]
                 if model_type == "final":
                     st.success("✅ Финальная модель")
@@ -2632,48 +2798,81 @@ def main():
                 if st.button("🔄 Загрузить модель", type="primary"):
                     with st.spinner("Загружаем модель..."):
                         try:
-                            from transformers import AutoTokenizer
-                            from homellm.models.home_model import HomeForCausalLM, HomeConfig
-                            from safetensors.torch import load_file
+                            from transformers import AutoTokenizer, AutoModelForCausalLM
+                            from homellm.models.adapters import detect_model_type
                             
                             model_path = Path(selected_model["path"])
                             device = "cuda" if torch.cuda.is_available() else "cpu"
                             
-                            # Определяем тип чекпоинта
+                            # Проверяем наличие config.json
                             config_json = model_path / "config.json"
-                            model_safetensors = model_path / "model.safetensors"
-                            model_bin = model_path / "pytorch_model.bin"
+                            if not config_json.exists():
+                                raise ValueError(f"config.json не найден в {model_path}")
+                            
+                            # Определяем тип модели
+                            model_type = detect_model_type(model_path)
+                            
+                            # Загружаем токенизатор
                             tokenizer_json = model_path / "tokenizer.json"
                             tokenizer_config = model_path / "tokenizer_config.json"
                             
-                            # HuggingFace формат = есть tokenizer файлы
-                            is_hf_format = tokenizer_json.exists() or tokenizer_config.exists()
-                            
-                            if is_hf_format and config_json.exists():
-                                # HuggingFace формат (final_model с tokenizer)
-                                st.info("Загружаем HuggingFace модель...")
+                            if tokenizer_json.exists() or tokenizer_config.exists():
+                                # Токенизатор есть в модели
+                                st.info(f"Загружаем {model_type.upper()} модель...")
                                 st.session_state.chat_tokenizer = AutoTokenizer.from_pretrained(
-                                    str(model_path), 
+                                    str(model_path),
                                     trust_remote_code=True
                                 )
-                                st.session_state.chat_model = HomeForCausalLM.from_pretrained(
-                                    str(model_path)
-                                ).to(device)
-                            elif model_safetensors.exists() or model_bin.exists():
-                                # Accelerate checkpoint формат
-                                st.info("Загружаем Accelerate чекпоинт...")
-                                
-                                # Загружаем токенизатор GPT-2 (по умолчанию)
+                            else:
+                                # Fallback на gpt2 токенизатор
+                                st.warning("Токенизатор не найден в модели, используем gpt2")
                                 st.session_state.chat_tokenizer = AutoTokenizer.from_pretrained("gpt2")
-                                if st.session_state.chat_tokenizer.pad_token is None:
-                                    st.session_state.chat_tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+                            
+                            # Подготавливаем токенизатор (pad_token = eos_token)
+                            if st.session_state.chat_tokenizer.pad_token is None:
+                                if st.session_state.chat_tokenizer.eos_token:
+                                    st.session_state.chat_tokenizer.pad_token = st.session_state.chat_tokenizer.eos_token
+                            
+                            # Загружаем модель через AutoModelForCausalLM (универсально для всех типов)
+                            st.session_state.chat_model = AutoModelForCausalLM.from_pretrained(
+                                str(model_path),
+                                trust_remote_code=True,
+                                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                            ).to(device)
+                            
+                            st.session_state.chat_model.eval()
+                            st.session_state.chat_model_path = str(model_path)
+                            st.session_state.messages = []
+                            st.success("✅ Модель загружена!")
+                            st.rerun()
+                        except Exception as e:
+                            import traceback
+                            st.error(f"Ошибка загрузки: {e}")
+                            st.code(traceback.format_exc())
+                            
+                            # Fallback для старых чекпоинтов (если AutoModelForCausalLM не сработал)
+                            st.warning("Пробуем fallback загрузку для старых чекпоинтов...")
+                            try:
+                                from homellm.models.home_model import HomeForCausalLM, HomeConfig
+                                from safetensors.torch import load_file
                                 
-                                # Пытаемся загрузить конфиг модели из чекпоинта
+                                model_safetensors = model_path / "model.safetensors"
+                                model_bin = model_path / "pytorch_model.bin"
+                                
+                                if not (model_safetensors.exists() or model_bin.exists()):
+                                    raise ValueError("Не найдены веса модели")
+                                
+                                # Загружаем токенизатор
+                                if not st.session_state.get("chat_tokenizer"):
+                                    st.session_state.chat_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+                                    if st.session_state.chat_tokenizer.pad_token is None:
+                                        st.session_state.chat_tokenizer.pad_token = st.session_state.chat_tokenizer.eos_token
+                                
+                                # Загружаем конфиг
                                 if config_json.exists():
                                     config = HomeConfig.from_pretrained(str(model_path))
-                                    st.info(f"Конфиг загружен: hidden_size={config.hidden_size}, layers={config.num_hidden_layers}")
                                 else:
-                                    # Ищем конфиг в родительской директории (run config)
+                                    # Ищем в родительской директории
                                     run_config_path = model_path.parent / "run_config.json"
                                     if run_config_path.exists():
                                         import json as json_module
@@ -2686,17 +2885,10 @@ def main():
                                             num_attention_heads=run_cfg.get("n_heads", 8),
                                             max_position_embeddings=run_cfg.get("seq_len", 512),
                                         )
-                                        st.info(f"Конфиг из run_config: hidden_size={config.hidden_size}")
                                     else:
-                                        st.warning("⚠️ config.json не найден в чекпоинте, используем дефолтные параметры")
-                                        config = HomeConfig(
-                                            vocab_size=len(st.session_state.chat_tokenizer),
-                                            hidden_size=512,
-                                            num_hidden_layers=8,
-                                            num_attention_heads=8,
-                                            max_position_embeddings=512,
-                                        )
+                                        raise ValueError("Не найден config.json")
                                 
+                                # Создаём и загружаем модель
                                 st.session_state.chat_model = HomeForCausalLM(config)
                                 
                                 # Загружаем веса
@@ -2704,39 +2896,27 @@ def main():
                                     state_dict = load_file(str(model_safetensors))
                                 else:
                                     state_dict = torch.load(str(model_bin), map_location="cpu")
+                                
                                 missing, unexpected = st.session_state.chat_model.load_state_dict(state_dict, strict=False)
                                 
-                                # Умная проверка пропущенных ключей
                                 if missing:
-                                    # Игнорируем lm_head.weight, так как он связан с embed_tokens
                                     real_missing = [k for k in missing if k != "lm_head.weight"]
                                     if real_missing:
-                                        st.warning(f"⚠️ Внимание! Отсутствуют веса: {real_missing[:5]}... (всего {len(real_missing)})")
-                                        logger.warning(f"Missing keys: {real_missing}")
-                                    else:
-                                        # Если не хватает только lm_head, значит все ок
-                                        logger.info("Missing only lm_head.weight (expected for tied weights)")
+                                        st.warning(f"⚠️ Отсутствуют веса: {real_missing[:5]}...")
                                 
-                                if unexpected:
-                                    st.warning(f"⚠️ Найдены лишние ключи в чекпоинте: {unexpected[:5]}...")
-
-                                # Явно связываем веса после загрузки
                                 if hasattr(st.session_state.chat_model, "tie_weights"):
                                     st.session_state.chat_model.tie_weights()
-                                    
+                                
                                 st.session_state.chat_model = st.session_state.chat_model.to(device)
-                            else:
-                                raise ValueError(f"Не найден config.json или model.safetensors в {model_path}")
-                            
-                            st.session_state.chat_model.eval()
-                            st.session_state.chat_model_path = str(model_path)
-                            st.session_state.messages = []
-                            st.success("✅ Модель загружена!")
-                            st.rerun()
-                        except Exception as e:
-                            import traceback
-                            st.error(f"Ошибка загрузки: {e}")
-                            st.code(traceback.format_exc())
+                                st.session_state.chat_model.eval()
+                                st.session_state.chat_model_path = str(model_path)
+                                st.session_state.messages = []
+                                st.success("✅ Модель загружена (fallback метод)!")
+                                st.rerun()
+                            except Exception as e2:
+                                st.error(f"Fallback загрузка тоже не удалась: {e2}")
+                                import traceback
+                                st.code(traceback.format_exc())
             else:
                 st.success(f"✅ Модель загружена: {selected_model_name}")
                 

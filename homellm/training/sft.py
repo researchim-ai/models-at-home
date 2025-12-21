@@ -210,10 +210,11 @@ class SFTDataset(IterableDataset):
             if role == role_user:
                 segments.append((f"{self.tmpl['user_tag']}\n{content}{sep}", False))
             elif role == role_assistant:
-                # тег ассистента НЕ учим
-                segments.append((f"{self.tmpl['bot_tag']}\n", False))
-                # учим только сам ответ (+ sep)
-                segments.append((f"{content}{sep}", True))
+                # тег ассистента НЕ учим (без \n)
+                segments.append((f"{self.tmpl['bot_tag']}", False))
+                # учим только сам ответ (+ \n перед ним и sep после)
+                # ВАЖНО: \n переносим в trainable часть, чтобы первый токен ответа не маскировался
+                segments.append((f"\n{content}{sep}", True))
                 has_asst = True
 
         if not has_asst:
@@ -254,8 +255,8 @@ class SFTDataset(IterableDataset):
         segments: List[Tuple[str, bool]] = [
             (f"{sys_val}{sep}", False),
             (f"{self.tmpl['user_tag']}\n{instr}{sep}", False),
-            (f"{self.tmpl['bot_tag']}\n", False),
-            (f"{out}{sep}", True),
+            (f"{self.tmpl['bot_tag']}", False),  # тег без \n
+            (f"\n{out}{sep}", True),  # \n переносим в trainable часть
             (self.tokenizer.eos_token, True),
         ]
         text, spans = self._segments_to_text_and_spans(segments)
@@ -426,6 +427,16 @@ class SFTDataset(IterableDataset):
 
                 # не учим паддинг
                 labels = labels.masked_fill(attention_mask == 0, -100)
+                
+                # ВАЖНО: EOS токен часто имеет offset (0,0) у fast tokenizers,
+                # поэтому он не попадает в train_spans через offset_mapping.
+                # Добавляем явную обработку EOS токена.
+                eos_id = self.tokenizer.eos_token_id
+                if eos_id is not None:
+                    # Ищем последний валидный токен (не padding)
+                    last_valid_idx = int(attention_mask.sum().item()) - 1
+                    if last_valid_idx >= 0 and input_ids[last_valid_idx].item() == eos_id:
+                        labels[last_valid_idx] = input_ids[last_valid_idx]
 
                 # Если после масок не осталось обучаемых токенов — пропускаем
                 if not (labels != -100).any():
@@ -447,6 +458,13 @@ class SFTDataset(IterableDataset):
         """
         Возвращает приблизительное количество примеров, доступных ЭТОМУ ранку.
         (важно для расчёта max_train_steps в trainer_worker).
+        
+        ВАЖНО: Это приблизительная оценка, так как реальное количество валидных примеров
+        может быть меньше из-за:
+        - битых JSON строк
+        - пустых/коротких примеров
+        - примеров, где после masking не осталось обучаемых токенов
+        - truncation, который может удалить весь trainable контент
         
         Учитывает val_ratio и split для корректной оценки длины на один rank.
         """
@@ -481,5 +499,107 @@ class SFTDataset(IterableDataset):
             
             # ВАЖНО: Не делим на num_replicas, т.к. шардирование делает accelerate.prepare()
             # Возвращаем полную длину для выбранного split
+            # 
+            # ПРИМЕЧАНИЕ: Реальное количество валидных примеров может быть меньше из-за skipped.
+            # Если нужно точное значение - используйте max_steps вместо epochs.
             self._length = effective
+            
+            # Логируем предупреждение если есть статистика о skipped примерах
+            if hasattr(self, 'stats') and self.stats.get("total_lines", 0) > 0:
+                skipped_ratio = self.stats.get("skipped", 0) / max(1, self.stats.get("total_lines", 1))
+                if skipped_ratio > 0.1:  # Если >10% примеров скипается
+                    logger.warning(
+                        f"SFTDataset: {skipped_ratio*100:.1f}% примеров пропущено. "
+                        f"Реальная длина может быть меньше __len__()={self._length}. "
+                        f"Рекомендуется использовать max_steps вместо epochs."
+                    )
+        
         return self._length
+    
+    def debug_masking(self, data: Dict[str, Any], max_tokens: int = 50) -> Optional[str]:
+        """
+        Отладочная функция для проверки корректности маскирования.
+        
+        Возвращает строку с декодированным текстом и пометками:
+        - [MASKED] для токенов с labels=-100
+        - [TRAIN] для токенов с labels!=-100 (обучаемые)
+        
+        Полезно для быстрой проверки, что обучается только ответ ассистента.
+        """
+        try:
+            fmt = self.cols.get("format", "instruct")
+            text, train_spans = self._format_prompt_with_spans(data)
+            
+            if not text:
+                return None
+            
+            use_offsets = bool(getattr(self.tokenizer, "is_fast", False))
+            if not use_offsets:
+                return "⚠️ Fast tokenizer required for masking debug"
+            
+            enc = self.tokenizer(
+                text,
+                max_length=self.seq_len,
+                truncation=True,
+                padding="max_length",
+                add_special_tokens=False,
+                return_attention_mask=True,
+                return_offsets_mapping=True,
+            )
+            
+            input_ids = torch.tensor(enc["input_ids"], dtype=torch.long)
+            attention_mask = torch.tensor(enc["attention_mask"], dtype=torch.long)
+            labels = torch.full_like(input_ids, fill_value=-100)
+            
+            offsets = enc.get("offset_mapping", [])
+            if offsets:
+                offsets_list = offsets[0] if isinstance(offsets[0], list) else offsets
+                
+                def is_trainable_token(start: int, end: int) -> bool:
+                    if start >= end:
+                        return False
+                    for a, b in train_spans:
+                        if start >= a and end <= b:
+                            return True
+                    return False
+                
+                for i, (s, e) in enumerate(offsets_list):
+                    if i >= len(labels):
+                        break
+                    if is_trainable_token(int(s), int(e)):
+                        labels[i] = input_ids[i]
+            
+            labels = labels.masked_fill(attention_mask == 0, -100)
+            
+            # EOS обработка
+            eos_id = self.tokenizer.eos_token_id
+            if eos_id is not None:
+                last_valid_idx = int(attention_mask.sum().item()) - 1
+                if last_valid_idx >= 0 and input_ids[last_valid_idx].item() == eos_id:
+                    labels[last_valid_idx] = input_ids[last_valid_idx]
+            
+            # Формируем отладочный вывод
+            valid_len = int(attention_mask.sum().item())
+            trainable_count = int((labels != -100).sum().item())
+            
+            result = []
+            result.append(f"Total tokens: {valid_len}, Trainable: {trainable_count} ({trainable_count/valid_len*100:.1f}%)\n")
+            result.append("=" * 60 + "\n")
+            
+            for i in range(min(valid_len, max_tokens)):
+                token_id = input_ids[i].item()
+                token_text = self.tokenizer.decode([token_id])
+                is_trainable = labels[i].item() != -100
+                
+                marker = "[TRAIN]" if is_trainable else "[MASKED]"
+                result.append(f"{i:3d} {marker:8s} {token_text!r}\n")
+            
+            if valid_len > max_tokens:
+                result.append(f"... ({valid_len - max_tokens} more tokens)\n")
+            
+            result.append("=" * 60 + "\n")
+            result.append(f"Trainable spans (char positions): {train_spans}\n")
+            
+            return "".join(result)
+        except Exception as e:
+            return f"Error in debug_masking: {e}"

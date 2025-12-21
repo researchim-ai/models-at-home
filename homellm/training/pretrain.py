@@ -136,7 +136,8 @@ class StreamingTextDataset(IterableDataset):
                 add_special_tokens=True,
             )["input_ids"]
             
-            yield torch.tensor(tokens, dtype=torch.long)
+            # Возвращаем dict для совместимости с collator'ами
+            yield {"input_ids": torch.tensor(tokens, dtype=torch.long)}
 
     def get_sample_prompt(self, max_samples: int = 10) -> str | None:
         """Получить пример текста из датасета для отображения в UI.
@@ -152,6 +153,7 @@ class StreamingTextDataset(IterableDataset):
             else:
                 f = open(self.file_path, "r", encoding="utf-8")
             
+            try:
                 for idx, line in enumerate(f):
                     line = line.strip()
                     if not line:

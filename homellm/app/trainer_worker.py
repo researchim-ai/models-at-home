@@ -23,9 +23,8 @@ from transformers import (
     get_cosine_schedule_with_warmup,
     DataCollatorForLanguageModeling,
 )
-from safetensors.torch import load_file
 
-from homellm.models.home_model import HomeConfig, HomeForCausalLM
+from homellm.models.adapters import resolve_adapter
 from homellm.training.pretrain import StreamingTextDataset
 from homellm.training.sft import SFTDataset
 
@@ -33,8 +32,22 @@ logger = logging.getLogger(__name__)
 
 
 def get_gpu_stats():
-    """Получить статистику GPU через nvidia-smi (работает правильно при DDP)."""
+    """
+    Получить статистику GPU через nvidia-smi (работает правильно при DDP).
+    
+    ВАЖНО: Фильтрует и ремапит GPU по CUDA_VISIBLE_DEVICES, чтобы показывать
+    только выбранные GPU с правильными индексами (0..N-1).
+    """
     gpu_stats = []
+    
+    # Получаем список видимых GPU из окружения
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible_ids = None
+    if visible:
+        try:
+            visible_ids = [int(x.strip()) for x in visible.split(",") if x.strip() != ""]
+        except Exception:
+            visible_ids = None
     
     try:
         import subprocess
@@ -62,6 +75,15 @@ def get_gpu_stats():
                             "memory_percent": round(memory_used / memory_total * 100, 1) if memory_total > 0 else 0,
                             "utilization": utilization,
                         })
+            
+            # Фильтруем и ремапим по CUDA_VISIBLE_DEVICES
+            if visible_ids is not None:
+                # Оставляем только видимые GPU
+                gpu_stats = [g for g in gpu_stats if g["id"] in visible_ids]
+                # Ремапим физические ID -> логические (0..N-1)
+                remap = {phys: i for i, phys in enumerate(visible_ids)}
+                for g in gpu_stats:
+                    g["id"] = remap.get(g["id"], g["id"])
     except Exception:
         # Fallback на torch.cuda если nvidia-smi недоступен
         if torch.cuda.is_available():
@@ -198,7 +220,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
     
     # Mixed precision
     mixed_precision = config.get("mixed_precision", "no")
-    stage = config.get("stage", "pretrain") # pretrain | sft
+    stage = config.get("stage", "pretrain") # pretrain | continual_pretrain | sft
     
     accelerator = Accelerator(
         gradient_accumulation_steps=config["gradient_accumulation"],
@@ -209,29 +231,23 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
     metrics = MetricsLogger(metrics_path, enabled=accelerator.is_main_process)
     
     try:
+        # Определяем адаптер для работы с моделью
+        adapter = resolve_adapter(config)
+        logger.info(f"Using adapter: {adapter.__class__.__name__}")
+        
         metrics.update(status="loading_tokenizer", stage=stage)
         
-        # Tokenizer
-        # Для SFT важно использовать токенизатор базовой модели (если он там сохранён)
-        tokenizer_path = config.get("tokenizer_path", "gpt2")
+        # Загружаем токенизатор через адаптер
+        tokenizer_path = config.get("tokenizer_path")
+        if not tokenizer_path and stage in ("sft", "continual_pretrain") and config.get("base_model_path"):
+            # Для SFT/continual используем токенизатор из базовой модели
+            tokenizer_path = config["base_model_path"]
+        elif not tokenizer_path:
+            # Для pretrain используем model_id если указан, иначе gpt2
+            tokenizer_path = config.get("model_id", "gpt2")
         
-        if stage == "sft" and config.get("base_model_path"):
-            bp = Path(config["base_model_path"])
-            # Проверяем наличие файлов токенизатора в базовой модели
-            if (bp / "tokenizer.json").exists() or (bp / "tokenizer_config.json").exists() or (bp / "vocab.json").exists():
-                tokenizer_path = str(bp)
-                logger.info(f"Using tokenizer from base model: {tokenizer_path}")
-        
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-        except Exception as e:
-            # Если путь к токенизатору кривой или это путь к чекпоинту без токенизатора
-            logger.warning(f"Failed to load tokenizer from {tokenizer_path}, falling back to gpt2: {e}")
-            tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        
-        # pad token: лучше иметь, иначе паддинг/коллатор могут чудить
-        if tokenizer.pad_token is None:
-            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+        tokenizer = adapter.load_tokenizer(tokenizer_path, trust_remote_code=True)
+        tokenizer = adapter.prepare_tokenizer(tokenizer)  # pad_token = eos_token
         
         metrics.update(status=f"loading_dataset ({stage})")
         
@@ -280,7 +296,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             from transformers import default_data_collator
             collate_fn = default_data_collator
         else:
-            # Pretrain
+            # Pretrain или Continual Pretrain - используем StreamingTextDataset
             train_dataset = StreamingTextDataset(
                 config["data_path"], 
                 tokenizer, 
@@ -292,7 +308,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 shard=False,  # Шардирование делает accelerate
             )
             
-            # Получаем пример текста для отображения (для pretrain)
+            # Получаем пример текста для отображения (для pretrain/continual_pretrain)
             try:
                 if hasattr(train_dataset, 'get_sample_prompt'):
                     sample_prompt = train_dataset.get_sample_prompt(max_samples=20)
@@ -356,72 +372,33 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         
         metrics.update(status="building_model")
         
-        # Model Configuration
-        # Если SFT, мы должны загрузить веса
-        if stage == "sft" and config.get("base_model_path"):
-            base_model_path = Path(config["base_model_path"])
-            
-            # Пытаемся загрузить конфиг
-            if (base_model_path / "config.json").exists():
-                model_config = HomeConfig.from_pretrained(str(base_model_path))
-            else:
-                 # Пытаемся найти конфиг в родительской папке запуска
-                 parent_config = base_model_path.parent / "run_config.json"
-                 if parent_config.exists():
-                     with open(parent_config) as f:
-                        run_cfg = json.load(f)
-                     model_config = HomeConfig(
-                        vocab_size=len(tokenizer),
-                        hidden_size=run_cfg.get("hidden_size", 512),
-                        num_hidden_layers=run_cfg.get("num_layers", 8),
-                        num_attention_heads=run_cfg.get("n_heads", 8),
-                        max_position_embeddings=run_cfg.get("seq_len", 512),
-                     )
-                 else:
-                     raise ValueError(f"Cannot find config.json in {base_model_path}")
-                     
-            model = HomeForCausalLM(model_config)
-            
-            # Загрузка весов
-            # Ищем .safetensors или .bin
-            if (base_model_path / "model.safetensors").exists():
-                 state_dict = load_file(str(base_model_path / "model.safetensors"))
-                 model.load_state_dict(state_dict, strict=False) # strict=False т.к. может измениться размер vocab
-            elif (base_model_path / "pytorch_model.bin").exists():
-                 state_dict = torch.load(base_model_path / "pytorch_model.bin", map_location="cpu")
-                 model.load_state_dict(state_dict, strict=False)
-            else:
-                # Accelerate checkpoint format?
-                try:
-                    # Попробуем загрузить через load_state_dict если это папка чекпоинта accelerate
-                    # Обычно accelerate сохраняет random_states и model.safetensors внутри
-                    pass
-                except:
-                    pass
-            
-            logger.info(f"Loaded base model from {base_model_path}")
-            
-        else:
-            # Pretrain from scratch
-            model_config = HomeConfig(
-                vocab_size=len(tokenizer),
-                hidden_size=config["hidden_size"],
-                num_hidden_layers=config["num_layers"],
-                num_attention_heads=config["n_heads"],
-                max_position_embeddings=config["seq_len"],
-                dropout=config.get("dropout", 0.0),
-            )
-            model = HomeForCausalLM(model_config)
+        # Загружаем модель через адаптер
+        resume_from_checkpoint = None
+        base_model_path = config.get("base_model_path")
         
-        # Если vocab токенизатора изменился (например добавили pad_token) — расширяем эмбеддинги
-        # Это важно для обоих случаев: pretrain (vocab может измениться после добавления pad_token)
-        # и SFT (vocab базовой модели может отличаться от токенизатора)
-        if model.config.vocab_size != len(tokenizer):
-            logger.info(f"Resizing token embeddings: {model.config.vocab_size} -> {len(tokenizer)}")
-            model.resize_token_embeddings(len(tokenizer))
-            model.config.vocab_size = len(tokenizer)
-            if hasattr(model, "tie_weights"):
-                model.tie_weights()
+        # Проверяем, является ли это checkpoint (для resume)
+        if base_model_path:
+            base_path = Path(base_model_path)
+            is_checkpoint = (
+                "checkpoint" in base_path.name.lower() or
+                (base_path / "pytorch_model.bin.index.json").exists()
+            )
+            
+            if is_checkpoint and stage == "continual_pretrain":
+                resume_from_checkpoint = str(base_path)
+                logger.info(f"Continual pretraining: will resume from accelerate checkpoint {base_path}")
+        
+        # Загружаем модель через адаптер
+        model, model_config = adapter.load_for_training(
+            base_model_path=base_model_path,
+            stage=stage,
+            tokenizer=tokenizer,
+            config=config,
+            trust_remote_code=True,
+        )
+        
+        # Подготавливаем модель для обучения (resize, LoRA, use_cache, etc.)
+        model = adapter.prepare_for_training(model, tokenizer, config)
         
         # Подсчёт параметров
         num_params = sum(p.numel() for p in model.parameters())
@@ -476,10 +453,40 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 model, optimizer, train_loader, lr_scheduler
             )
         
+        # Resume из checkpoint для continual_pretrain (если указан checkpoint)
+        starting_step = 0
+        if resume_from_checkpoint and stage == "continual_pretrain":
+            try:
+                logger.info(f"Resuming training from checkpoint: {resume_from_checkpoint}")
+                accelerator.load_state(resume_from_checkpoint)
+                
+                # Пытаемся извлечь global_step из checkpoint
+                checkpoint_meta = Path(resume_from_checkpoint) / "checkpoint_metadata.json"
+                if checkpoint_meta.exists():
+                    with open(checkpoint_meta) as f:
+                        meta = json.load(f)
+                        starting_step = meta.get("global_step", 0)
+                else:
+                    # Пытаемся извлечь из имени папки (например checkpoint_step1000)
+                    import re
+                    match = re.search(r'step(\d+)', str(resume_from_checkpoint))
+                    if match:
+                        starting_step = int(match.group(1))
+                
+                logger.info(f"Resumed from step {starting_step}")
+                metrics.update(status="resumed", resumed_from_step=starting_step)
+            except Exception as e:
+                logger.error(f"Failed to resume from checkpoint {resume_from_checkpoint}: {e}")
+                logger.warning("Continuing without resume (starting from step 0)")
+                metrics.update(status="resume_failed", resume_error=str(e))
+        
         output_dir = Path(config["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
         
         metrics.update(status="training")
+        
+        # Начинаем с шага, с которого возобновили (если был resume)
+        current_step = starting_step
         
         # Функция для валидации (использует eval_batches из замыкания)
         def evaluate(val_loader):
@@ -522,7 +529,6 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             model.train()
             
             for step, batch in enumerate(train_loader):
-                
                 with accelerator.accumulate(model):
                     outputs = model(**batch)
                     loss = outputs.loss
@@ -658,10 +664,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 logger.info(f"Saved chat_template: user_tag='{u_tag}', bot_tag='{b_tag}'")
             
             # --- ВСЕГДА сохраняем финальную модель (и для pretrain тоже) ---
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(final_dir, save_function=accelerator.save)
-            model_config.save_pretrained(final_dir)
-            tokenizer.save_pretrained(final_dir)
+            # Используем адаптер для универсального сохранения (работает для Home и HF моделей)
+            adapter.save_final(accelerator, model, tokenizer, final_dir)
             
             total_time = time.time() - start_time
             hours, rem = divmod(total_time, 3600)
