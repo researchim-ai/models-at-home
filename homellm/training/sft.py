@@ -335,11 +335,23 @@ class SFTDataset(IterableDataset):
     # ---------------------------------------------------------------------
 
     def __iter__(self):
-        # ВАЖНО: Шардирование делает accelerate.prepare(), мы только делаем train/val split
-        # детерминированный split по глобальному idx
+        """
+        Итератор с опциональным шардированием.
+        
+        ВАЖНО: По умолчанию шардирование делает accelerate.prepare() через DataLoaderShard/Dispatcher.
+        Явное шардирование в датасете включается только если shard=True.
+        
+        Логика:
+        1. Читаем все строки с глобальным индексом
+        2. Применяем train/val split по глобальному индексу
+        3. Опционально шардируем между процессами и workers (только если shard=True)
+        """
+        from torch.utils.data import get_worker_info
+        
+        # Train/val split параметры
         scale = 10000
         threshold = int(self.val_ratio * scale)
-
+        
         # Поддержка .gz файлов (включая .jsonl.gz)
         if self._is_gz:
             import gzip
@@ -348,16 +360,37 @@ class SFTDataset(IterableDataset):
             f = open(self.file_path, "r", encoding="utf-8")
         
         try:
-            for idx, line in enumerate(f):
-                self.stats["total_lines"] += 1
-                
+            # Базовый итератор всех строк с глобальным индексом
+            base_iter = enumerate(f)
+            
+            # 1. Применяем train/val split по глобальному индексу
+            def apply_split(idx_line_pair):
+                idx, line = idx_line_pair
                 is_val = (threshold > 0) and ((idx % scale) < threshold)
-                
-                # Фильтруем по split (train/val)
                 if self.split == "val" and not is_val:
-                    continue
+                    return None
                 if self.split == "train" and is_val:
-                    continue
+                    return None
+                return idx_line_pair
+            
+            # Фильтруем по split
+            filtered_iter = (pair for pair in base_iter if apply_split(pair) is not None)
+            
+            # 2. Шардирование между DDP процессами (только если shard=True)
+            # ВАЖНО: Если shard=False, шардирование делает accelerate.prepare()
+            if self.shard and self.num_replicas > 1:
+                filtered_iter = ((idx, line) for idx, line in filtered_iter if idx % self.num_replicas == self.rank)
+            
+            # 3. Шардирование между DataLoader workers внутри каждого процесса (только если shard=True)
+            worker_info = get_worker_info()
+            if self.shard and worker_info is not None and worker_info.num_workers > 1:
+                total_workers = self.num_replicas * worker_info.num_workers
+                worker_rank = self.rank * worker_info.num_workers + worker_info.id
+                filtered_iter = ((idx, line) for idx, line in filtered_iter if idx % total_workers == worker_rank)
+            
+            # Итерируем по данным (зашардированным или нет, в зависимости от shard)
+            for idx, line in filtered_iter:
+                self.stats["total_lines"] += 1
 
                 try:
                     data = json.loads(line)

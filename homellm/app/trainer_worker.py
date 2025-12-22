@@ -18,6 +18,7 @@ from typing import Dict, Any
 import torch
 from torch.utils.data import IterableDataset, DataLoader
 from accelerate import Accelerator
+from accelerate.utils import DataLoaderConfiguration
 from transformers import (
     AutoTokenizer,
     get_cosine_schedule_with_warmup,
@@ -222,9 +223,18 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
     mixed_precision = config.get("mixed_precision", "no")
     stage = config.get("stage", "pretrain") # pretrain | continual_pretrain | sft
     
+    # ВАЖНО: Явная конфигурация DataLoader для IterableDataset
+    # dispatch_batches=True: rank0 читает датасет, батчи рассылаются по процессам (избегает дублей)
+    # even_batches=False: не дублируем примеры для выравнивания батчей (строгая уникальность)
+    dataloader_config = DataLoaderConfiguration(
+        dispatch_batches=True,   # Критично для IterableDataset: избегает дублей между процессами
+        even_batches=False,      # Не дублируем примеры для выравнивания (строгая уникальность)
+    )
+    
     accelerator = Accelerator(
         gradient_accumulation_steps=config["gradient_accumulation"],
         mixed_precision=mixed_precision,
+        dataloader_config=dataloader_config,
     )
     
     # ВАЖНО: MetricsLogger только на main process для избежания гонок при Multi-GPU
@@ -260,7 +270,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         holdout_ratio = val_ratio if (val_ratio > 0.0 and eval_every > 0) else 0.0
         
         # Dataset Selection based on Stage
-        # ВАЖНО: Шардирование делает accelerate.prepare(), датасеты только делают train/val split
+        # ВАЖНО: Шардирование делает accelerate.prepare() через DataLoaderShard/Dispatcher
+        # Датасет только делает train/val split, но НЕ шардирует между процессами (shard=False)
         if stage == "sft":
             train_dataset = SFTDataset(
                 config["data_path"],
@@ -268,11 +279,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 seq_len=config["seq_len"],
                 sft_columns=config.get("sft_columns"),
                 sft_template=config.get("sft_template"),
-                num_replicas=1,  # Не шардируем вручную, это сделает accelerate
-                rank=0,
+                num_replicas=1,  # Не используется при shard=False, accelerate шардирует сам
+                rank=0,  # Не используется при shard=False, accelerate шардирует сам
                 split="train",
                 val_ratio=holdout_ratio,  # ✅ ВАЖНО: исключаем val-часть из train
-                shard=False,  # Шардирование делает accelerate
+                shard=False,  # ✅ Шардирование делает accelerate.prepare()
             )
             
             # Получаем пример сформированного промпта для отображения (для SFT)
@@ -301,11 +312,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 config["data_path"], 
                 tokenizer, 
                 seq_len=config["seq_len"],
-                num_replicas=1,  # Не шардируем вручную, это сделает accelerate
-                rank=0,
+                num_replicas=1,  # Не используется при shard=False, accelerate шардирует сам
+                rank=0,  # Не используется при shard=False, accelerate шардирует сам
                 split="train",
                 val_ratio=holdout_ratio,  # ✅ ВАЖНО: исключаем val-часть из train
-                shard=False,  # Шардирование делает accelerate
+                shard=False,  # ✅ Шардирование делает accelerate.prepare()
             )
             
             # Получаем пример текста для отображения (для pretrain/continual_pretrain)
@@ -318,12 +329,24 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             except Exception as e:
                 logger.warning(f"Failed to get sample prompt: {e}")
             
-            collate_fn = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+            # ВАЖНО: Для pretrain используем кастомный collator, который маскирует по attention_mask,
+            # а не по pad_token_id. Это критично, если pad_token = eos_token (EOS не должен маскироваться)
+            def causal_lm_collator(batch):
+                """Кастомный collator для pretrain, маскирует labels по attention_mask."""
+                input_ids = torch.stack([x["input_ids"] for x in batch])
+                attention_mask = torch.stack([x["attention_mask"] for x in batch])
+                labels = input_ids.clone()
+                labels[attention_mask == 0] = -100  # Маскируем только padding, не EOS
+                return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+            
+            collate_fn = causal_lm_collator
         
         # Создаем validation loader если нужно
         val_loader = None
         
         if holdout_ratio > 0.0:
+            # ВАЖНО: Шардирование делает accelerate.prepare() через DataLoaderShard/Dispatcher
+            # Датасет только делает train/val split, но НЕ шардирует между процессами (shard=False)
             if stage == "sft":
                 from homellm.training.sft import SFTDataset
                 val_dataset = SFTDataset(
@@ -332,11 +355,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     seq_len=config["seq_len"],
                     sft_columns=config.get("sft_columns"),
                     sft_template=config.get("sft_template"),
-                    num_replicas=1,  # важно!
-                    rank=0,
+                    num_replicas=1,  # Не используется при shard=False, accelerate шардирует сам
+                    rank=0,  # Не используется при shard=False, accelerate шардирует сам
                     split="val",
                     val_ratio=holdout_ratio,  # ✅ Используем тот же holdout_ratio
-                    shard=False,     # важно!
+                    shard=False,  # ✅ Шардирование делает accelerate.prepare()
                 )
                 from transformers import default_data_collator
                 val_collate = default_data_collator
@@ -346,13 +369,22 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     config["data_path"],
                     tokenizer,
                     seq_len=config["seq_len"],
-                    num_replicas=1,
-                    rank=0,
+                    num_replicas=1,  # Не используется при shard=False, accelerate шардирует сам
+                    rank=0,  # Не используется при shard=False, accelerate шардирует сам
                     split="val",
                     val_ratio=holdout_ratio,  # ✅ Используем тот же holdout_ratio
-                    shard=False,
+                    shard=False,  # ✅ Шардирование делает accelerate.prepare()
                 )
-                val_collate = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+                # Используем тот же кастомный collator для val, что и для train
+                def causal_lm_collator(batch):
+                    """Кастомный collator для pretrain, маскирует labels по attention_mask."""
+                    input_ids = torch.stack([x["input_ids"] for x in batch])
+                    attention_mask = torch.stack([x["attention_mask"] for x in batch])
+                    labels = input_ids.clone()
+                    labels[attention_mask == 0] = -100  # Маскируем только padding, не EOS
+                    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+                
+                val_collate = causal_lm_collator
             
             # ВАЖНО: num_workers=0 для val, чтобы избежать дубликатов при shard=False
             val_loader = DataLoader(
@@ -363,11 +395,13 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             )
             
         # ВАЖНО: num_workers=0 для IterableDataset, чтобы избежать дублирования данных
+        # drop_last=True для стабильности DDP (все процессы выполнят одинаковое число итераций)
         train_loader = DataLoader(
             train_dataset,
             batch_size=config["batch_size"],
             collate_fn=collate_fn,
             num_workers=0,  # IterableDataset + num_workers>0 = дублирование данных
+            drop_last=True,  # ✅ Критично для DDP: избегаем рассинхрона по числу шагов между процессами
         )
         
         metrics.update(status="building_model")
@@ -376,17 +410,26 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         resume_from_checkpoint = None
         base_model_path = config.get("base_model_path")
         
-        # Проверяем, является ли это checkpoint (для resume)
+        # Проверяем, является ли это accelerate checkpoint (для resume)
+        # ВАЖНО: pytorch_model.bin.index.json может быть и у обычных шардированных HF-сейвов,
+        # поэтому проверяем наличие accelerator_state.json - это точный признак accelerate checkpoint
+        def is_accelerate_checkpoint(p: Path) -> bool:
+            """Проверяет, является ли путь accelerate checkpoint'ом."""
+            return (p / "accelerator_state.json").exists()
+        
         if base_model_path:
             base_path = Path(base_model_path)
-            is_checkpoint = (
-                "checkpoint" in base_path.name.lower() or
-                (base_path / "pytorch_model.bin.index.json").exists()
-            )
+            is_checkpoint = is_accelerate_checkpoint(base_path)
             
             if is_checkpoint and stage == "continual_pretrain":
                 resume_from_checkpoint = str(base_path)
                 logger.info(f"Continual pretraining: will resume from accelerate checkpoint {base_path}")
+            elif is_checkpoint and stage != "continual_pretrain":
+                logger.warning(
+                    f"Found accelerate checkpoint at {base_path}, but stage is {stage}. "
+                    f"Resume from checkpoint is only supported for continual_pretrain. "
+                    f"Will load as regular model instead."
+                )
         
         # Загружаем модель через адаптер
         model, model_config = adapter.load_for_training(
@@ -431,8 +474,17 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         
         metrics.update(total_steps=max_train_steps, max_steps_estimated=config.get("max_steps") is None)
         
+        # ВАЖНО: Для LoRA/QLoRA оптимизатор должен брать только trainable параметры
+        # Это критично для QLoRA, где базовые веса заморожены и огромные
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        if len(trainable_params) == 0:
+            raise ValueError("No trainable parameters found in model. Check LoRA/QLoRA configuration.")
+        
+        logger.info(f"Optimizing {len(trainable_params)} trainable parameters "
+                   f"(total: {sum(p.numel() for p in model.parameters())})")
+        
         optimizer = torch.optim.AdamW(
-            model.parameters(), 
+            trainable_params,  # ✅ Только trainable параметры (критично для LoRA/QLoRA)
             lr=config["learning_rate"], 
             betas=(0.9, 0.95), 
             eps=1e-8,
@@ -485,12 +537,18 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         
         metrics.update(status="training")
         
-        # Начинаем с шага, с которого возобновили (если был resume)
-        current_step = starting_step
+        # ВАЖНО: Синхронизируем global_step с starting_step после resume
+        # Это критично для правильной работы LR scheduler и checkpointing
+        global_step = starting_step
         
         # Функция для валидации (использует eval_batches из замыкания)
         def evaluate(val_loader):
-            """Выполнить валидацию на val_loader."""
+            """
+            Выполнить валидацию на val_loader.
+            
+            ВАЖНО: val_loader зашардирован для всех процессов, поэтому каждый процесс
+            видит свою часть validation данных. reduce() корректно усредняет loss по всем процессам.
+            """
             model.eval()
             losses = []
             with torch.no_grad():
@@ -499,16 +557,26 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                         break
                     out = model(**batch)
                     loss = out.loss.detach()
-                    # на всякий: усреднить по ранкам
+                    # Усредняем loss по всем процессам (каждый процесс видит свою часть val данных)
                     loss = accelerator.reduce(loss, reduction="mean")
-                    losses.append(loss.item())
+                    # Сохраняем только на main process, чтобы избежать дублирования
+                    if accelerator.is_main_process:
+                        losses.append(loss.item())
             model.train()
             if not losses:
                 return None
-            return sum(losses) / len(losses)
+            # Возвращаем средний loss (уже усредненный по процессам)
+            return sum(losses) / len(losses) if losses else None
         
-        global_step = 0
+        # ВАЖНО: global_step уже инициализирован выше как starting_step (для resume)
+        # Если resume не было, starting_step = 0, поэтому global_step = 0
         start_time = time.time()
+        
+        # Debug: проверка дублей между процессами (первые N шагов)
+        # ВАЖНО: Включается только если в конфиге есть debug_check_duplicates=True
+        debug_check_duplicates = config.get("debug_check_duplicates", False)
+        debug_sample_ids = []  # Собираем sample_id для первых шагов
+        debug_max_samples = 20  # Проверяем первые 20 примеров
         
         # Loss tracking:
         # - micro_* для проверки divergence на КАЖДОМ update-step
@@ -529,6 +597,15 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             model.train()
             
             for step, batch in enumerate(train_loader):
+                # Debug: проверка дублей (только первые N примеров)
+                # ВАЖНО: При dispatch_batches=True нужно собирать хэши со всех процессов через gather
+                if debug_check_duplicates and global_step < debug_max_samples:
+                    # Для проверки используем hash от input_ids
+                    if "input_ids" in batch:
+                        # Берем первый пример из батча для проверки
+                        sample_hash = hash(batch["input_ids"][0].cpu().numpy().tobytes())
+                        debug_sample_ids.append((global_step, accelerator.process_index, sample_hash))
+                
                 with accelerator.accumulate(model):
                     outputs = model(**batch)
                     loss = outputs.loss
@@ -583,6 +660,41 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     log_loss_sum += update_loss
                     log_updates += 1
 
+                    # Debug: проверка дублей после первых N шагов
+                    # ВАЖНО: При dispatch_batches=True нужно собирать хэши со всех процессов через gather
+                    if debug_check_duplicates and global_step == debug_max_samples:
+                        # Собираем количество хэшей с каждого процесса
+                        hash_counts = torch.tensor([len(debug_sample_ids)], device=accelerator.device, dtype=torch.long)
+                        all_counts = accelerator.gather(hash_counts)
+                        
+                        if accelerator.is_main_process:
+                            total_hashes = all_counts.sum().item()
+                            logger.info(f"Debug: collected {total_hashes} sample hashes across all processes")
+                            
+                            # Собираем все хэши со всех процессов для проверки дублей
+                            # Создаем тензоры с хэшами (каждый процесс отправляет свои хэши)
+                            if len(debug_sample_ids) > 0:
+                                local_hashes = torch.tensor([h for _, _, h in debug_sample_ids], device=accelerator.device, dtype=torch.long)
+                                # Pad до максимальной длины для gather
+                                max_len = all_counts.max().item()
+                                if len(local_hashes) < max_len:
+                                    padding = torch.full((max_len - len(local_hashes),), -1, device=accelerator.device, dtype=torch.long)
+                                    local_hashes = torch.cat([local_hashes, padding])
+                                
+                                all_hashes = accelerator.gather(local_hashes.unsqueeze(0))
+                                # Убираем padding (-1) и проверяем дубли
+                                all_hashes_flat = all_hashes.flatten()
+                                valid_hashes = all_hashes_flat[all_hashes_flat != -1].cpu().numpy()
+                                
+                                unique_hashes = set(valid_hashes)
+                                if len(valid_hashes) != len(unique_hashes):
+                                    duplicates = len(valid_hashes) - len(unique_hashes)
+                                    logger.warning(f"Debug: Found {duplicates} duplicate samples in first {debug_max_samples} steps across all processes!")
+                                else:
+                                    logger.info(f"Debug: No duplicates found in first {debug_max_samples} steps (all {len(valid_hashes)} samples unique across all processes)")
+                            else:
+                                logger.warning("Debug: No sample hashes collected on main process")
+                    
                     # Логирование
                     if global_step % config.get("log_every", 10) == 0 or global_step == 1:
                         avg_loss = log_loss_sum / max(1, log_updates)
@@ -614,8 +726,10 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                             metrics.log_checkpoint(str(ckpt_path))
                     
                     # Validation
+                    # ВАЖНО: evaluate() вызывается на всех процессах, т.к. val_loader зашардирован
+                    # Каждый процесс видит свою часть val данных, reduce() усредняет результаты
                     if val_loader is not None and eval_every > 0 and (global_step % eval_every == 0):
-                        val_loss = evaluate(val_loader)
+                        val_loss = evaluate(val_loader)  # Вызывается на всех процессах
                         if accelerator.is_main_process and val_loss is not None:
                             metrics.log_eval(global_step, float(val_loss))
                             logger.info(f"Validation at step {global_step}: val_loss={val_loss:.4f}")

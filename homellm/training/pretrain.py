@@ -114,19 +114,53 @@ class StreamingTextDataset(IterableDataset):
             f.close()
 
     def __iter__(self):
-        # ВАЖНО: Шардирование делает accelerate.prepare(), мы только делаем train/val split
-        # детерминированный split по глобальному idx
+        """
+        Итератор с опциональным шардированием.
+        
+        ВАЖНО: По умолчанию шардирование делает accelerate.prepare() через DataLoaderShard/Dispatcher.
+        Явное шардирование в датасете включается только если shard=True.
+        
+        Логика:
+        1. Читаем все строки с глобальным индексом
+        2. Применяем train/val split по глобальному индексу
+        3. Опционально шардируем между процессами и workers (только если shard=True)
+        """
+        from torch.utils.data import get_worker_info
+        
+        # Train/val split параметры
         scale = 10000
         threshold = int(self.val_ratio * scale)
         
-        for idx, text in enumerate(self._read_lines()):
+        # Базовый итератор всех строк с глобальным индексом
+        base_iter = enumerate(self._read_lines())
+        
+        # 1. Применяем train/val split по глобальному индексу
+        def apply_split(idx_text_pair):
+            idx, text = idx_text_pair
             is_val = (threshold > 0) and ((idx % scale) < threshold)
-            
-            # Фильтруем по split (train/val)
             if self.split == "val" and not is_val:
-                continue
+                return None
             if self.split == "train" and is_val:
-                continue
+                return None
+            return idx_text_pair
+        
+        # Фильтруем по split
+        filtered_iter = (pair for pair in base_iter if apply_split(pair) is not None)
+        
+        # 2. Шардирование между DDP процессами (только если shard=True)
+        # ВАЖНО: Если shard=False, шардирование делает accelerate.prepare()
+        if self.shard and self.num_replicas > 1:
+            filtered_iter = ((idx, text) for idx, text in filtered_iter if idx % self.num_replicas == self.rank)
+        
+        # 3. Шардирование между DataLoader workers внутри каждого процесса (только если shard=True)
+        worker_info = get_worker_info()
+        if self.shard and worker_info is not None and worker_info.num_workers > 1:
+            total_workers = self.num_replicas * worker_info.num_workers
+            worker_rank = self.rank * worker_info.num_workers + worker_info.id
+            filtered_iter = ((idx, text) for idx, text in filtered_iter if idx % total_workers == worker_rank)
+        
+        # Итерируем по данным (зашардированным или нет, в зависимости от shard)
+        for idx, text in filtered_iter:
             
             tokens = self.tokenizer(
                 text,
@@ -134,10 +168,16 @@ class StreamingTextDataset(IterableDataset):
                 max_length=self.seq_len,
                 padding="max_length",  # Всегда дополняем до seq_len
                 add_special_tokens=True,
-            )["input_ids"]
+                return_attention_mask=True,  # ✅ Нужно для правильного masking labels
+            )
             
-            # Возвращаем dict для совместимости с collator'ами
-            yield {"input_ids": torch.tensor(tokens, dtype=torch.long)}
+            # Возвращаем dict с attention_mask для правильного masking
+            # ВАЖНО: labels будут маскироваться по attention_mask, а не по pad_token_id,
+            # чтобы не маскировать "настоящий EOS" если pad_token = eos_token
+            yield {
+                "input_ids": torch.tensor(tokens["input_ids"], dtype=torch.long),
+                "attention_mask": torch.tensor(tokens["attention_mask"], dtype=torch.long),
+            }
 
     def get_sample_prompt(self, max_samples: int = 10) -> str | None:
         """Получить пример текста из датасета для отображения в UI.

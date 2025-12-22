@@ -223,14 +223,25 @@ class ModelAdapter:
         # QLoRA: подготовка модели для 4-bit (если модель уже загружена в 4-bit)
         if tuning_method == "qlora" and PEFT_AVAILABLE:
             # Модель должна быть уже загружена в 4-bit через quantization_config в load_for_training()
-            # Проверяем наличие quantization_config в конфиге модели
-            if getattr(model.config, "quantization_config", None) is not None:
+            # Проверяем несколькими способами, что модель действительно в 4-bit
+            is_4bit = (
+                getattr(model, "is_loaded_in_4bit", False) or
+                getattr(model, "is_quantized", False) or
+                getattr(model.config, "quantization_config", None) is not None
+            )
+            
+            if is_4bit:
                 logger.info("Preparing 4-bit model for QLoRA training...")
                 model = prepare_model_for_kbit_training(model)
                 logger.info("Model prepared for 4-bit training")
             else:
-                logger.warning("QLoRA requires 4-bit quantization, but model was not loaded in 4-bit. "
-                             "This may cause issues. Ensure quantization_config is applied during model loading.")
+                logger.warning(
+                    "QLoRA requires 4-bit quantization, but model was not loaded in 4-bit. "
+                    "This may cause issues. Ensure quantization_config is applied during model loading. "
+                    f"Model attributes: is_loaded_in_4bit={getattr(model, 'is_loaded_in_4bit', 'N/A')}, "
+                    f"is_quantized={getattr(model, 'is_quantized', 'N/A')}, "
+                    f"quantization_config={getattr(model.config, 'quantization_config', 'N/A')}"
+                )
         
         # Resize embeddings если vocab изменился (до LoRA)
         if hasattr(model.config, 'vocab_size') and model.config.vocab_size != len(tokenizer):
@@ -391,13 +402,16 @@ class HomeAdapter(ModelAdapter):
         
         base_model_path = Path(base_model_path) if base_model_path else None
         
-        # Проверяем, является ли это checkpoint (для resume)
+        # Проверяем, является ли это accelerate checkpoint (для resume)
+        # ВАЖНО: pytorch_model.bin.index.json может быть и у обычных шардированных HF-сейвов,
+        # поэтому проверяем наличие accelerator_state.json - это точный признак accelerate checkpoint
+        def is_accelerate_checkpoint(p: Path) -> bool:
+            """Проверяет, является ли путь accelerate checkpoint'ом."""
+            return (p / "accelerator_state.json").exists()
+        
         is_checkpoint = False
         if base_model_path:
-            is_checkpoint = (
-                "checkpoint" in base_model_path.name.lower() or
-                (base_model_path / "pytorch_model.bin.index.json").exists()
-            )
+            is_checkpoint = is_accelerate_checkpoint(base_model_path)
         
         if is_checkpoint and stage == "continual_pretrain":
             # Для resume - загружаем конфиг, модель создадим позже
@@ -419,7 +433,12 @@ class HomeAdapter(ModelAdapter):
                     raise ValueError(f"Cannot find config.json in {base_model_path}")
             
             model = HomeForCausalLM(model_config)
-            logger.info(f"Home model initialized for resume from checkpoint")
+            logger.info(f"Home model initialized for resume from accelerate checkpoint")
+            logger.warning(
+                "Model initialized with random weights. "
+                "Weights will be loaded from checkpoint via accelerator.load_state(). "
+                "If resume fails, training will continue with random weights (this is likely incorrect)."
+            )
             return model, model_config
         
         elif base_model_path:
