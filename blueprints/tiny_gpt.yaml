@@ -1,0 +1,39 @@
+model_type: homellm_blueprint
+vocab_size: 50257
+hidden_size: 128
+max_position_embeddings: 512
+auto_project: true
+blocks:
+  - id: embed
+    type: token_embedding
+    params:
+      vocab_size: 50257
+      hidden_size: 128
+  - id: pos
+    type: positional_embedding
+    params:
+      max_position_embeddings: 512
+      hidden_size: 128
+  - id: add_embed
+    type: add
+    params: {}
+  - id: attn1
+    type: attention
+    params:
+      num_heads: 4
+      dropout: 0.0
+  - id: mlp1
+    type: residual_mlp
+    params:
+      intermediate_size: 512
+      activation: silu
+      dropout: 0.0
+  - id: norm
+    type: rmsnorm
+    params:
+      eps: 1.0e-5
+  - id: head
+    type: linear
+    params:
+      out_features: 128
+

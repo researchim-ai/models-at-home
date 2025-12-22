@@ -1132,6 +1132,13 @@ def render_model_config():
              st.sidebar.error(f"Ошибка чтения config.json: {e}")
 
     st.sidebar.subheader("⚙️ Параметры модели")
+
+    blueprint_path = st.sidebar.text_input(
+        "Blueprint (опционально)",
+        value="",
+        placeholder="/path/to/blueprint.yaml",
+        help="Путь к YAML/JSON blueprint. Если указан, модель собирается по схеме."
+    )
     
     if loaded_config:
         # Режим только чтения для SFT/Continual Pretrain с загруженным конфигом
@@ -1280,6 +1287,7 @@ def render_model_config():
         "base_model_path": base_model_path,
         "model_name_input": model_name,
         "model_id": model_id if model_id else None,
+        "model_blueprint": blueprint_path or None,
         "hidden_size": hidden_size,
         "num_layers": num_layers,
         "n_heads": n_heads,

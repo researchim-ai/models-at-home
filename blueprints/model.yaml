@@ -1,0 +1,37 @@
+model_type: homellm_blueprint
+vocab_size: 50257
+hidden_size: 512
+max_position_embeddings: 2048
+auto_project: true
+blocks:
+- id: token_embedding_1
+  type: token_embedding
+  params:
+    vocab_size: 50257
+    hidden_size: 512
+  inputs: []
+- id: positional_embedding_2
+  type: positional_embedding
+  params:
+    max_position_embeddings: 2048
+    hidden_size: 512
+  inputs: []
+- id: add_3
+  type: add
+  params: {}
+  inputs:
+  - token_embedding_1
+  - positional_embedding_2
+- id: attention_4
+  type: attention
+  params:
+    num_heads: 8
+    dropout: 0
+  inputs:
+  - add_3
+- id: rmsnorm_5
+  type: rmsnorm
+  params:
+    eps: 1.0e-05
+  inputs:
+  - attention_4

@@ -11,10 +11,12 @@ services:
     container_name: models-at-home
     ports:
       - "8501:8501"
+      - "8502:8502"
     volumes:
       - ./datasets:/app/datasets
       - ./out:/app/out
       - ./.runs:/app/.runs
+      - ./blueprints:/app/blueprints
     environment:
       - PYTHONUNBUFFERED=1
       - MKL_THREADING_LAYER=GNU

@@ -26,6 +26,8 @@ from transformers import (
 )
 
 from homellm.models.home_model import HomeConfig, HomeForCausalLM
+from homellm.models.blueprint import Blueprint
+from homellm.models.blueprint_model import BlueprintLMConfig, BlueprintForCausalLM
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +360,18 @@ class ModelAdapter:
             save_function=accelerator.save,
         )
         
+        # Если модель построена по blueprint — сохраняем blueprint рядом
+        bp_dict = getattr(unwrapped_model.config, "blueprint", None)
+        if bp_dict:
+            try:
+                blueprint_path = output_dir / "blueprint.json"
+                import json as _json
+
+                blueprint_path.write_text(_json.dumps(bp_dict, indent=2, ensure_ascii=False), encoding="utf-8")
+                logger.info(f"Saved blueprint to {blueprint_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save blueprint: {e}")
+
         # Сохраняем токенизатор
         tokenizer.save_pretrained(str(output_dir))
         
@@ -399,6 +413,23 @@ class HomeAdapter(ModelAdapter):
         if tuning_method == "qlora":
             logger.warning("QLoRA is not supported for Home models. Falling back to LoRA.")
             config["tuning_method"] = "lora"  # Понижаем до LoRA
+
+        # Blueprint режим (сборка с нуля по схеме)
+        if config.get("model_blueprint"):
+            bp_path = Path(config["model_blueprint"])
+            bp = Blueprint.load(bp_path)
+            if bp.vocab_size != len(tokenizer):
+                bp = bp.copy(update={"vocab_size": len(tokenizer)})
+            bp_cfg = BlueprintLMConfig(
+                vocab_size=bp.vocab_size,
+                hidden_size=bp.hidden_size,
+                max_position_embeddings=bp.max_position_embeddings,
+                auto_project=bp.auto_project,
+                blueprint=bp.dict(),
+            )
+            model = BlueprintForCausalLM(bp_cfg)
+            logger.info(f"Loaded blueprint model from {bp_path} (hash={bp.hash()})")
+            return model, bp_cfg
         
         base_model_path = Path(base_model_path) if base_model_path else None
         
@@ -490,7 +521,24 @@ class HomeAdapter(ModelAdapter):
         config: Dict[str, Any],
         trust_remote_code: bool = True,
     ) -> Tuple[PreTrainedModel, Any]:
-        """Инициализирует Home модель с нуля."""
+        """Инициализирует Home модель или blueprint-модель с нуля."""
+        blueprint_path = config.get("model_blueprint")
+        if blueprint_path:
+            bp = Blueprint.load(blueprint_path)
+            # Синхронизируем vocab_size с токенизатором
+            if bp.vocab_size != len(tokenizer):
+                bp = bp.copy(update={"vocab_size": len(tokenizer)})
+            bp_cfg = BlueprintLMConfig(
+                vocab_size=bp.vocab_size,
+                hidden_size=bp.hidden_size,
+                max_position_embeddings=bp.max_position_embeddings,
+                auto_project=bp.auto_project,
+                blueprint=bp.dict(),
+            )
+            model = BlueprintForCausalLM(bp_cfg)
+            logger.info(f"Initialized blueprint model from {blueprint_path} (hash={bp.hash()})")
+            return model, bp_cfg
+
         model_config = HomeConfig(
             vocab_size=len(tokenizer),
             hidden_size=config["hidden_size"],
