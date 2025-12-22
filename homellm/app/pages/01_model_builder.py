@@ -558,10 +558,10 @@ DRAWFLOW_HTML = f"""
 # ==============================================================================
 
 def main():
-    st.set_page_config(page_title="Research Studio", page_icon="🧪", layout="wide")
+    st.set_page_config(page_title="Visual Model Builder", page_icon="🧪", layout="wide")
     
-    st.title("🧪 Research Model Studio")
-    st.caption("Полнофункциональный редактор архитектур.")
+    st.title("🧪 Visual Model Builder")
+    st.caption("Редактор архитектур моделей")
 
     components.html(DRAWFLOW_HTML, height=800, scrolling=False)
 
