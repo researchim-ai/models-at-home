@@ -43,7 +43,7 @@ SIDECAR_PORT = 8502
 # DRAWFLOW TO BLUEPRINT CONVERTER
 # ==============================================================================
 
-def drawflow_to_blueprint(drawflow_data: Dict) -> Dict:
+def drawflow_to_blueprint(drawflow_data: Dict, training_config: Dict = None) -> Dict:
     """Converts Drawflow export format to HomeLLM Blueprint."""
     nodes = drawflow_data["drawflow"]["Home"]["data"]
     
@@ -78,7 +78,7 @@ def drawflow_to_blueprint(drawflow_data: Dict) -> Dict:
         }
         blocks.append(block)
     
-    return {
+    result = {
         "model_type": "homellm_blueprint",
         "vocab_size": 50257, 
         "hidden_size": 512,
@@ -86,6 +86,12 @@ def drawflow_to_blueprint(drawflow_data: Dict) -> Dict:
         "auto_project": True,
         "blocks": blocks
     }
+    
+    # Add training config if provided
+    if training_config:
+        result["training"] = training_config
+    
+    return result
 
 
 # ==============================================================================
@@ -121,22 +127,28 @@ class SaveRequestHandler(BaseHTTPRequestHandler):
                 post_data = self.rfile.read(content_length)
                 
                 payload = json.loads(post_data.decode('utf-8'))
-                fname = payload.get("filename", "model.yaml")
-                if not fname.endswith(".yaml"): fname += ".yaml"
+                fname = payload.get("filename", "model.json")
+                # Use JSON by default
+                if not fname.endswith(".json") and not fname.endswith(".yaml"):
+                    fname += ".json"
                 
                 raw_data = payload.get("data")
+                training_config = payload.get("training", None)
                 
                 # Convert
-                bp_data = drawflow_to_blueprint(raw_data)
+                bp_data = drawflow_to_blueprint(raw_data, training_config)
                 
                 # Validate
                 Blueprint.parse_obj(bp_data)
                 
-                # Save
-                yaml_str = yaml.dump(bp_data, sort_keys=False, allow_unicode=True)
+                # Save as JSON (or YAML if specified)
                 save_path = BLUEPRINTS_DIR / fname
                 with open(save_path, "w", encoding="utf-8") as f:
-                    f.write(yaml_str)
+                    if fname.endswith(".yaml"):
+                        yaml_str = yaml.dump(bp_data, sort_keys=False, allow_unicode=True)
+                        f.write(yaml_str)
+                    else:
+                        json.dump(bp_data, f, indent=2, ensure_ascii=False)
                 
                 # Response
                 self.send_response(200)
@@ -325,6 +337,53 @@ DRAWFLOW_HTML = f"""
     .ctrl-btn.danger {{ background: #ef4444; }}
     
     #status-msg {{ color: #ef4444; font-weight: bold; display: none; margin-right: 10px; }}
+    
+    /* Training Config Panel */
+    #training-panel {{
+      position: absolute;
+      bottom: 10px; left: 10px;
+      background: linear-gradient(135deg, #1e1e1e 0%, #2a1e3a 100%);
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid #6b21a8;
+      z-index: 10;
+      width: 220px;
+      box-shadow: 0 4px 15px rgba(107, 33, 168, 0.3);
+    }}
+    .panel-title {{
+      font-weight: bold;
+      color: #c084fc;
+      margin-bottom: 10px;
+      font-size: 0.95em;
+      border-bottom: 1px solid #6b21a8;
+      padding-bottom: 6px;
+    }}
+    .panel-row {{
+      margin-bottom: 8px;
+      display: flex;
+      flex-direction: column;
+    }}
+    .panel-row label {{
+      font-size: 0.75em;
+      color: #a78bfa;
+      margin-bottom: 2px;
+    }}
+    .panel-row select, .panel-row input {{
+      background: #1e1e1e;
+      border: 1px solid #6b21a8;
+      color: white;
+      padding: 6px 8px;
+      border-radius: 4px;
+      font-size: 0.85em;
+    }}
+    .panel-row select:focus, .panel-row input:focus {{
+      outline: none;
+      border-color: #a855f7;
+      box-shadow: 0 0 5px rgba(168, 85, 247, 0.4);
+    }}
+    .panel-row select option {{
+      background: #1e1e1e;
+    }}
   </style>
 </head>
 <body>
@@ -368,9 +427,51 @@ DRAWFLOW_HTML = f"""
   <span id="status-msg"></span>
   <input type="text" id="host" class="host-input" value="localhost" title="Server Host (e.g. localhost)" />
   <button class="ctrl-btn danger" onclick="editor.clear()">Clear</button>
-  <input type="text" id="filename" class="filename-input" value="model.yaml" />
+  <input type="text" id="filename" class="filename-input" value="model.json" />
   <button class="ctrl-btn" onclick="saveGraph()">💾 Save to Disk</button>
   <button class="ctrl-btn" onclick="copyJSON()" style="background:#555">📋 Copy JSON</button>
+</div>
+
+<div id="training-panel">
+  <div class="panel-title">⚡ Training Config</div>
+  <div class="panel-row">
+    <label>Optimizer:</label>
+    <select id="optimizer">
+      <option value="adamw" selected>AdamW</option>
+      <option value="adam">Adam</option>
+      <option value="sgd">SGD</option>
+      <option value="rmsprop">RMSprop</option>
+      <option value="adagrad">Adagrad</option>
+      <option value="adadelta">Adadelta</option>
+    </select>
+  </div>
+  <div class="panel-row">
+    <label>Learning Rate:</label>
+    <input type="number" id="lr" value="0.001" step="0.0001" />
+  </div>
+  <div class="panel-row">
+    <label>Weight Decay:</label>
+    <input type="number" id="weight_decay" value="0.01" step="0.001" />
+  </div>
+  <div class="panel-row">
+    <label>Loss Function:</label>
+    <select id="loss_fn">
+      <option value="cross_entropy" selected>CrossEntropyLoss</option>
+      <option value="mse">MSELoss</option>
+      <option value="l1">L1Loss</option>
+      <option value="smooth_l1">SmoothL1Loss</option>
+      <option value="huber">HuberLoss</option>
+      <option value="nll">NLLLoss</option>
+      <option value="bce">BCELoss</option>
+      <option value="bce_logits">BCEWithLogitsLoss</option>
+      <option value="kl_div">KLDivLoss</option>
+      <option value="cosine_embedding">CosineEmbeddingLoss</option>
+    </select>
+  </div>
+  <div class="panel-row">
+    <label>Label Smoothing:</label>
+    <input type="number" id="label_smoothing" value="0.0" step="0.01" min="0" max="1" />
+  </div>
 </div>
 
 <div id="drawflow"></div>
@@ -487,10 +588,33 @@ DRAWFLOW_HTML = f"""
   editor.addConnection(3, 4, "output_1", "input_1");
   editor.addConnection(4, 5, "output_1", "input_1");
 
+  function getTrainingConfig() {{
+    const optimizer = document.getElementById('optimizer').value;
+    const lr = parseFloat(document.getElementById('lr').value);
+    const weightDecay = parseFloat(document.getElementById('weight_decay').value);
+    const lossFn = document.getElementById('loss_fn').value;
+    const labelSmoothing = parseFloat(document.getElementById('label_smoothing').value);
+    
+    const config = {{
+      optimizer: optimizer,
+      lr: lr,
+      weight_decay: weightDecay,
+      loss_fn: lossFn
+    }};
+    
+    // Label smoothing (for CrossEntropy)
+    if (lossFn === 'cross_entropy' && labelSmoothing > 0) {{
+      config.label_smoothing = labelSmoothing;
+    }}
+    
+    return config;
+  }}
+
   async function saveGraph() {{
     const data = editor.export();
     const fname = document.getElementById("filename").value;
-    const host = document.getElementById("host").value; // Read from input
+    const host = document.getElementById("host").value;
+    const training = getTrainingConfig();
     const btn = document.querySelector("button[onclick='saveGraph()']");
     const status = document.getElementById("status-msg");
     const originalText = btn.innerText;
@@ -501,8 +625,6 @@ DRAWFLOW_HTML = f"""
 
     try {{
         const port = {SIDECAR_PORT};
-        // Streamlit renders this editor in an iframe that may have protocol=about:
-        // Use parent URL (referrer) to pick http/https reliably.
         let scheme = "http:";
         try {{
             if (document.referrer && document.referrer !== "") {{
@@ -514,16 +636,17 @@ DRAWFLOW_HTML = f"""
         const url = scheme + "//" + host + ":" + port + "/save_blueprint";
         
         console.log("Saving to: " + url);
+        console.log("Training config:", training);
 
         const response = await fetch(url, {{
             method: "POST",
             headers: {{ "Content-Type": "application/json" }},
-            body: JSON.stringify({{ filename: fname, data: data }})
+            body: JSON.stringify({{ filename: fname, data: data, training: training }})
         }});
 
         if (response.ok) {{
             const res = await response.json();
-            alert("✅ Model saved successfully to " + res.path);
+            alert("✅ Model saved successfully to " + res.path + "\\n\\nOptimizer: " + training.optimizer.toUpperCase() + "\\nLoss: " + training.loss_fn);
         }} else {{
             const err = await response.text();
             alert("❌ Save failed: " + err);
@@ -570,7 +693,7 @@ def main():
         with col_input:
             json_str = st.text_area("1. Нажмите 'Copy JSON' в редакторе и вставьте сюда:", height=100)
         with col_action:
-            fname = st.text_input("2. Имя файла", value="my_manual_model.yaml")
+            fname = st.text_input("2. Имя файла", value="my_manual_model.json")
             if st.button("3. Конвертировать и Сохранить"):
                 if not json_str.strip():
                     st.error("Вставьте JSON!")
@@ -578,13 +701,19 @@ def main():
                     try:
                         raw_data = json.loads(json_str)
                         bp_data = drawflow_to_blueprint(raw_data)
-                        yaml_str = yaml.dump(bp_data, sort_keys=False, allow_unicode=True)
                         save_path = BLUEPRINTS_DIR / fname
                         with open(save_path, "w", encoding="utf-8") as f:
-                            f.write(yaml_str)
+                            if fname.endswith(".yaml"):
+                                yaml_str = yaml.dump(bp_data, sort_keys=False, allow_unicode=True)
+                                f.write(yaml_str)
+                            else:
+                                json.dump(bp_data, f, indent=2, ensure_ascii=False)
                         st.success(f"✅ Сохранено: `{save_path}`")
                     except Exception as e:
                         st.error(f"Ошибка: {e}")
+    
+    st.divider()
+    st.caption("🚀 Model Builder поддерживает стандартные блоки PyTorch и пользовательские операции.")
 
 if __name__ == "__main__":
     main()

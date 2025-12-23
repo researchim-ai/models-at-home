@@ -223,12 +223,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
     mixed_precision = config.get("mixed_precision", "no")
     stage = config.get("stage", "pretrain") # pretrain | continual_pretrain | sft
     
-    # ВАЖНО: Явная конфигурация DataLoader для IterableDataset
-    # dispatch_batches=True: rank0 читает датасет, батчи рассылаются по процессам (избегает дублей)
-    # even_batches=False: не дублируем примеры для выравнивания батчей (строгая уникальность)
+    # ВАЖНО: Убираем dispatch_batches=True, так как это вызывает проблемы с NoneType при broadcast
+    # Вместо этого будем использовать явное шардирование внутри StreamingTextDataset (shard=True)
     dataloader_config = DataLoaderConfiguration(
-        dispatch_batches=True,   # Критично для IterableDataset: избегает дублей между процессами
-        even_batches=False,      # Не дублируем примеры для выравнивания (строгая уникальность)
+        dispatch_batches=None,
+        even_batches=False, 
     )
     
     accelerator = Accelerator(
@@ -279,11 +278,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 seq_len=config["seq_len"],
                 sft_columns=config.get("sft_columns"),
                 sft_template=config.get("sft_template"),
-                num_replicas=1,  # Не используется при shard=False, accelerate шардирует сам
-                rank=0,  # Не используется при shard=False, accelerate шардирует сам
+                num_replicas=accelerator.num_processes,  # ✅ Явное шардирование
+                rank=accelerator.process_index,  # ✅ Явное шардирование
                 split="train",
-                val_ratio=holdout_ratio,  # ✅ ВАЖНО: исключаем val-часть из train
-                shard=False,  # ✅ Шардирование делает accelerate.prepare()
+                val_ratio=holdout_ratio,
+                shard=True,  # ✅ Включаем шардирование внутри датасета
             )
             
             # Получаем пример сформированного промпта для отображения (для SFT)
@@ -312,11 +311,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 config["data_path"], 
                 tokenizer, 
                 seq_len=config["seq_len"],
-                num_replicas=1,  # Не используется при shard=False, accelerate шардирует сам
-                rank=0,  # Не используется при shard=False, accelerate шардирует сам
+                num_replicas=accelerator.num_processes,  # ✅ Явное шардирование
+                rank=accelerator.process_index,  # ✅ Явное шардирование
                 split="train",
-                val_ratio=holdout_ratio,  # ✅ ВАЖНО: исключаем val-часть из train
-                shard=False,  # ✅ Шардирование делает accelerate.prepare()
+                val_ratio=holdout_ratio,
+                shard=True,  # ✅ Включаем шардирование внутри датасета
             )
             
             # Получаем пример текста для отображения (для pretrain/continual_pretrain)
@@ -333,6 +332,15 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             # а не по pad_token_id. Это критично, если pad_token = eos_token (EOS не должен маскироваться)
             def causal_lm_collator(batch):
                 """Кастомный collator для pretrain, маскирует labels по attention_mask."""
+                # Фильтруем битые примеры (если dataset вернул None)
+                batch = [x for x in batch if x is not None]
+                if not batch:
+                     # Пустой батч не должен крашить accelerate, вернем пустые тензоры или пустой dict
+                     # Но accelerate может не переварить пустой dict при broadcast, поэтому вернем dummy batch
+                     # чтобы просто пропустить шаг
+                     dummy = torch.zeros((1, 1), dtype=torch.long)
+                     return {"input_ids": dummy, "attention_mask": dummy, "labels": dummy}
+
                 input_ids = torch.stack([x["input_ids"] for x in batch])
                 attention_mask = torch.stack([x["attention_mask"] for x in batch])
                 labels = input_ids.clone()
@@ -355,11 +363,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     seq_len=config["seq_len"],
                     sft_columns=config.get("sft_columns"),
                     sft_template=config.get("sft_template"),
-                    num_replicas=1,  # Не используется при shard=False, accelerate шардирует сам
-                    rank=0,  # Не используется при shard=False, accelerate шардирует сам
+                    num_replicas=accelerator.num_processes,  # ✅ Явное шардирование
+                    rank=accelerator.process_index,  # ✅ Явное шардирование
                     split="val",
-                    val_ratio=holdout_ratio,  # ✅ Используем тот же holdout_ratio
-                    shard=False,  # ✅ Шардирование делает accelerate.prepare()
+                    val_ratio=holdout_ratio,
+                    shard=True,  # ✅ Включаем шардирование внутри датасета
                 )
                 from transformers import default_data_collator
                 val_collate = default_data_collator
@@ -369,15 +377,20 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     config["data_path"],
                     tokenizer,
                     seq_len=config["seq_len"],
-                    num_replicas=1,  # Не используется при shard=False, accelerate шардирует сам
-                    rank=0,  # Не используется при shard=False, accelerate шардирует сам
+                    num_replicas=accelerator.num_processes,  # ✅ Явное шардирование
+                    rank=accelerator.process_index,  # ✅ Явное шардирование
                     split="val",
-                    val_ratio=holdout_ratio,  # ✅ Используем тот же holdout_ratio
-                    shard=False,  # ✅ Шардирование делает accelerate.prepare()
+                    val_ratio=holdout_ratio,
+                    shard=True,  # ✅ Включаем шардирование внутри датасета
                 )
                 # Используем тот же кастомный collator для val, что и для train
                 def causal_lm_collator(batch):
                     """Кастомный collator для pretrain, маскирует labels по attention_mask."""
+                    batch = [x for x in batch if x is not None]
+                    if not batch:
+                        dummy = torch.zeros((1, 1), dtype=torch.long)
+                        return {"input_ids": dummy, "attention_mask": dummy, "labels": dummy}
+
                     input_ids = torch.stack([x["input_ids"] for x in batch])
                     attention_mask = torch.stack([x["attention_mask"] for x in batch])
                     labels = input_ids.clone()

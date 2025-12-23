@@ -17,7 +17,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     libgl1 \
     libgomp1 \
-    graphviz \
  && rm -rf /var/lib/apt/lists/*
 
 # venv для зависимостей (удобно копировать в финальный образ)
@@ -58,7 +57,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
     libgl1 \
     libgomp1 \
-    graphviz \
  && rm -rf /var/lib/apt/lists/*
 
 # Подхватываем venv из builder
@@ -70,7 +68,7 @@ WORKDIR /app
 COPY --from=builder /app /app
 
 # Директории под монтирования (не обязательно, но удобно)
-RUN mkdir -p /app/datasets /app/out /app/.runs /app/blueprints
+RUN mkdir -p /app/datasets /app/out /app/.runs
 
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
@@ -79,5 +77,5 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ENV MKL_THREADING_LAYER=GNU
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 8501 8502
+EXPOSE 8501
 CMD ["./scripts/run_studio.sh"]

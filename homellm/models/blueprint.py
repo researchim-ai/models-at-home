@@ -9,6 +9,21 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, validator
 
 
+class TrainingConfig(BaseModel):
+    """Training hyperparameters embedded in the blueprint."""
+    
+    optimizer: str = Field(default="adamw", description="Optimizer: adamw, adam, sgd, rmsprop, etc.")
+    lr: float = Field(default=1e-3, gt=0, description="Learning rate")
+    weight_decay: float = Field(default=0.01, ge=0, description="Weight decay (L2 regularization)")
+    momentum: Optional[float] = Field(default=0.0, description="Momentum (for SGD)")
+    loss_fn: str = Field(default="cross_entropy", description="Loss function")
+    label_smoothing: float = Field(default=0.0, ge=0, le=1, description="Label smoothing for CrossEntropy")
+    
+    # Extra optimizer params
+    betas: Optional[tuple] = Field(default=None, description="Betas for Adam/AdamW")
+    eps: float = Field(default=1e-8, description="Epsilon for numerical stability")
+
+
 class BlockSpec(BaseModel):
     """Single block in a model blueprint."""
 
@@ -28,6 +43,7 @@ class Blueprint(BaseModel):
     blocks: List[BlockSpec] = Field(..., min_items=1)
     auto_project: bool = Field(default=True, description="Insert projections on hidden size mismatch")
     dtype: Optional[str] = Field(default=None, description="Optional dtype hint (float32/bfloat16/float16)")
+    training: Optional[TrainingConfig] = Field(default=None, description="Training configuration")
 
     @validator("blocks")
     def check_unique_ids(cls, blocks: List[BlockSpec]) -> List[BlockSpec]:
@@ -87,3 +103,60 @@ class BlueprintConfig(BaseModel):
             dtype=bp.dtype,
             blueprint=bp.dict(),
         )
+
+
+def create_optimizer(model, training_config: TrainingConfig):
+    """Create optimizer from TrainingConfig."""
+    import torch
+    
+    params = model.parameters()
+    opt_name = training_config.optimizer.lower()
+    lr = training_config.lr
+    wd = training_config.weight_decay
+    
+    if opt_name == "adamw":
+        betas = training_config.betas or (0.9, 0.999)
+        return torch.optim.AdamW(params, lr=lr, betas=betas, eps=training_config.eps, weight_decay=wd)
+    elif opt_name == "adam":
+        betas = training_config.betas or (0.9, 0.999)
+        return torch.optim.Adam(params, lr=lr, betas=betas, eps=training_config.eps, weight_decay=wd)
+    elif opt_name == "sgd":
+        return torch.optim.SGD(params, lr=lr, momentum=training_config.momentum or 0.0, weight_decay=wd)
+    elif opt_name == "rmsprop":
+        return torch.optim.RMSprop(params, lr=lr, weight_decay=wd, eps=training_config.eps)
+    elif opt_name == "adagrad":
+        return torch.optim.Adagrad(params, lr=lr, weight_decay=wd, eps=training_config.eps)
+    elif opt_name == "adadelta":
+        return torch.optim.Adadelta(params, lr=lr, weight_decay=wd, eps=training_config.eps)
+    else:
+        raise ValueError(f"Unknown optimizer: {opt_name}")
+
+
+def create_loss_fn(training_config: TrainingConfig):
+    """Create loss function from TrainingConfig."""
+    import torch.nn as nn
+    
+    loss_name = training_config.loss_fn.lower()
+    
+    if loss_name == "cross_entropy":
+        return nn.CrossEntropyLoss(label_smoothing=training_config.label_smoothing)
+    elif loss_name == "mse":
+        return nn.MSELoss()
+    elif loss_name == "l1":
+        return nn.L1Loss()
+    elif loss_name == "smooth_l1":
+        return nn.SmoothL1Loss()
+    elif loss_name == "huber":
+        return nn.HuberLoss()
+    elif loss_name == "nll":
+        return nn.NLLLoss()
+    elif loss_name == "bce":
+        return nn.BCELoss()
+    elif loss_name == "bce_logits":
+        return nn.BCEWithLogitsLoss()
+    elif loss_name == "kl_div":
+        return nn.KLDivLoss(reduction="batchmean")
+    elif loss_name == "cosine_embedding":
+        return nn.CosineEmbeddingLoss()
+    else:
+        raise ValueError(f"Unknown loss function: {loss_name}")
