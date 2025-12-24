@@ -43,6 +43,24 @@ class BlueprintForCausalLM(PreTrainedModel, GenerationMixin):
         self._blueprint = Blueprint.parse_obj(config.blueprint)
         self.model, hidden_size = build_model_from_blueprint(self._blueprint)
         self.lm_head = nn.Linear(hidden_size, config.vocab_size, bias=False)
+        
+        # Tie weights if requested (default for causal LM)
+        if config.tie_word_embeddings:
+            # Try to find the token embedding layer in the built model
+            # We look for the first module that is an instance of nn.Embedding
+            embedding_layer = None
+            for module in self.model.modules():
+                if isinstance(module, nn.Embedding) and module.num_embeddings == config.vocab_size:
+                    embedding_layer = module
+                    break
+            
+            if embedding_layer is not None:
+                if self.lm_head.weight.shape == embedding_layer.weight.shape:
+                    self.lm_head.weight = embedding_layer.weight
+                else:
+                    # Dimensions might mismatch if there is a projection or different hidden size
+                    pass
+
         self.post_init()
 
     def forward(
@@ -64,6 +82,17 @@ class BlueprintForCausalLM(PreTrainedModel, GenerationMixin):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
+            
+            # Add auxiliary loss from MoE layers (load balancing)
+            aux_loss = 0.0
+            for module in self.model.modules():
+                if hasattr(module, "aux_loss") and isinstance(module.aux_loss, torch.Tensor):
+                    aux_loss += module.aux_loss
+            
+            # Standard coefficient for load balancing loss is usually 0.01-0.02
+            # We can make it configurable later, but for now 0.01 is a safe research default.
+            if isinstance(aux_loss, torch.Tensor) or aux_loss > 0:
+                loss += 0.01 * aux_loss
 
         return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=None)
 

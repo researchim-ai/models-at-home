@@ -70,7 +70,10 @@ class PositionalEmbedding(nn.Module):
         else:
             seq_len = input_ids.size(1)
         positions = torch.arange(seq_len, device=self.embed.weight.device).unsqueeze(0)
-        return self.embed(positions)
+        out = self.embed(positions)
+        if input_ids is not None:
+            return out.expand(input_ids.shape[0], -1, -1)
+        return out
 
 
 @register_block("positional_embedding", "Learnable positional embeddings")
@@ -408,6 +411,121 @@ class SwiGLU(nn.Module):
 
     def forward(self, x):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
+class MoE(nn.Module):
+    def __init__(self, hidden_size: int, num_experts: int, num_select: int = 2, dropout: float = 0.0, expert_type: str = "mlp"):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_select = num_select
+        self.expert_type = expert_type
+        
+        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        
+        # Build experts based on type
+        experts_list = []
+        for _ in range(num_experts):
+            if expert_type == "swiglu":
+                # SwiGLU standard intermediate is 8/3 hidden, but let's stick to 4x or custom if we want simple
+                # Mixtral uses 14336 for 4096 hidden (~3.5x). Let's use 4x for simplicity unless parameterized.
+                experts_list.append(SwiGLU(hidden_size, hidden_size * 4, dropout=dropout))
+            else:
+                experts_list.append(FeedForward(hidden_size, hidden_size * 4, activation="silu", dropout=dropout))
+        
+        self.experts = nn.ModuleList(experts_list)
+        
+        # For tracking auxiliary loss during forward
+        self.aux_loss = 0.0
+
+    def forward(self, x):
+        # x: (batch, seq, hidden)
+        batch, seq, hidden = x.shape
+        x_flat = x.view(-1, hidden)
+        
+        # Gating
+        logits = self.gate(x_flat) # (batch*seq, num_experts)
+        probs = F.softmax(logits, dim=-1)
+        
+        # --- Load Balancing Loss Calculation ---
+        # We want to minimize the coefficient of variation of the load (fraction of tokens per expert)
+        # And also ensure the gating probabilities are balanced.
+        # Switch Transformer Loss: aux_loss = alpha * N * sum(f_i * P_i)
+        # f_i = fraction of tokens routed to expert i (hard assignment, or soft based on implementation)
+        # P_i = fraction of probability mass assigned to expert i (sum(probs, dim=0) / T)
+        
+        # P_i: Average probability assigned to expert i across the batch
+        # shape: (num_experts,)
+        prob_mass_per_expert = probs.mean(dim=0) 
+        
+        # f_i: Fraction of tokens routed to expert i.
+        # Since we use Top-K routing, a token contributes to K experts.
+        # We can approximate f_i by the sum of probabilities for selected experts, or just use hard counts.
+        # For differentiability, using soft probs is often preferred in some implementations, 
+        # but the standard definition uses the number of tokens routed.
+        # However, to be differentiable w.r.t logits, we need to involve probs.
+        
+        # Simple differentiable approximation often used:
+        # aux_loss = sum(prob_mass_per_expert * prob_mass_per_expert) * num_experts 
+        # (minimizing sum of squares pushes towards uniform distribution)
+        
+        # Let's use the standard "Switch Transformer" style load balancing loss definition:
+        # loss = num_experts * sum(P_i * f_i)
+        # where f_i is strictly the fraction of tokens choosing expert i (non-differentiable part usually handled by straight-through or just ignored for f_i calculation in terms of grads, but P_i carries grads).
+        
+        # We use Top-K selection for routing.
+        topk_probs, topk_indices = torch.topk(probs, self.num_select, dim=-1)
+        
+        # Compute load (fraction of tokens routed to each expert)
+        # We create a mask of selected experts
+        # shape: (batch*seq, num_experts)
+        # We need one-hot encoding of selections
+        # indices: (batch*seq, k)
+        
+        # Flatten indices to (batch*seq * k)
+        flat_indices = topk_indices.view(-1)
+        # One-hot: (batch*seq*k, num_experts) -> sum over batch*seq*k -> (num_experts)
+        # This counts how many times each expert was selected
+        expert_counts = torch.zeros(self.num_experts, device=x.device)
+        expert_counts.scatter_add_(0, flat_indices, torch.ones_like(flat_indices, dtype=torch.float))
+        
+        # Fraction f_i
+        fraction_routed = expert_counts / (batch * seq * self.num_select)
+        
+        # The loss term: num_experts * sum(fraction_routed * prob_mass_per_expert)
+        # This encourages prob_mass (soft) to align with uniform distribution if fraction_routed is uniform, 
+        # and penalizes if they are correlated and peaked.
+        # Ideally we want both to be uniform (1/N).
+        # Minimized when both are uniform.
+        
+        self.aux_loss = self.num_experts * torch.sum(fraction_routed * prob_mass_per_expert)
+        
+        # Normalize weights for routing
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True) 
+        
+        # Expert routing (naive loop implementation for simplicity/compatibility)
+        out = torch.zeros_like(x_flat)
+        
+        for k in range(self.num_select):
+            indices = topk_indices[:, k] # (batch*seq,) expert index for k-th choice
+            scores = topk_probs[:, k, None] # (batch*seq, 1) score
+            
+            for expert_idx in range(self.num_experts):
+                # Mask for current expert
+                mask = (indices == expert_idx)
+                if mask.any():
+                    # Process selected tokens
+                    selected_x = x_flat[mask]
+                    expert_out = self.experts[expert_idx](selected_x)
+                    out[mask] += expert_out * scores[mask]
+                    
+        return out.view(batch, seq, hidden)
+
+@register_block("moe", "Mixture of Experts (Sparse MLP)")
+def build_moe(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
+    num_experts = params.get("num_experts", 8)
+    num_select = params.get("num_select", 2)
+    dropout = params.get("dropout", 0.0)
+    expert_type = params.get("expert_type", "mlp") # "mlp" or "swiglu"
+    return MoE(in_dim, num_experts, num_select, dropout, expert_type), in_dim
 
 @register_block("swiglu", "SwiGLU FeedForward (Llama style)")
 def build_swiglu(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:

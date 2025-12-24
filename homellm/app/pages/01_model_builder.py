@@ -57,10 +57,20 @@ def drawflow_to_blueprint(drawflow_data: Dict, training_config: Dict = None) -> 
         id_map[nid] = clean_id
     
     # Second pass: Data
+    inferred_hidden_size = 512 # Default
+    inferred_vocab_size = 50257
+    
     for nid, node in nodes.items():
         b_type = node["name"]
         params = node["data"].copy()
         params.pop("type", None)
+        
+        # Try to infer global dims from embedding layer
+        if b_type == "token_embedding":
+            if "hidden_size" in params:
+                inferred_hidden_size = int(params["hidden_size"])
+            if "vocab_size" in params:
+                inferred_vocab_size = int(params["vocab_size"])
         
         inputs = []
         input_keys = sorted(node["inputs"].keys())
@@ -80,8 +90,8 @@ def drawflow_to_blueprint(drawflow_data: Dict, training_config: Dict = None) -> 
     
     result = {
         "model_type": "homellm_blueprint",
-        "vocab_size": 50257, 
-        "hidden_size": 512,
+        "vocab_size": inferred_vocab_size, 
+        "hidden_size": inferred_hidden_size,
         "max_position_embeddings": 2048,
         "auto_project": True,
         "blocks": blocks
@@ -163,6 +173,64 @@ class SaveRequestHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+        
+        elif self.path == '/analyze_blueprint':
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                post_data = self.rfile.read(content_length)
+                
+                payload = json.loads(post_data.decode('utf-8'))
+                raw_data = payload.get("data")
+                training_config = payload.get("training", None)
+                
+                # Convert
+                bp_data = drawflow_to_blueprint(raw_data, training_config)
+                
+                # Validation & Build
+                import torch
+                from homellm.models.blueprint_model import BlueprintLMConfig, BlueprintForCausalLM
+                # Blueprint is already imported globally
+                
+                bp = Blueprint.parse_obj(bp_data)
+                
+                config = BlueprintLMConfig(
+                    vocab_size=bp.vocab_size,
+                    hidden_size=bp.hidden_size,
+                    max_position_embeddings=bp.max_position_embeddings,
+                    auto_project=bp.auto_project,
+                    blueprint=bp.dict()
+                )
+                
+                # Build on CPU (safe & reasonably fast for analysis)
+                model = BlueprintForCausalLM(config)
+                
+                total_params = sum(p.numel() for p in model.parameters())
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                size_mb = total_params * 4 / (1024 * 1024) # fp32
+                
+                result = {
+                    "status": "success",
+                    "total_params": total_params,
+                    "trainable_params": trainable_params,
+                    "size_mb": size_mb,
+                    "layers": len(bp.blocks),
+                    "hidden_size": bp.hidden_size,
+                    "vocab_size": bp.vocab_size
+                }
+                
+                self.send_response(200)
+                self._send_cors()
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+                
+            except Exception as e:
+                self.send_response(500)
+                self._send_cors()
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -217,7 +285,17 @@ DRAWFLOW_HTML = f"""
       --border-color: #444;
     }}
     body {{ margin: 0px; padding: 0px; width: 100vw; height: 100vh; overflow: hidden; background: var(--bg-color); font-family: 'Roboto', sans-serif; }}
-    #drawflow {{ width: 100%; height: 100%; background: var(--bg-color); background-size: 25px 25px; background-image: radial-gradient(#444 1px, transparent 1px); }}
+    
+    /* Configured for Left Sidebar Layout */
+    #drawflow {{ 
+        position: absolute;
+        top: 0; left: 240px; 
+        width: calc(100% - 240px); 
+        height: 100%; 
+        background: var(--bg-color); 
+        background-size: 25px 25px; 
+        background-image: radial-gradient(#444 1px, transparent 1px); 
+    }}
     
     .drawflow .drawflow-node {{
       background: var(--node-bg);
@@ -270,6 +348,7 @@ DRAWFLOW_HTML = f"""
     .header-conv {{ background: #b45309; }}
     .header-pool {{ background: #0f766e; }}
     
+    /* MAIN LEFT TOOLBAR */
     #toolbar {{
       position: absolute;
       top: 10px; left: 10px;
@@ -281,13 +360,15 @@ DRAWFLOW_HTML = f"""
       flex-direction: column;
       gap: 5px;
       z-index: 10;
-      max-height: 90vh;
+      max-height: 95vh;
       overflow-y: auto;
-      width: 180px;
+      width: 220px; /* Wider to fit config */
     }}
+    
     .category-title {{
-        font-weight:bold; margin-bottom:2px; margin-top:8px; color:#aaa; font-size:0.75em; text-transform:uppercase;
+        font-weight:bold; margin-bottom:2px; margin-top:12px; color:#c084fc; font-size:0.75em; text-transform:uppercase; border-bottom: 1px solid #444; padding-bottom:2px;
     }}
+    
     .tool-btn {{
       background: #333;
       color: white;
@@ -303,93 +384,128 @@ DRAWFLOW_HTML = f"""
     .tool-btn:hover {{ background: #444; }}
     .tool-btn i {{ width: 18px; text-align: center; margin-right: 6px; }}
     
-    #top-bar {{
-      position: absolute;
-      top: 10px; right: 10px;
-      background: #1e1e1e;
-      padding: 10px;
-      border-radius: 8px;
-      border: 1px solid #444;
-      z-index: 10;
-      display: flex;
-      gap: 10px;
-      align-items: center;
+    /* Config Panel inside Toolbar */
+    .config-section {{
+        margin-top: 5px;
+        background: #2a2a2a;
+        padding: 8px;
+        border-radius: 4px;
+        border: 1px solid #555;
     }}
-    .filename-input {{
-      background: #333; border: 1px solid #555; color: white; padding: 8px; border-radius: 4px;
-      width: 200px;
+    .config-label {{
+        font-size: 0.75em; color: #aaa; margin-bottom: 2px; display:block;
     }}
-    .host-input {{
-      background: #333; border: 1px solid #555; color: #aaa; padding: 8px; border-radius: 4px;
-      width: 120px; font-size: 0.8em;
+    .config-input, .config-select {{
+        background: #111;
+        border: 1px solid #444;
+        color: white;
+        padding: 4px;
+        border-radius: 3px;
+        width: 100%;
+        box-sizing: border-box;
+        font-size: 0.8em;
+        margin-bottom: 6px;
     }}
-    .ctrl-btn {{
-      background: #4ea9ff;
-      color: white;
-      border: none;
-      padding: 8px 16px;
-      border-radius: 4px;
-      cursor: pointer;
-      font-weight: bold;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    .action-btn {{
+        width: 100%; padding: 6px; margin-top: 5px; border-radius: 4px; border:none; cursor:pointer; font-weight:bold; font-size: 0.85em;
     }}
-    .ctrl-btn:hover {{ background: #3b82f6; }}
-    .ctrl-btn.danger {{ background: #ef4444; }}
+    .btn-primary {{ background: #4ea9ff; color: white; }}
+    .btn-secondary {{ background: #555; color: white; }}
+    .btn-danger {{ background: #ef4444; color: white; }}
+    .btn-success {{ background: #22c55e; color: white; }}
+
+    #preset-bar {{
+        margin-bottom: 10px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid #444;
+    }}
     
-    #status-msg {{ color: #ef4444; font-weight: bold; display: none; margin-right: 10px; }}
-    
-    /* Training Config Panel */
-    #training-panel {{
-      position: absolute;
-      bottom: 10px; left: 10px;
-      background: linear-gradient(135deg, #1e1e1e 0%, #2a1e3a 100%);
-      padding: 12px;
-      border-radius: 8px;
-      border: 1px solid #6b21a8;
-      z-index: 10;
-      width: 220px;
-      box-shadow: 0 4px 15px rgba(107, 33, 168, 0.3);
+    /* Modal for Analysis */
+    #modal-overlay {{
+        position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+        background: rgba(0,0,0,0.5); z-index: 999; display: none;
+        align-items: center; justify-content: center;
     }}
-    .panel-title {{
-      font-weight: bold;
-      color: #c084fc;
-      margin-bottom: 10px;
-      font-size: 0.95em;
-      border-bottom: 1px solid #6b21a8;
-      padding-bottom: 6px;
+    #modal-content {{
+        background: #1e1e1e; border: 1px solid #444; border-radius: 8px;
+        padding: 20px; width: 400px; color: white; box-shadow: 0 4px 15px rgba(0,0,0,0.5);
     }}
-    .panel-row {{
-      margin-bottom: 8px;
-      display: flex;
-      flex-direction: column;
-    }}
-    .panel-row label {{
-      font-size: 0.75em;
-      color: #a78bfa;
-      margin-bottom: 2px;
-    }}
-    .panel-row select, .panel-row input {{
-      background: #1e1e1e;
-      border: 1px solid #6b21a8;
-      color: white;
-      padding: 6px 8px;
-      border-radius: 4px;
-      font-size: 0.85em;
-    }}
-    .panel-row select:focus, .panel-row input:focus {{
-      outline: none;
-      border-color: #a855f7;
-      box-shadow: 0 0 5px rgba(168, 85, 247, 0.4);
-    }}
-    .panel-row select option {{
-      background: #1e1e1e;
-    }}
+    #modal-title {{ font-size: 1.2em; font-weight: bold; margin-bottom: 10px; color: #4ea9ff; }}
+    .stat-row {{ display: flex; justify-content: space-between; margin-bottom: 8px; border-bottom: 1px solid #333; padding-bottom: 4px; }}
+    .stat-label {{ color: #aaa; }}
+    .stat-val {{ font-weight: bold; font-family: monospace; }}
+
   </style>
 </head>
 <body>
 
+<div id="modal-overlay" onclick="closeModal()">
+    <div id="modal-content" onclick="event.stopPropagation()">
+        <div id="modal-title">📊 Model Analysis</div>
+        <div id="modal-body">Loading...</div>
+        <button class="action-btn btn-secondary" onclick="closeModal()">Close</button>
+    </div>
+</div>
+
 <div id="toolbar">
-  <div class="category-title" style="margin-top:0">Core</div>
+  
+  <!-- PRESETS SECTION -->
+  <div id="preset-bar">
+    <div class="config-label">PRESETS</div>
+    <select id="preset-select" class="config-select" onchange="loadPreset(this.value)">
+        <option value="" disabled selected>Load Preset...</option>
+        <option value="gpt2_mini">GPT-2 (Mini)</option>
+        <option value="llama_mini">Llama (Mini)</option>
+        <option value="moe_simple">Simple MoE</option>
+    </select>
+    <button class="action-btn btn-danger" onclick="editor.clear()">Clear All</button>
+  </div>
+
+  <!-- PROJECT SETTINGS SECTION -->
+  <div class="category-title" style="margin-top:0">Project Settings</div>
+  <div class="config-section">
+      <label class="config-label">Filename</label>
+      <input type="text" id="filename" class="config-input" value="model.json" />
+      
+      <button class="action-btn btn-primary" onclick="saveGraph()">💾 Save to Disk</button>
+      <button class="action-btn btn-success" onclick="analyzeGraph()">📊 Analyze Model</button>
+      <button class="action-btn btn-secondary" onclick="copyJSON()">📋 Copy JSON</button>
+      <div id="status-msg" style="font-size:0.75em; margin-top:5px; color:#ef4444; display:none;"></div>
+      
+      <label class="config-label" style="margin-top:5px">Server Host</label>
+      <input type="text" id="host" class="config-input" value="localhost" />
+  </div>
+
+  <!-- TRAINING CONFIG SECTION -->
+  <div class="category-title">Training Config</div>
+  <div class="config-section">
+      <label class="config-label">Optimizer</label>
+      <select id="optimizer" class="config-select">
+        <option value="adamw" selected>AdamW</option>
+        <option value="adam">Adam</option>
+        <option value="sgd">SGD</option>
+        <option value="rmsprop">RMSprop</option>
+      </select>
+      
+      <label class="config-label">Learning Rate</label>
+      <input type="number" id="lr" class="config-input" value="0.001" step="0.0001" />
+      
+      <label class="config-label">Weight Decay</label>
+      <input type="number" id="weight_decay" class="config-input" value="0.01" step="0.001" />
+      
+      <label class="config-label">Loss Function</label>
+      <select id="loss_fn" class="config-select">
+        <option value="cross_entropy" selected>CrossEntropyLoss</option>
+        <option value="mse">MSELoss</option>
+        <option value="l1">L1Loss</option>
+      </select>
+      
+      <label class="config-label">Label Smoothing</label>
+      <input type="number" id="label_smoothing" class="config-input" value="0.0" step="0.01" min="0" max="1" />
+  </div>
+
+  <!-- BLOCKS -->
+  <div class="category-title">Core Blocks</div>
   <div class="tool-btn" onclick="addNode('token_embedding')"><i class="fas fa-font"></i> Embedding</div>
   <div class="tool-btn" onclick="addNode('positional_embedding')"><i class="fas fa-map-marker-alt"></i> Pos Embed</div>
   
@@ -400,6 +516,7 @@ DRAWFLOW_HTML = f"""
   <div class="tool-btn" onclick="addNode('swiglu')"><i class="fas fa-atom"></i> SwiGLU (Llama)</div>
   <div class="tool-btn" onclick="addNode('residual_mlp')"><i class="fas fa-recycle"></i> Res MLP</div>
   <div class="tool-btn" onclick="addNode('repeater')"><i class="fas fa-clone"></i> Repeater (Loop)</div>
+  <div class="tool-btn" onclick="addNode('moe')"><i class="fas fa-network-wired"></i> MoE</div>
 
   <div class="category-title">Convolutions</div>
   <div class="tool-btn" onclick="addNode('causal_conv1d')"><i class="fas fa-wave-square"></i> Causal Conv1D</div>
@@ -424,57 +541,6 @@ DRAWFLOW_HTML = f"""
   <div class="category-title">Advanced</div>
   <div class="tool-btn" onclick="addNode('inline_code')"><i class="fas fa-code"></i> Inline Code</div>
   <div class="tool-btn" onclick="addNode('custom_op')"><i class="fas fa-plug"></i> Custom Op</div>
-</div>
-
-<div id="top-bar">
-  <span id="status-msg"></span>
-  <input type="text" id="host" class="host-input" value="localhost" title="Server Host (e.g. localhost)" />
-  <button class="ctrl-btn danger" onclick="editor.clear()">Clear</button>
-  <input type="text" id="filename" class="filename-input" value="model.json" />
-  <button class="ctrl-btn" onclick="saveGraph()">💾 Save to Disk</button>
-  <button class="ctrl-btn" onclick="copyJSON()" style="background:#555">📋 Copy JSON</button>
-</div>
-
-<div id="training-panel">
-  <div class="panel-title">⚡ Training Config</div>
-  <div class="panel-row">
-    <label>Optimizer:</label>
-    <select id="optimizer">
-      <option value="adamw" selected>AdamW</option>
-      <option value="adam">Adam</option>
-      <option value="sgd">SGD</option>
-      <option value="rmsprop">RMSprop</option>
-      <option value="adagrad">Adagrad</option>
-      <option value="adadelta">Adadelta</option>
-    </select>
-  </div>
-  <div class="panel-row">
-    <label>Learning Rate:</label>
-    <input type="number" id="lr" value="0.001" step="0.0001" />
-  </div>
-  <div class="panel-row">
-    <label>Weight Decay:</label>
-    <input type="number" id="weight_decay" value="0.01" step="0.001" />
-  </div>
-  <div class="panel-row">
-    <label>Loss Function:</label>
-    <select id="loss_fn">
-      <option value="cross_entropy" selected>CrossEntropyLoss</option>
-      <option value="mse">MSELoss</option>
-      <option value="l1">L1Loss</option>
-      <option value="smooth_l1">SmoothL1Loss</option>
-      <option value="huber">HuberLoss</option>
-      <option value="nll">NLLLoss</option>
-      <option value="bce">BCELoss</option>
-      <option value="bce_logits">BCEWithLogitsLoss</option>
-      <option value="kl_div">KLDivLoss</option>
-      <option value="cosine_embedding">CosineEmbeddingLoss</option>
-    </select>
-  </div>
-  <div class="panel-row">
-    <label>Label Smoothing:</label>
-    <input type="number" id="label_smoothing" value="0.0" step="0.01" min="0" max="1" />
-  </div>
 </div>
 
 <div id="drawflow"></div>
@@ -506,6 +572,10 @@ DRAWFLOW_HTML = f"""
     data[key] = value;
   }}
 
+  function closeModal() {{
+      document.getElementById('modal-overlay').style.display = 'none';
+  }}
+
   // --- NODE TEMPLATES (same as before) ---
   function getHtml(type) {{
     let inputs = '<div class="input input_1"></div>';
@@ -532,6 +602,9 @@ DRAWFLOW_HTML = f"""
     }} else if (type === 'repeater') {{
       headerClass = 'header-layer'; icon = 'fa-clone';
       content += `Repeats: <input type="number" value="1" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'num_repeats', parseInt(this.value))"><br>Block: <select onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'block_type', this.value)"><option value="residual_mlp">Res MLP</option><option value="attention">Attention</option><option value="causal_self_attention">Flash Attn</option><option value="swiglu">SwiGLU</option></select>`;
+    }} else if (type === 'moe') {{
+      headerClass = 'header-layer'; icon = 'fa-network-wired';
+      content += `Experts: <input type="number" value="8" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'num_experts', parseInt(this.value))"> Select: <input type="number" value="2" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'num_select', parseInt(this.value))"><br>Type: <select onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'expert_type', this.value)"><option value="mlp">MLP</option><option value="swiglu">SwiGLU</option></select><br>Drop: <input type="number" step="0.1" value="0.0" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'dropout', parseFloat(this.value))">`;
     }} else if (type.includes('mlp')) {{
       headerClass = 'header-layer'; icon = 'fa-brain';
       content += `Inter: <input type="number" value="2048" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'intermediate_size', parseInt(this.value))"> Act: <select onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'activation', this.value)"><option value="silu">SiLU</option><option value="gelu">GELU</option><option value="relu">ReLU</option></select>`;
@@ -566,7 +639,7 @@ DRAWFLOW_HTML = f"""
     `;
   }}
 
-  function addNode(type) {{
+  function addNode(type, x, y) {{
     var num_inputs = (type.includes('embedding') ? 0 : 1);
     if (['add', 'multiply'].includes(type)) num_inputs = 2;
     if (type === 'concat') num_inputs = 3;
@@ -577,6 +650,7 @@ DRAWFLOW_HTML = f"""
     if (type === 'attention') {{ data.num_heads = 8; data.dropout = 0.0; }}
     if (type === 'causal_self_attention') {{ data.num_heads = 8; data.dropout = 0.0; data.use_rope = false; data.rope_theta = 10000.0; }}
     if (type === 'swiglu') {{ data.intermediate_size = 2048; data.dropout = 0.0; }}
+    if (type === 'moe') {{ data.num_experts = 8; data.num_select = 2; data.dropout = 0.0; data.expert_type = 'mlp'; }}
     if (type === 'repeater') {{ data.num_repeats = 1; data.block_type = 'residual_mlp'; }}
     if (type.includes('mlp') && type !== 'swiglu' && type !== 'residual_mlp') {{ data.intermediate_size = 2048; data.activation = 'silu'; }}
     if (type === 'residual_mlp') {{ data.intermediate_size = 2048; data.activation = 'silu'; }}
@@ -588,21 +662,27 @@ DRAWFLOW_HTML = f"""
     if (type === 'activation') {{ data.type = 'silu'; }}
     if (type === 'adaptive_avg_pool') {{ data.output_size = 1; }}
     if (type === 'inline_code') {{ data.code = 'x = x'; }}
+    
+    // Default coords if not provided
+    if (x === undefined) x = 100;
+    if (y === undefined) y = 100;
 
-    editor.addNode(type, num_inputs, 1, 100, 100, type, data, getHtml(type));
+    return editor.addNode(type, num_inputs, 1, x, y, type, data, getHtml(type));
   }}
   
   // Default Graph
-  editor.addNode('token_embedding', 0, 1, 50, 100, 'token_embedding', {{type: 'token_embedding', vocab_size: 50257, hidden_size: 512}}, getHtml('token_embedding'));
-  editor.addNode('positional_embedding', 0, 1, 50, 250, 'positional_embedding', {{type: 'positional_embedding', max_position_embeddings: 2048, hidden_size: 512}}, getHtml('positional_embedding'));
-  editor.addNode('add', 2, 1, 350, 150, 'add', {{type: 'add'}}, getHtml('add'));
-  editor.addNode('attention', 1, 1, 600, 150, 'attention', {{type: 'attention', num_heads: 8, dropout: 0.0}}, getHtml('attention'));
-  editor.addNode('rmsnorm', 1, 1, 850, 150, 'rmsnorm', {{type: 'rmsnorm', eps: 1e-5}}, getHtml('rmsnorm'));
-  
-  editor.addConnection(1, 3, "output_1", "input_1");
-  editor.addConnection(2, 3, "output_1", "input_2");
-  editor.addConnection(3, 4, "output_1", "input_1");
-  editor.addConnection(4, 5, "output_1", "input_1");
+  (function initGraph(){{
+      var n1 = editor.addNode('token_embedding', 0, 1, 50, 100, 'token_embedding', {{type: 'token_embedding', vocab_size: 50257, hidden_size: 512}}, getHtml('token_embedding'));
+      var n2 = editor.addNode('positional_embedding', 0, 1, 50, 250, 'positional_embedding', {{type: 'positional_embedding', max_position_embeddings: 2048, hidden_size: 512}}, getHtml('positional_embedding'));
+      var n3 = editor.addNode('add', 2, 1, 350, 150, 'add', {{type: 'add'}}, getHtml('add'));
+      var n4 = editor.addNode('attention', 1, 1, 600, 150, 'attention', {{type: 'attention', num_heads: 8, dropout: 0.0}}, getHtml('attention'));
+      var n5 = editor.addNode('rmsnorm', 1, 1, 850, 150, 'rmsnorm', {{type: 'rmsnorm', eps: 1e-5}}, getHtml('rmsnorm'));
+      
+      editor.addConnection(n1, n3, "output_1", "input_1");
+      editor.addConnection(n2, n3, "output_1", "input_2");
+      editor.addConnection(n3, n4, "output_1", "input_1");
+      editor.addConnection(n4, n5, "output_1", "input_1");
+  }})();
 
   function getTrainingConfig() {{
     const optimizer = document.getElementById('optimizer').value;
@@ -678,13 +758,159 @@ DRAWFLOW_HTML = f"""
         btn.disabled = false;
     }}
   }}
+
+  async function analyzeGraph() {{
+    const data = editor.export();
+    const host = document.getElementById("host").value;
+    const training = getTrainingConfig();
+    const btn = document.querySelector("button[onclick='analyzeGraph()']");
+    const originalText = btn.innerText;
+    
+    btn.innerText = "Analyzing...";
+    btn.disabled = true;
+    
+    // Show modal loading
+    document.getElementById('modal-overlay').style.display = 'flex';
+    document.getElementById('modal-body').innerHTML = '<div style="text-align:center; padding:20px;"><i class="fas fa-circle-notch fa-spin"></i> Building model & calculating stats...</div>';
+
+    try {{
+        const port = {SIDECAR_PORT};
+        let scheme = "http:";
+        try {{
+            if (document.referrer && document.referrer !== "") {{
+                const u = new URL(document.referrer);
+                if (u.protocol === "http:" || u.protocol === "https:") scheme = u.protocol;
+            }}
+        }} catch (e) {{}}
+        if (!(scheme === "http:" || scheme === "https:")) scheme = "http:";
+        const url = scheme + "//" + host + ":" + port + "/analyze_blueprint";
+        
+        const response = await fetch(url, {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{ data: data, training: training }})
+        }});
+
+        if (response.ok) {{
+            const res = await response.json();
+            const html = `
+                <div class="stat-row"><span class="stat-label">Total Params</span><span class="stat-val">${{res.total_params.toLocaleString()}}</span></div>
+                <div class="stat-row"><span class="stat-label">Trainable</span><span class="stat-val">${{res.trainable_params.toLocaleString()}}</span></div>
+                <div class="stat-row"><span class="stat-label">Est. Size (FP32)</span><span class="stat-val">${{res.size_mb.toFixed(2)}} MB</span></div>
+                <hr style="border-color:#444; margin:10px 0;">
+                <div class="stat-row"><span class="stat-label">Layers/Blocks</span><span class="stat-val">${{res.layers}}</span></div>
+                <div class="stat-row"><span class="stat-label">Hidden Dim</span><span class="stat-val">${{res.hidden_size}}</span></div>
+                <div class="stat-row"><span class="stat-label">Vocab Size</span><span class="stat-val">${{res.vocab_size}}</span></div>
+            `;
+            document.getElementById('modal-body').innerHTML = html;
+        }} else {{
+            const err = await response.text();
+            document.getElementById('modal-body').innerHTML = `<div style="color:#ef4444">❌ Analysis failed:<br>${{err}}</div>`;
+        }}
+    }} catch (e) {{
+        document.getElementById('modal-body').innerHTML = `<div style="color:#ef4444">❌ Connection Error:<br>${{e}}</div>`;
+    }} finally {{
+        btn.innerText = originalText;
+        btn.disabled = false;
+    }}
+  }}
+  
+  function loadPreset(presetName) {{
+      editor.clear();
+      
+      if (presetName === 'gpt2_mini') {{
+          // Embedding -> Pos -> Add -> [Attention -> MLP]x4 -> Norm
+          const n1 = addNode('token_embedding', 50, 100);
+          const n2 = addNode('positional_embedding', 50, 250);
+          const n3 = addNode('add', 300, 175);
+          
+          // Block 1
+          const n4 = addNode('attention', 550, 100);
+          const n5 = addNode('residual_mlp', 800, 100);
+          
+          // Block 2
+          const n6 = addNode('attention', 550, 300);
+          const n7 = addNode('residual_mlp', 800, 300);
+          
+          const n8 = addNode('rmsnorm', 1050, 200);
+          
+          // Data
+          updateNodeData(n1, 'hidden_size', 256);
+          updateNodeData(n2, 'hidden_size', 256);
+          updateNodeData(n4, 'num_heads', 4);
+          updateNodeData(n6, 'num_heads', 4);
+          
+          // Connections
+          editor.addConnection(n1, n3, "output_1", "input_1");
+          editor.addConnection(n2, n3, "output_1", "input_2");
+          editor.addConnection(n3, n4, "output_1", "input_1");
+          editor.addConnection(n4, n5, "output_1", "input_1");
+          editor.addConnection(n5, n6, "output_1", "input_1");
+          editor.addConnection(n6, n7, "output_1", "input_1");
+          editor.addConnection(n7, n8, "output_1", "input_1");
+          
+      }} else if (presetName === 'llama_mini') {{
+          const n1 = addNode('token_embedding', 50, 200);
+          
+          // Repeater 1: Flash Attn x 4
+          const n2 = addNode('repeater', 300, 200);
+          updateNodeData(n2, 'num_repeats', 4);
+          updateNodeData(n2, 'block_type', 'causal_self_attention');
+          
+          // Repeater 2: SwiGLU x 4
+          const n3 = addNode('repeater', 550, 200);
+          updateNodeData(n3, 'num_repeats', 4);
+          updateNodeData(n3, 'block_type', 'swiglu');
+          
+          const n4 = addNode('rmsnorm', 800, 200);
+          
+          editor.addConnection(n1, n2, "output_1", "input_1");
+          editor.addConnection(n2, n3, "output_1", "input_1");
+          editor.addConnection(n3, n4, "output_1", "input_1");
+          
+      }} else if (presetName === 'moe_simple') {{
+          const n1 = addNode('token_embedding', 50, 100);
+          const n2 = addNode('positional_embedding', 50, 250);
+          const n3 = addNode('add', 300, 175);
+          
+          const n4 = addNode('moe', 550, 175);
+          const n5 = addNode('moe', 800, 175);
+          
+          const n6 = addNode('rmsnorm', 1050, 175);
+          
+          editor.addConnection(n1, n3, "output_1", "input_1");
+          editor.addConnection(n2, n3, "output_1", "input_2");
+          editor.addConnection(n3, n4, "output_1", "input_1");
+          editor.addConnection(n4, n5, "output_1", "input_1");
+          editor.addConnection(n5, n6, "output_1", "input_1");
+      }}
+  }}
   
   function copyJSON() {{
-    const data = editor.export();
-    const jsonStr = JSON.stringify(data);
-    navigator.clipboard.writeText(jsonStr)
-      .then(() => alert("✅ JSON copied to clipboard! Paste it in the fallback box below."))
-      .catch(() => prompt("Copy this JSON:", jsonStr));
+      const data = editor.export();
+      const fname = document.getElementById("filename").value;
+      const training = getTrainingConfig();
+      
+      const payload = {{
+          filename: fname,
+          data: data,
+          training: training
+      }};
+      
+      const jsonStr = JSON.stringify(payload, null, 2);
+      
+      // Fallback for clipboard API if not available in iframe
+      const el = document.createElement('textarea');
+      el.value = jsonStr;
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand('copy');
+      document.body.removeChild(el);
+      
+      const status = document.getElementById("status-msg");
+      status.innerText = "✅ JSON copied to clipboard!";
+      status.style.display = 'inline';
+      setTimeout(() => {{ status.style.display = 'none'; }}, 3000);
   }}
 </script>
 </body>
@@ -716,7 +942,24 @@ def main():
                 else:
                     try:
                         raw_data = json.loads(json_str)
-                        bp_data = drawflow_to_blueprint(raw_data)
+                        # Expecting format {filename:..., data:..., training:...}
+                        # But Copy JSON produces exactly that.
+                        # However, drawflow_to_blueprint expects 'data' key as raw drawflow export.
+                        # If user pastes raw drawflow, we handle that too.
+                        
+                        # Try to detect if it's the wrapper or raw
+                        if "drawflow" in raw_data and "Home" in raw_data["drawflow"]:
+                             # Raw drawflow
+                             bp_data = drawflow_to_blueprint({"drawflow": raw_data["drawflow"]}) # Wrap it to match structure if needed, or pass directly
+                             # Actually drawflow_to_blueprint expects Dict with "drawflow" key.
+                             # If raw_data is exactly that, pass it.
+                             bp_data = drawflow_to_blueprint(raw_data)
+                        elif "data" in raw_data and "drawflow" in raw_data["data"]:
+                             # Wrapper format
+                             bp_data = drawflow_to_blueprint(raw_data["data"], raw_data.get("training"))
+                        else:
+                             raise ValueError("Unknown JSON format")
+
                         save_path = BLUEPRINTS_DIR / fname
                         with open(save_path, "w", encoding="utf-8") as f:
                             if fname.endswith(".yaml"):

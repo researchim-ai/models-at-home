@@ -67,7 +67,12 @@ class BlueprintGraphModule(nn.Module):
                              # Maybe user provided 1 input, and we need another?
                              # For now strict: Add needs 2 inputs in graph mode
                              raise ValueError(f"Block {block_id} (Add) requires 2 inputs, got {len(args)}")
-                        out = module(args[0], args[1])
+                    
+                    # Explicit sum to ensure broadcasting works as expected
+                    # Just calling module(*args) should work, but let's be safe
+                    # module(a, b) calls forward(a, b) -> sum((a, b))
+                    out = module(*args)
+                    
                 elif module_cls == "InlineCodeOp":
                     # Pass context
                     # If sequential (args has 1 item), use it.
