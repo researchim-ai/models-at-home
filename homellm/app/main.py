@@ -2673,15 +2673,41 @@ def main():
         runs = sorted([p for p in RUNS_DIR.iterdir() if p.is_dir()], reverse=True)
         
         if runs:
-            for run_dir in runs[:10]:  # Last 10 runs
+            # Показываем последние 30 запусков
+            for run_dir in runs[:30]: 
                 run_id = run_dir.name
                 metrics = load_metrics(run_id)
                 
                 if metrics:
                     status = metrics.get("status", "unknown")
-                    status_emoji = {"training": "🟢", "completed": "✅", "error": "❌", "stopped": "⏹️"}.get(status, "⏳")
+                    # Пропускаем пустые запуски (если они старые и ничего не сделали)
+                    is_empty = metrics.get("current_step", 0) == 0 and not metrics.get("checkpoints")
+                    if is_empty and status not in ("training", "running"):
+                         continue
+
+                    status_emoji = {"training": "🟢", "completed": "✅", "error": "❌", "stopped": "⏹️", "resumed": "▶️"}.get(status, "⏳")
                     
-                    with st.expander(f"{status_emoji} {run_id}"):
+                    # Пытаемся получить имя модели из конфига для заголовка
+                    model_name_display = run_id
+                    try:
+                        config_path = run_dir / "config.json"
+                        if config_path.exists():
+                            with open(config_path) as f:
+                                rc = json.load(f)
+                                # Ищем имя модели или output_dir
+                                if "model_name_input" in rc:
+                                    model_name_display = f"{run_id} | {rc['model_name_input']}"
+                                elif "output_dir" in rc:
+                                    out_d = Path(rc["output_dir"])
+                                    # out/home_pretrain/run_id -> home_pretrain
+                                    if out_d.name == run_id:
+                                        model_name_display = f"{run_id} | {out_d.parent.name}"
+                                    else:
+                                        model_name_display = f"{run_id} | {out_d.name}"
+                    except:
+                        pass
+                    
+                    with st.expander(f"{status_emoji} {model_name_display}"):
                         col1, col2, col3, col4 = st.columns(4)
                         with col1:
                             st.metric("Steps", metrics.get("current_step", 0))
@@ -2700,7 +2726,7 @@ def main():
                                 st.caption(f"Step {ckpt['step']}: `{ckpt['path']}`")
                         
                         # Кнопки
-                        btn_col1, btn_col2 = st.columns(2)
+                        btn_col1, btn_col2, btn_col3 = st.columns(3)
                         with btn_col1:
                             if st.button(f"📊 Метрики", key=f"metrics_{run_id}"):
                                 st.session_state.current_run_id = run_id
@@ -2720,6 +2746,57 @@ def main():
                                             st.toast("✅ Модель выбрана! Перейдите на вкладку 💬 Чат", icon="💬")
                                 except:
                                     pass
+                        with btn_col3:
+                            # Кнопка продолжения тренировки (если были чекпоинты)
+                            # Проверяем что чекпоинт РЕАЛЬНО существует на диске
+                            valid_ckpt = None
+                            if checkpoints:
+                                latest_ckpt_path = checkpoints[-1]['path']
+                                # Превращаем в абсолютный путь если он относительный
+                                abs_ckpt_path = Path(latest_ckpt_path)
+                                if not abs_ckpt_path.is_absolute():
+                                    abs_ckpt_path = PROJECT_ROOT / latest_ckpt_path
+                                
+                                if abs_ckpt_path.exists():
+                                    valid_ckpt = str(abs_ckpt_path)
+
+                            if valid_ckpt:
+                                if st.button("▶️ Продолжить", key=f"continue_{run_id}", help="Продолжить обучение с последнего чекпоинта"):
+                                    try:
+                                        # 2. Загружаем конфиг старого запуска
+                                        config_path = run_dir / "config.json"
+                                        with open(config_path) as f:
+                                            old_config = json.load(f)
+                                        
+                                        # 3. Корректируем output_dir чтобы не создавать вложенность
+                                        # Старый output_dir указывал на папку конкретного запуска (run_ID)
+                                        # Мы хотим чтобы новый запуск был на уровне с старым (в родительской папке)
+                                        old_output_dir = Path(old_config.get("output_dir", ""))
+                                        # Если путь абсолютный - берем родителя. Если нет - тоже (надеемся)
+                                        # start_training ожидает путь к корню эксперимента
+                                        old_config["output_dir"] = str(old_output_dir.parent)
+                                        
+                                        # 4. Устанавливаем флаг resume (АБСОЛЮТНЫЙ ПУТЬ)
+                                        old_config["resume_from_checkpoint"] = valid_ckpt
+                                        
+                                        # 5. Запускаем
+                                        with st.spinner(f"Возобновляем обучение с {valid_ckpt}..."):
+                                            new_run_id, process = start_training(old_config)
+                                            st.session_state.current_run_id = new_run_id
+                                            st.session_state.training_process = process
+                                            st.session_state.training_active = True
+                                            
+                                            save_active_run(new_run_id, old_config)
+                                            
+                                            st.success(f"Тренировка возобновлена! Run ID: {new_run_id}")
+                                            time.sleep(1)
+                                            st.rerun()
+                                            
+                                    except Exception as e:
+                                        st.error(f"Не удалось возобновить: {e}")
+                            elif checkpoints:
+                                # Чекпоинты были в метриках, но удалены с диска
+                                st.button("⚠️ Файлы удалены", key=f"gone_{run_id}", disabled=True, help=f"Чекпоинт {checkpoints[-1]['path']} не найден на диске")
                         
                         # Показываем что выбрано
                         if st.session_state.current_run_id == run_id:

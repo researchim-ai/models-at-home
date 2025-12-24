@@ -518,9 +518,18 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 model, optimizer, train_loader, lr_scheduler
             )
         
-        # Resume из checkpoint для continual_pretrain (если указан checkpoint)
+        # Resume из checkpoint (универсально для всех стадий)
         starting_step = 0
-        if resume_from_checkpoint and stage == "continual_pretrain":
+        
+        # Если передан аргумент resume_from_checkpoint через конфиг (от CLI)
+        if config.get("resume_from_checkpoint"):
+            resume_from_checkpoint = config["resume_from_checkpoint"]
+        # Или если это continual_pretrain и мы нашли чекпоинт в base_model_path
+        elif stage == "continual_pretrain" and base_model_path:
+             if is_accelerate_checkpoint(Path(base_model_path)):
+                 resume_from_checkpoint = base_model_path
+
+        if resume_from_checkpoint:
             try:
                 logger.info(f"Resuming training from checkpoint: {resume_from_checkpoint}")
                 accelerator.load_state(resume_from_checkpoint)
@@ -540,10 +549,27 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 
                 logger.info(f"Resumed from step {starting_step}")
                 metrics.update(status="resumed", resumed_from_step=starting_step)
+                
+                # ВАЖНО: Пропускаем уже пройденные батчи
+                if starting_step > 0:
+                    # Для IterableDataset нужно пропустить (starting_step * gradient_accumulation) батчей
+                    batches_to_skip = starting_step * config["gradient_accumulation"]
+                    logger.info(f"Skipping {batches_to_skip} batches to sync dataloader...")
+                    train_loader = accelerator.skip_first_batches(train_loader, num_batches=batches_to_skip)
+                    
             except Exception as e:
                 logger.error(f"Failed to resume from checkpoint {resume_from_checkpoint}: {e}")
-                logger.warning("Continuing without resume (starting from step 0)")
-                metrics.update(status="resume_failed", resume_error=str(e))
+                # Если пользователь ЯВНО просил resume (через аргумент или конфиг) - мы должны падать, а не молча игнорировать
+                # Исключение: auto-resume при continual_pretrain (base_model_path) - тут можно варнинг
+                is_explicit_resume = config.get("resume_from_checkpoint") is not None
+                
+                if is_explicit_resume:
+                    metrics.update(status="error", resume_error=str(e), error=f"Resume failed: {e}")
+                    raise RuntimeError(f"Could not resume from checkpoint {resume_from_checkpoint}: {e}")
+                else:
+                    logger.warning("Continuing without resume (starting from step 0)")
+                    metrics.update(status="resume_failed", resume_error=str(e))
+
         
         output_dir = Path(config["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -820,10 +846,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to JSON config")
     parser.add_argument("--metrics", type=str, required=True, help="Path to metrics JSON")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint directory to resume from")
     args = parser.parse_args()
     
     with open(args.config) as f:
         config = json.load(f)
+    
+    # Merge CLI args into config
+    if args.resume_from_checkpoint:
+        config["resume_from_checkpoint"] = args.resume_from_checkpoint
     
     run_training(config, Path(args.metrics))
 
