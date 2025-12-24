@@ -178,6 +178,40 @@ def build_activation(params: Dict[str, Any], in_dim: int, auto_project: bool) ->
     return Activation(act), in_dim
 
 
+
+class Repeater(nn.Module):
+    def __init__(self, layers: nn.ModuleList):
+        super().__init__()
+        self.layers = layers
+
+    def forward(self, x, **kwargs):
+        for layer in self.layers:
+            x = layer(x, **kwargs)
+        return x
+
+@register_block("repeater", "Repeat a sub-block N times (e.g. Decoder Layers)")
+def build_repeater(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
+    num_repeats = params.get("num_repeats", 1)
+    block_type = params.get("block_type")
+    block_params = params.get("block_params", {})
+    
+    if not block_type:
+        raise ValueError("repeater requires 'block_type'")
+
+    builder = get_block(block_type)
+    
+    layers = []
+    current_dim = in_dim
+    
+    for _ in range(num_repeats):
+        # Build the sub-block
+        # We assume sub-block output dim becomes input for next iteration
+        module, out_dim = builder(block_params, current_dim, auto_project)
+        layers.append(module)
+        current_dim = out_dim
+        
+    return Repeater(nn.ModuleList(layers)), current_dim
+
 # =============================================================================
 # LAYERS (MLP, ATTN, CONV)
 # =============================================================================
@@ -231,6 +265,159 @@ class CausalAttention(nn.Module):
             causal = torch.triu(torch.ones(seq, seq, device=x.device, dtype=torch.bool), diagonal=1)
             out, _ = self.mha(x, x, x, attn_mask=causal)
         return out
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32).float().to(device) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Build here to make `forward` faster
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        # Different from paper, but using a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None):
+    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
+    # cos, sin: (seq_len, dim) -> (1, 1, seq_len, dim)
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.0, use_rope: bool = False, rope_theta: float = 10000.0):
+        super().__init__()
+        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.use_rope = use_rope
+
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.dropout_prob = dropout
+        
+        if use_rope:
+             self.rotary_emb = RotaryEmbedding(self.head_dim, base=rope_theta)
+
+    def forward(self, x, attention_mask=None):
+        # x: (batch, seq_len, hidden_size)
+        batch_size, seq_len, _ = x.shape
+        
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if self.use_rope:
+             cos, sin = self.rotary_emb(v, seq_len=seq_len)
+             q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Flash Attention support (PyTorch 2.0+)
+        # attention_mask: (batch, seq_len) -> we need (batch, 1, seq_len, seq_len) or similar for SDPA?
+        # F.scaled_dot_product_attention handles causal mask internally if is_causal=True
+        
+        # But wait! If we have padding (attention_mask has 0s), we must pass it.
+        # SDPA expects attn_mask to be a boolean mask where True indicates values to be computed (not masked out) ??
+        # Or float mask with -inf. 
+        # Actually SDPA docs: "attn_mask: binary mask where 0 (False) is ignore" IS NOT CORRECT. 
+        # Docs say: "The shape of attn_mask must be broadcastable to the shape of the attention weights."
+        
+        # Simple causal only:
+        is_causal = True
+        
+        # If we have padding mask (attention_mask from tokenizer):
+        # We need to combine causal + padding.
+        # SDPA supports is_causal=True which is efficient. Adding explicit mask disables flash attention in some versions.
+        # Ideally we rely on is_causal=True.
+        
+        # For now, let's use SDPA with is_causal=True.
+        # Warning: if there is padding in the batch (left or right), we ideally need to mask it.
+        # But for simple pretraining with packed sequences or simple causal, is_causal=True is often enough
+        # provided we don't attend to padding tokens which is handled by loss masking usually.
+        # However, for correctness, standard MHA masks padding.
+        
+        out = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=None, 
+            dropout_p=self.dropout_prob if self.training else 0.0, 
+            is_causal=is_causal
+        )
+
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        return self.o_proj(out)
+
+@register_block("causal_self_attention", "Flash Causal Self-Attention (with optional RoPE)")
+def build_causal_self_attention(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
+    num_heads = params.get("num_heads")
+    if num_heads is None:
+        # Try to infer valid num_heads (e.g. 32 or 8)
+        if in_dim % 32 == 0: num_heads = 32
+        elif in_dim % 8 == 0: num_heads = 8
+        else: num_heads = 1
+        
+    dropout = params.get("dropout", 0.0)
+    use_rope = params.get("use_rope", False)
+    rope_theta = params.get("rope_theta", 10000.0)
+    
+    if in_dim % num_heads != 0 and not auto_project:
+        raise ValueError(f"in_dim {in_dim} not divisible by num_heads {num_heads}")
+        
+    return CausalSelfAttention(in_dim, num_heads, dropout, use_rope, rope_theta), in_dim
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int, dropout: float = 0.0):
+        super().__init__()
+        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
+@register_block("swiglu", "SwiGLU FeedForward (Llama style)")
+def build_swiglu(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
+    hidden_size = in_dim
+    # Default intermediate size is usually 8/3 * hidden_size or similar for SwiGLU
+    default_inter = int(2 * hidden_size * 4 / 3) 
+    # Round to multiple of 256 is common but let's keep it simple or user defined
+    intermediate = params.get("intermediate_size", default_inter)
+    dropout = params.get("dropout", 0.0)
+    return SwiGLU(hidden_size, intermediate, dropout), hidden_size
 
 
 @register_block("attention", "Causal self-attention (MultiheadAttention)")

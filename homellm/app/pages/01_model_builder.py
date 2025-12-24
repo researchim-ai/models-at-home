@@ -395,8 +395,11 @@ DRAWFLOW_HTML = f"""
   
   <div class="category-title">Layers</div>
   <div class="tool-btn" onclick="addNode('attention')"><i class="fas fa-eye"></i> Attention</div>
+  <div class="tool-btn" onclick="addNode('causal_self_attention')"><i class="fas fa-bolt"></i> Flash Attn (RoPE)</div>
   <div class="tool-btn" onclick="addNode('mlp')"><i class="fas fa-brain"></i> MLP</div>
+  <div class="tool-btn" onclick="addNode('swiglu')"><i class="fas fa-atom"></i> SwiGLU (Llama)</div>
   <div class="tool-btn" onclick="addNode('residual_mlp')"><i class="fas fa-recycle"></i> Res MLP</div>
+  <div class="tool-btn" onclick="addNode('repeater')"><i class="fas fa-clone"></i> Repeater (Loop)</div>
 
   <div class="category-title">Convolutions</div>
   <div class="tool-btn" onclick="addNode('causal_conv1d')"><i class="fas fa-wave-square"></i> Causal Conv1D</div>
@@ -520,6 +523,15 @@ DRAWFLOW_HTML = f"""
     }} else if (type === 'attention') {{
       headerClass = 'header-layer'; icon = 'fa-eye';
       content += `Heads: <input type="number" value="8" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'num_heads', parseInt(this.value))"> Drop: <input type="number" step="0.1" value="0.0" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'dropout', parseFloat(this.value))">`;
+    }} else if (type === 'causal_self_attention') {{
+      headerClass = 'header-layer'; icon = 'fa-bolt';
+      content += `Heads: <input type="number" value="8" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'num_heads', parseInt(this.value))"><br><label><input type="checkbox" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'use_rope', this.checked)"> Use RoPE</label><br>Theta: <input type="number" value="10000" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'rope_theta', parseFloat(this.value))">`;
+    }} else if (type === 'swiglu') {{
+      headerClass = 'header-layer'; icon = 'fa-atom';
+      content += `Inter: <input type="number" value="2048" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'intermediate_size', parseInt(this.value))"> Drop: <input type="number" step="0.1" value="0.0" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'dropout', parseFloat(this.value))">`;
+    }} else if (type === 'repeater') {{
+      headerClass = 'header-layer'; icon = 'fa-clone';
+      content += `Repeats: <input type="number" value="1" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'num_repeats', parseInt(this.value))"><br>Block: <select onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'block_type', this.value)"><option value="residual_mlp">Res MLP</option><option value="attention">Attention</option><option value="causal_self_attention">Flash Attn</option><option value="swiglu">SwiGLU</option></select>`;
     }} else if (type.includes('mlp')) {{
       headerClass = 'header-layer'; icon = 'fa-brain';
       content += `Inter: <input type="number" value="2048" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'intermediate_size', parseInt(this.value))"> Act: <select onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'activation', this.value)"><option value="silu">SiLU</option><option value="gelu">GELU</option><option value="relu">ReLU</option></select>`;
@@ -563,7 +575,11 @@ DRAWFLOW_HTML = f"""
     if (type === 'token_embedding') {{ data.vocab_size = 50257; data.hidden_size = 512; }}
     if (type === 'positional_embedding') {{ data.max_position_embeddings = 2048; data.hidden_size = 512; }}
     if (type === 'attention') {{ data.num_heads = 8; data.dropout = 0.0; }}
-    if (type.includes('mlp')) {{ data.intermediate_size = 2048; data.activation = 'silu'; }}
+    if (type === 'causal_self_attention') {{ data.num_heads = 8; data.dropout = 0.0; data.use_rope = false; data.rope_theta = 10000.0; }}
+    if (type === 'swiglu') {{ data.intermediate_size = 2048; data.dropout = 0.0; }}
+    if (type === 'repeater') {{ data.num_repeats = 1; data.block_type = 'residual_mlp'; }}
+    if (type.includes('mlp') && type !== 'swiglu' && type !== 'residual_mlp') {{ data.intermediate_size = 2048; data.activation = 'silu'; }}
+    if (type === 'residual_mlp') {{ data.intermediate_size = 2048; data.activation = 'silu'; }}
     if (type === 'causal_conv1d') {{ data.out_channels = 512; data.kernel_size = 3; data.dilation = 1; }}
     if (type === 'rmsnorm') {{ data.eps = 1e-5; }}
     if (type === 'groupnorm') {{ data.num_groups = 32; }}

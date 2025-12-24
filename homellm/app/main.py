@@ -1133,13 +1133,70 @@ def render_model_config():
 
     st.sidebar.subheader("⚙️ Параметры модели")
 
-    blueprint_path = st.sidebar.text_input(
-        "Blueprint (опционально)",
-        value="",
-        placeholder="/path/to/blueprint.yaml",
-        help="Путь к YAML/JSON blueprint. Если указан, модель собирается по схеме."
+    # === ИНТЕГРАЦИЯ С VISUAL MODEL BUILDER ===
+    # ВАЖНО: Visual Model Builder сохраняет проекты в корневую папку `blueprints/` (а не `homellm/blueprints/`)
+    blueprints_dir = PROJECT_ROOT / "blueprints"
+    blueprints_dir.mkdir(exist_ok=True)
+    blueprints = list(blueprints_dir.glob("*.json"))
+        
+    # Пункт Blueprint всегда показываем, даже если пока нет файлов (тогда дадим ввести путь вручную)
+    arch_options = ["HomeModel (GPT-2 style)", "Llama (Custom)", "Mistral (Custom)", "Custom Blueprint (Visual Builder)"]
+    
+    # Выбор архитектуры
+    model_type = st.sidebar.selectbox(
+        "Архитектура модели",
+        options=arch_options,
+        index=0,
+        help="Выберите архитектуру. Custom Blueprint позволяет использовать модели из Visual Builder."
     )
     
+    blueprint_path = ""
+    # Базовые значения для переопределения
+    default_h, default_l, default_n, default_seq = 512, 8, 8, 2048
+
+    if model_type == "Custom Blueprint (Visual Builder)":
+        # Логика для Blueprint проектов
+        if blueprints:
+            bp_names = [b.name for b in blueprints]
+            selected_bp = st.sidebar.selectbox("Проект (Visual Builder)", bp_names)
+            blueprint_path = str(blueprints_dir / selected_bp)
+        else:
+            st.sidebar.warning("Blueprint проектов не найдено в папке `blueprints/`. Сохраните проект в Visual Model Builder или укажите путь вручную.")
+            blueprint_path = st.sidebar.text_input("Путь к blueprint.json", value=str(blueprints_dir / "model.json"))
+        
+        # Загружаем инфо из blueprint
+        try:
+            with open(blueprint_path) as f:
+                bp_data = json.load(f)
+            st.sidebar.info(f"Blocks: {len(bp_data.get('blocks', []))} | Hidden: {bp_data.get('hidden_size')} | Vocab: {bp_data.get('vocab_size')}")
+            
+            # Обновляем дефолты для слайдеров ниже (чтобы они визуально соответствовали)
+            default_h = bp_data.get("hidden_size", 512)
+            default_seq = bp_data.get("max_position_embeddings", 2048)
+            # Сложно посчитать слои из Repeater, но попробуем грубо
+            default_l = len(bp_data.get("blocks", []))
+            
+            # Токенизатор
+            st.sidebar.markdown("**Токенизатор**")
+            tokenizer_mode = st.sidebar.radio("Tokenizer Source", ["Standard (GPT-2)", "HF Repo", "Local Path"], horizontal=True)
+            if tokenizer_mode == "Standard (GPT-2)":
+                tokenizer_path = "gpt2"
+            elif tokenizer_mode == "HF Repo":
+                tokenizer_path = st.sidebar.text_input("HF ID", "meta-llama/Llama-2-7b-hf")
+            else:
+                tokenizer_path = st.sidebar.text_input("Local Path", str(PROJECT_ROOT / "tokenizers/my_tok"))
+                
+        except Exception as e:
+            st.sidebar.error(f"Invalid Blueprint: {e}")
+            tokenizer_path = "gpt2"
+            
+    else:
+        # Старая логика ручного выбора
+        tokenizer_path = None # Будет определен стандартно
+    
+    # Сохраняем путь в переменную для возврата
+    # (blueprint_path уже установлен выше)
+
     if loaded_config:
         # Режим только чтения для SFT/Continual Pretrain с загруженным конфигом
         # Используем значения из конфига (поддержка разных имен ключей)
@@ -1186,7 +1243,13 @@ def render_model_config():
         if preset != "Custom" and preset in presets:
             default_h, default_l, default_n = presets[preset]
         else:
-            default_h, default_l, default_n = 512, 8, 8
+            # Если это blueprint mode, используем значения из blueprint как стартовые для слайдеров
+            # Но не меняем default_h/l/n глобально, чтобы не сломать логику пресетов если переключат обратно
+            if model_type != "Custom Blueprint (Visual Builder)":
+                 default_h, default_l, default_n = 512, 8, 8
+        
+        # Слайдеры (теперь они показывают параметры блюпринта или позволяют менять параметры HomeModel)
+        disabled_sliders = (model_type == "Custom Blueprint (Visual Builder)")
         
         hidden_size = st.sidebar.slider(
             "Hidden Size", 
@@ -1194,7 +1257,8 @@ def render_model_config():
             max_value=2048, 
             value=default_h, 
             step=64,
-            help="Размерность скрытого слоя"
+            help="Размерность скрытого слоя",
+            disabled=disabled_sliders
         )
         
         num_layers = st.sidebar.slider(
@@ -1202,7 +1266,8 @@ def render_model_config():
             min_value=2, 
             max_value=32, 
             value=default_l,
-            help="Количество слоёв трансформера"
+            help="Количество слоёв трансформера",
+            disabled=disabled_sliders
         )
         
         n_heads = st.sidebar.slider(
@@ -1210,18 +1275,24 @@ def render_model_config():
             min_value=2, 
             max_value=32, 
             value=default_n,
-            help="Количество голов внимания"
+            help="Количество голов внимания",
+            disabled=disabled_sliders
         )
+        
+        seq_len_opts = [256, 512, 1024, 2048]
+        if default_seq not in seq_len_opts: seq_len_opts.append(default_seq)
+        seq_len_opts = sorted(seq_len_opts)
         
         seq_len = st.sidebar.selectbox(
             "Seq Length",
-            [256, 512, 1024, 2048],
-            index=1,
-            help="Максимальная длина последовательности"
+            seq_len_opts,
+            index=seq_len_opts.index(default_seq) if default_seq in seq_len_opts else 0,
+            help="Максимальная длина последовательности",
+            disabled=disabled_sliders
         )
     
     # Проверка совместимости hidden_size и n_heads
-    if hidden_size % n_heads != 0:
+    if not disabled_sliders and hidden_size % n_heads != 0:
         st.sidebar.error(f"⚠️ hidden_size ({hidden_size}) должен делиться на n_heads ({n_heads}) без остатка!")
         valid_heads = [str(i) for i in range(1, min(33, hidden_size+1)) if hidden_size % i == 0][:10]
         if valid_heads:
@@ -1282,22 +1353,35 @@ def render_model_config():
         if lora_target_modules_input:
             lora_target_modules = [m.strip() for m in lora_target_modules_input.split(",")]
     
-    return {
+    # Сборка конфига
+    config = {
         "stage": selected_stage,
         "base_model_path": base_model_path,
         "model_name_input": model_name,
         "model_id": model_id if model_id else None,
-        "model_blueprint": blueprint_path or None,
-        "hidden_size": hidden_size,
-        "num_layers": num_layers,
-        "n_heads": n_heads,
-        "seq_len": seq_len,
         "tuning_method": tuning_method,
         "lora_r": lora_r,
         "lora_alpha": lora_alpha,
         "lora_dropout": lora_dropout,
         "lora_target_modules": lora_target_modules,
+        # Сохраняем значения слайдеров (для справки)
+        "hidden_size": hidden_size,
+        "num_layers": num_layers,
+        "n_heads": n_heads,
+        "seq_len": seq_len,
     }
+
+    if model_type == "Custom Blueprint (Visual Builder)":
+        config["model_type"] = "blueprint"
+        config["blueprint_path"] = blueprint_path
+        if tokenizer_path:
+             config["tokenizer_path"] = tokenizer_path
+    else:
+        config["model_type"] = "home"
+        if "Llama" in model_type: config["arch_preset"] = "llama"
+        if "Mistral" in model_type: config["arch_preset"] = "mistral"
+        
+    return config
 
 
 def render_training_config():

@@ -387,9 +387,17 @@ class HomeAdapter(ModelAdapter):
         trust_remote_code: bool = True,
     ) -> PreTrainedTokenizer:
         """Загружает токенизатор для Home модели."""
+        source_str = str(source)
         source = Path(source) if isinstance(source, str) else source
         
-        # Пробуем загрузить из модели, иначе fallback на gpt2
+        # Если передан стандартный идентификатор HF или путь
+        # 1. Пробуем HF from_pretrained (работает и для gpt2, и для путей)
+        try:
+            return AutoTokenizer.from_pretrained(source_str, trust_remote_code=trust_remote_code)
+        except Exception:
+            pass
+
+        # 2. Пробуем загрузить из папки модели (наш формат)
         if source.exists() and (source / "tokenizer.json").exists():
             try:
                 return AutoTokenizer.from_pretrained(str(source), trust_remote_code=trust_remote_code)
@@ -397,6 +405,7 @@ class HomeAdapter(ModelAdapter):
                 logger.warning(f"Failed to load tokenizer from {source}: {e}")
         
         # Fallback
+        logger.warning(f"Could not load tokenizer from {source_str}, falling back to gpt2")
         return AutoTokenizer.from_pretrained("gpt2", trust_remote_code=trust_remote_code)
     
     def load_for_training(
@@ -415,11 +424,19 @@ class HomeAdapter(ModelAdapter):
             config["tuning_method"] = "lora"  # Понижаем до LoRA
 
         # Blueprint режим (сборка с нуля по схеме)
-        if config.get("model_blueprint"):
-            bp_path = Path(config["model_blueprint"])
+        if config.get("model_blueprint") or config.get("blueprint_path"):
+            bp_path = Path(config.get("blueprint_path") or config.get("model_blueprint"))
+            if not bp_path.exists():
+                raise ValueError(f"Blueprint file not found: {bp_path}")
+                
             bp = Blueprint.load(bp_path)
+            
+            # Синхронизация vocab_size
             if bp.vocab_size != len(tokenizer):
+                logger.info(f"Blueprint vocab_size ({bp.vocab_size}) != tokenizer len ({len(tokenizer)}). Updating blueprint.")
                 bp = bp.copy(update={"vocab_size": len(tokenizer)})
+            
+            # Создаем конфиг
             bp_cfg = BlueprintLMConfig(
                 vocab_size=bp.vocab_size,
                 hidden_size=bp.hidden_size,
@@ -427,8 +444,12 @@ class HomeAdapter(ModelAdapter):
                 auto_project=bp.auto_project,
                 blueprint=bp.dict(),
             )
+            
+            # Инициализация модели
             model = BlueprintForCausalLM(bp_cfg)
             logger.info(f"Loaded blueprint model from {bp_path} (hash={bp.hash()})")
+            logger.info(f"Model structure: {model}")
+            
             return model, bp_cfg
         
         base_model_path = Path(base_model_path) if base_model_path else None
