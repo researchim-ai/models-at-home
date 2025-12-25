@@ -19,7 +19,7 @@ echo "=============================================="
 echo "  Открой в браузере: http://localhost:$PORT"
 echo "=============================================="
 
-streamlit run homellm/app/main.py \
+streamlit run homellm/app/LLM.py \
     --server.port "$PORT" \
     --server.headless true \
     --browser.gatherUsageStats false \
