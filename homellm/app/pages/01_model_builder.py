@@ -204,6 +204,39 @@ class SaveRequestHandler(BaseHTTPRequestHandler):
                 # Build on CPU (safe & reasonably fast for analysis)
                 model = BlueprintForCausalLM(config)
                 
+                # --- Shape Analysis (Dry Run) ---
+                node_shapes = {}
+                error_msg = None
+                
+                try:
+                    def get_shape_hook(name):
+                        def hook(module, inp, out):
+                            if isinstance(out, torch.Tensor):
+                                shape_str = str(list(out.shape))
+                            elif isinstance(out, tuple) and len(out) > 0 and isinstance(out[0], torch.Tensor):
+                                shape_str = str(list(out[0].shape))
+                            else:
+                                shape_str = "N/A"
+                            node_shapes[name] = shape_str
+                        return hook
+
+                    # Register hooks on graph blocks
+                    # model.model is the BlueprintGraphModule
+                    for name, module in model.model.named_children():
+                        module.register_forward_hook(get_shape_hook(name))
+                    
+                    # Dummy forward pass
+                    # Use small seq_len to be fast
+                    seq_len = min(64, bp.max_position_embeddings)
+                    dummy_input = torch.randint(0, bp.vocab_size, (1, seq_len))
+                    
+                    with torch.no_grad():
+                        model(dummy_input)
+                        
+                except Exception as e:
+                    error_msg = str(e)
+                    node_shapes["error"] = error_msg
+                
                 total_params = sum(p.numel() for p in model.parameters())
                 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
                 size_mb = total_params * 4 / (1024 * 1024) # fp32
@@ -215,7 +248,8 @@ class SaveRequestHandler(BaseHTTPRequestHandler):
                     "size_mb": size_mb,
                     "layers": len(bp.blocks),
                     "hidden_size": bp.hidden_size,
-                    "vocab_size": bp.vocab_size
+                    "vocab_size": bp.vocab_size,
+                    "node_shapes": node_shapes
                 }
                 
                 self.send_response(200)
@@ -469,6 +503,9 @@ DRAWFLOW_HTML = f"""
       
       <button class="action-btn btn-primary" onclick="saveGraph()">💾 Save to Disk</button>
       <button class="action-btn btn-success" onclick="analyzeGraph()">📊 Analyze Model</button>
+      <label style="font-size:0.8em; display:block; margin-top:8px; cursor:pointer; color:#ccc;">
+          <input type="checkbox" id="viz-shapes" checked> Visualize Shapes on Graph
+      </label>
       <button class="action-btn btn-secondary" onclick="copyJSON()">📋 Copy JSON</button>
       <div id="status-msg" style="font-size:0.75em; margin-top:5px; color:#ef4444; display:none;"></div>
       
@@ -514,6 +551,7 @@ DRAWFLOW_HTML = f"""
   <div class="tool-btn" onclick="addNode('causal_self_attention')"><i class="fas fa-bolt"></i> Flash Attn (RoPE)</div>
   <div class="tool-btn" onclick="addNode('mlp')"><i class="fas fa-brain"></i> MLP</div>
   <div class="tool-btn" onclick="addNode('swiglu')"><i class="fas fa-atom"></i> SwiGLU (Llama)</div>
+  <div class="tool-btn" onclick="addNode('llama_block')"><i class="fas fa-cubes"></i> Llama Block</div>
   <div class="tool-btn" onclick="addNode('residual_mlp')"><i class="fas fa-recycle"></i> Res MLP</div>
   <div class="tool-btn" onclick="addNode('repeater')"><i class="fas fa-clone"></i> Repeater (Loop)</div>
   <div class="tool-btn" onclick="addNode('moe')"><i class="fas fa-network-wired"></i> MoE</div>
@@ -599,9 +637,12 @@ DRAWFLOW_HTML = f"""
     }} else if (type === 'swiglu') {{
       headerClass = 'header-layer'; icon = 'fa-atom';
       content += `Inter: <input type="number" value="2048" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'intermediate_size', parseInt(this.value))"> Drop: <input type="number" step="0.1" value="0.0" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'dropout', parseFloat(this.value))">`;
+    }} else if (type === 'llama_block') {{
+      headerClass = 'header-layer'; icon = 'fa-cubes';
+      content += `Heads: <input type="number" value="8" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'num_heads', parseInt(this.value))"><br>Inter: <input type="number" value="2048" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'intermediate_size', parseInt(this.value))">`;
     }} else if (type === 'repeater') {{
       headerClass = 'header-layer'; icon = 'fa-clone';
-      content += `Repeats: <input type="number" value="1" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'num_repeats', parseInt(this.value))"><br>Block: <select onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'block_type', this.value)"><option value="residual_mlp">Res MLP</option><option value="attention">Attention</option><option value="causal_self_attention">Flash Attn</option><option value="swiglu">SwiGLU</option></select>`;
+      content += `Repeats: <input type="number" value="1" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'num_repeats', parseInt(this.value))"><br>Block: <select onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'block_type', this.value)"><option value="residual_mlp">Res MLP</option><option value="attention">Attention</option><option value="causal_self_attention">Flash Attn</option><option value="swiglu">SwiGLU</option><option value="llama_block">Llama Block</option></select>`;
     }} else if (type === 'moe') {{
       headerClass = 'header-layer'; icon = 'fa-network-wired';
       content += `Experts: <input type="number" value="8" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'num_experts', parseInt(this.value))"> Select: <input type="number" value="2" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'num_select', parseInt(this.value))"><br>Type: <select onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'expert_type', this.value)"><option value="mlp">MLP</option><option value="swiglu">SwiGLU</option></select><br>Drop: <input type="number" step="0.1" value="0.0" onchange="updateNodeData(this.parentElement.parentElement.id.slice(5), 'dropout', parseFloat(this.value))">`;
@@ -650,6 +691,7 @@ DRAWFLOW_HTML = f"""
     if (type === 'attention') {{ data.num_heads = 8; data.dropout = 0.0; }}
     if (type === 'causal_self_attention') {{ data.num_heads = 8; data.dropout = 0.0; data.use_rope = false; data.rope_theta = 10000.0; }}
     if (type === 'swiglu') {{ data.intermediate_size = 2048; data.dropout = 0.0; }}
+    if (type === 'llama_block') {{ data.num_heads = 8; data.intermediate_size = 2048; data.dropout = 0.0; }}
     if (type === 'moe') {{ data.num_experts = 8; data.num_select = 2; data.dropout = 0.0; data.expert_type = 'mlp'; }}
     if (type === 'repeater') {{ data.num_repeats = 1; data.block_type = 'residual_mlp'; }}
     if (type.includes('mlp') && type !== 'swiglu' && type !== 'residual_mlp') {{ data.intermediate_size = 2048; data.activation = 'silu'; }}
@@ -803,6 +845,11 @@ DRAWFLOW_HTML = f"""
                 <div class="stat-row"><span class="stat-label">Vocab Size</span><span class="stat-val">${{res.vocab_size}}</span></div>
             `;
             document.getElementById('modal-body').innerHTML = html;
+            
+            if (res.node_shapes) {{
+                displayShapes(res.node_shapes);
+            }}
+
         }} else {{
             const err = await response.text();
             document.getElementById('modal-body').innerHTML = `<div style="color:#ef4444">❌ Analysis failed:<br>${{err}}</div>`;
@@ -813,6 +860,42 @@ DRAWFLOW_HTML = f"""
         btn.innerText = originalText;
         btn.disabled = false;
     }}
+  }}
+  
+  function displayShapes(shapeMap) {{
+      document.querySelectorAll('.shape-badge').forEach(b => b.remove());
+
+      const viz = document.getElementById('viz-shapes');
+      if (!viz || !viz.checked || !shapeMap) return;
+
+      Object.keys(shapeMap).forEach(key => {{
+          if (key === 'error') return;
+          const parts = key.split('_');
+          const nid = parts[parts.length - 1];
+          
+          const nodeEl = document.getElementById('node-' + nid);
+          if (nodeEl) {{
+               const badge = document.createElement('div');
+               badge.className = 'shape-badge';
+               badge.innerText = shapeMap[key];
+               badge.style.position = 'absolute';
+               badge.style.top = '-22px';
+               badge.style.right = '0px';
+               badge.style.background = '#3b82f6';
+               badge.style.color = '#fff';
+               badge.style.padding = '2px 6px';
+               badge.style.borderRadius = '4px';
+               badge.style.fontSize = '11px';
+               badge.style.fontFamily = 'monospace';
+               badge.style.pointerEvents = 'none';
+               badge.style.whiteSpace = 'nowrap';
+               badge.style.zIndex = '100';
+               badge.style.border = '1px solid #60a5fa';
+               badge.style.boxShadow = '0 2px 4px rgba(0,0,0,0.5)';
+               
+               nodeEl.appendChild(badge);
+          }}
+      }});
   }}
   
   function loadPreset(presetName) {{
@@ -852,21 +935,15 @@ DRAWFLOW_HTML = f"""
       }} else if (presetName === 'llama_mini') {{
           const n1 = addNode('token_embedding', 50, 200);
           
-          // Repeater 1: Flash Attn x 4
-          const n2 = addNode('repeater', 300, 200);
-          updateNodeData(n2, 'num_repeats', 4);
-          updateNodeData(n2, 'block_type', 'causal_self_attention');
+          // Repeater: Llama Block x 8
+          const n2 = addNode('repeater', 400, 200);
+          updateNodeData(n2, 'num_repeats', 8);
+          updateNodeData(n2, 'block_type', 'llama_block');
           
-          // Repeater 2: SwiGLU x 4
-          const n3 = addNode('repeater', 550, 200);
-          updateNodeData(n3, 'num_repeats', 4);
-          updateNodeData(n3, 'block_type', 'swiglu');
-          
-          const n4 = addNode('rmsnorm', 800, 200);
+          const n3 = addNode('rmsnorm', 700, 200);
           
           editor.addConnection(n1, n2, "output_1", "input_1");
           editor.addConnection(n2, n3, "output_1", "input_1");
-          editor.addConnection(n3, n4, "output_1", "input_1");
           
       }} else if (presetName === 'moe_simple') {{
           const n1 = addNode('token_embedding', 50, 100);
@@ -928,49 +1005,8 @@ def main():
     st.title("🧪 Visual Model Builder")
     st.caption("Редактор архитектур моделей")
 
-    components.html(DRAWFLOW_HTML, height=800, scrolling=False)
+    components.html(DRAWFLOW_HTML, height=1100, scrolling=False)
 
-    with st.expander("🛠️ Ручное сохранение (если кнопка Save не работает)"):
-        col_input, col_action = st.columns([2, 1])
-        with col_input:
-            json_str = st.text_area("1. Нажмите 'Copy JSON' в редакторе и вставьте сюда:", height=100)
-        with col_action:
-            fname = st.text_input("2. Имя файла", value="my_manual_model.json")
-            if st.button("3. Конвертировать и Сохранить"):
-                if not json_str.strip():
-                    st.error("Вставьте JSON!")
-                else:
-                    try:
-                        raw_data = json.loads(json_str)
-                        # Expecting format {filename:..., data:..., training:...}
-                        # But Copy JSON produces exactly that.
-                        # However, drawflow_to_blueprint expects 'data' key as raw drawflow export.
-                        # If user pastes raw drawflow, we handle that too.
-                        
-                        # Try to detect if it's the wrapper or raw
-                        if "drawflow" in raw_data and "Home" in raw_data["drawflow"]:
-                             # Raw drawflow
-                             bp_data = drawflow_to_blueprint({"drawflow": raw_data["drawflow"]}) # Wrap it to match structure if needed, or pass directly
-                             # Actually drawflow_to_blueprint expects Dict with "drawflow" key.
-                             # If raw_data is exactly that, pass it.
-                             bp_data = drawflow_to_blueprint(raw_data)
-                        elif "data" in raw_data and "drawflow" in raw_data["data"]:
-                             # Wrapper format
-                             bp_data = drawflow_to_blueprint(raw_data["data"], raw_data.get("training"))
-                        else:
-                             raise ValueError("Unknown JSON format")
-
-                        save_path = BLUEPRINTS_DIR / fname
-                        with open(save_path, "w", encoding="utf-8") as f:
-                            if fname.endswith(".yaml"):
-                                yaml_str = yaml.dump(bp_data, sort_keys=False, allow_unicode=True)
-                                f.write(yaml_str)
-                            else:
-                                json.dump(bp_data, f, indent=2, ensure_ascii=False)
-                        st.success(f"✅ Сохранено: `{save_path}`")
-                    except Exception as e:
-                        st.error(f"Ошибка: {e}")
-    
     st.divider()
     st.caption("🚀 Model Builder поддерживает стандартные блоки PyTorch и пользовательские операции.")
 

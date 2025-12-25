@@ -538,6 +538,40 @@ def build_swiglu(params: Dict[str, Any], in_dim: int, auto_project: bool) -> Bui
     return SwiGLU(hidden_size, intermediate, dropout), hidden_size
 
 
+class LlamaBlock(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, intermediate_size: int, dropout: float = 0.0, rope_theta: float = 10000.0, eps: float = 1e-5):
+        super().__init__()
+        self.norm1 = RMSNorm(hidden_size, eps=eps)
+        self.attn = CausalSelfAttention(hidden_size, num_heads, dropout=dropout, use_rope=True, rope_theta=rope_theta)
+        self.norm2 = RMSNorm(hidden_size, eps=eps)
+        self.mlp = SwiGLU(hidden_size, intermediate_size, dropout=dropout)
+
+    def forward(self, x, attention_mask=None):
+        # Pre-Norm Residual Attention
+        h = self.norm1(x)
+        h = self.attn(h, attention_mask=attention_mask)
+        x = x + h
+        
+        # Pre-Norm Residual MLP
+        h = self.norm2(x)
+        h = self.mlp(h)
+        x = x + h
+        return x
+
+@register_block("llama_block", "Single Llama Transformer Block (Attn + MLP + Norms)")
+def build_llama_block(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
+    num_heads = params.get("num_heads", 8)
+    # Default intermediate for SwiGLU
+    default_inter = int(2 * in_dim * 4 / 3)
+    intermediate_size = params.get("intermediate_size", default_inter)
+    dropout = params.get("dropout", 0.0)
+    rope_theta = params.get("rope_theta", 10000.0)
+    eps = params.get("eps", 1e-5)
+    
+    return LlamaBlock(in_dim, num_heads, intermediate_size, dropout, rope_theta, eps), in_dim
+
+
+
 @register_block("attention", "Causal self-attention (MultiheadAttention)")
 def build_attention(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
     num_heads = params.get("num_heads")
