@@ -30,3 +30,8 @@ graphviz>=0.20.1
 # Логирование и мониторинг
 wandb>=0.17.0
 tensorboard>=2.16.0
+
+# RL
+gymnasium[classic_control]>=0.29.0
+imageio>=2.34.0
+imageio-ffmpeg>=0.5.1
