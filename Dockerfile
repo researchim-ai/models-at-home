@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
     python3-pip \
     python3.10-venv \
+    python3-distutils \
     build-essential \
     ninja-build \
     libgl1 \
@@ -48,13 +49,14 @@ RUN python -m pip install --no-cache-dir -e .
 ############################
 # 2) Runtime stage
 ############################
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04 AS runtime
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04 AS runtime
 
 LABEL com.modelsathome.image="models-at-home-studio"
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
+    python3-distutils \
     libgl1 \
     libgomp1 \
  && rm -rf /var/lib/apt/lists/*

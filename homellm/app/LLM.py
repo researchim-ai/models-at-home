@@ -197,12 +197,6 @@ def restore_session_state():
                     # Если статус завершённый - точно не жив
                     if status in ("completed", "error", "stopped"):
                         process_alive = False
-                    elif metrics_age_minutes > 5:
-                        # Метрики не обновлялись > 5 минут - вероятно процесс умер
-                        process_alive = False
-                        logger.warning(f"Metrics not updated for {metrics_age_minutes:.1f} minutes, assuming process dead")
-                        # Очищаем active_run если процесс умер тихо
-                        clear_active_run()
                     else:
                         # Проверяем процесс через PID
                         if pid_path.exists():
@@ -217,6 +211,31 @@ def restore_session_state():
                                 # PermissionError может означать, что процесс существует, но у нас нет прав
                                 # Но если метрики свежие (< 5 минут) - считаем живым
                                 process_alive = metrics_age_minutes < 5
+                    
+                    # Если метрики не обновлялись давно — НЕ считаем процесс мёртвым автоматически.
+                    # Сначала пытаемся проверить PID; PermissionError трактуем как "жив".
+                    if status not in ("completed", "error", "stopped") and metrics_age_minutes > 5:
+                        pid_alive = False
+                        if pid_path.exists():
+                            try:
+                                with open(pid_path) as f:
+                                    pid = int(f.read().strip())
+                                os.kill(pid, 0)
+                                pid_alive = True
+                            except PermissionError:
+                                pid_alive = True
+                            except (ProcessLookupError, ValueError, FileNotFoundError):
+                                pid_alive = False
+                        if pid_alive:
+                            process_alive = True
+                            logger.warning(
+                                f"Metrics not updated for {metrics_age_minutes:.1f} minutes, but PID looks alive. "
+                                f"Treating process as running (metrics may be stalled)."
+                            )
+                        else:
+                            process_alive = False
+                            logger.warning(f"Metrics not updated for {metrics_age_minutes:.1f} minutes and PID not alive, assuming process dead")
+                            clear_active_run()
                 except Exception as e:
                     logger.warning(f"Failed to check metrics: {e}")
                     # Fallback на проверку PID
@@ -1279,7 +1298,7 @@ def render_model_config():
             disabled=disabled_sliders
         )
         
-        seq_len_opts = [256, 512, 1024, 2048]
+        seq_len_opts = [512, 1024, 2048, 4096, 6144, 8192]
         if default_seq not in seq_len_opts: seq_len_opts.append(default_seq)
         seq_len_opts = sorted(seq_len_opts)
         
@@ -1412,6 +1431,15 @@ def render_training_config():
         value=5e-4,
         format_func=lambda x: f"{x:.0e}"
     )
+
+    min_lr_ratio = st.sidebar.slider(
+        "Min LR Ratio (Cosine floor)",
+        min_value=0.0,
+        max_value=0.2,
+        value=0.0,
+        step=0.01,
+        help="0.0 = cosine может уйти почти в 0 к концу. Например 0.05 = не ниже 5% от base LR."
+    )
     
     warmup_steps = st.sidebar.number_input(
         "Warmup Steps",
@@ -1439,7 +1467,7 @@ def render_training_config():
         epochs = 1
         max_steps = st.sidebar.number_input(
             "Max Steps",
-            min_value=100,
+            min_value=1,
             max_value=1000000,
             value=10000,
             step=1000,
@@ -1451,6 +1479,20 @@ def render_training_config():
         ["no", "fp16", "bf16"],
         index=2,
         help="bf16 рекомендуется для Ampere+ GPU"
+    )
+
+    # Sharding mode: гарантирует отсутствие двойного шардинга и корректную семантику resume
+    st.sidebar.divider()
+    st.sidebar.subheader("🧩 Шардирование данных")
+    sharding_mode = st.sidebar.selectbox(
+        "Sharding mode",
+        options=["auto", "dataset", "accelerate"],
+        index=0,
+        help=(
+            "auto: для streaming (IterableDataset) выбираем dataset-level шардинг (строго и совместимо с strict resume).\n"
+            "dataset: шардинг делает сам датасет (shard=True), DataLoader НЕ готовим через accelerate.\n"
+            "accelerate: шардинг делает accelerate.prepare(DataLoader); строгий resume для streaming отключается."
+        ),
     )
     
     grad_checkpoint = st.sidebar.checkbox(
@@ -1503,12 +1545,14 @@ def render_training_config():
         "batch_size": batch_size,
         "gradient_accumulation": grad_accum,
         "learning_rate": learning_rate,
+        "min_lr_ratio": min_lr_ratio,
         "warmup_steps": warmup_steps,
         "epochs": epochs,
         "max_steps": max_steps,
         "mixed_precision": mixed_precision,
         "grad_checkpoint": grad_checkpoint,
         "max_grad_norm": max_grad_norm,
+        "sharding_mode": sharding_mode,
         "val_ratio": val_ratio,
         "eval_every": eval_every,
         "eval_batches": eval_batches,
@@ -1824,7 +1868,11 @@ def render_metrics_dashboard(metrics: dict):
         current_step = metrics.get("current_step", 0)
         total_steps = metrics.get("total_steps", 1)
         progress = current_step / total_steps * 100 if total_steps > 0 else 0
-        st.metric("Прогресс", f"{progress:.1f}%", f"Step {current_step}/{total_steps}")
+        planned_total = metrics.get("planned_total_steps", None)
+        suffix = f"Step {current_step}/{total_steps}"
+        if planned_total is not None and int(planned_total) != int(total_steps):
+            suffix = f"{suffix} (план: {planned_total})"
+        st.metric("Прогресс", f"{progress:.1f}%", suffix)
     
     with col2:
         loss = metrics.get("current_loss", 0)
@@ -1840,6 +1888,18 @@ def render_metrics_dashboard(metrics: dict):
     with col4:
         lr = metrics.get("current_lr", 0)
         st.metric("Learning Rate", f"{lr:.2e}")
+
+    # Доп. пояснения: план vs факт, причина остановки, LR floor
+    planned_total = metrics.get("planned_total_steps", None)
+    total_steps = metrics.get("total_steps", None)
+    stop_reason = metrics.get("stop_reason", None)
+    min_lr_ratio = metrics.get("min_lr_ratio", None)
+    if planned_total is not None and total_steps is not None and int(planned_total) != int(total_steps):
+        st.caption(f"План шагов: {planned_total} • Факт (для прогресса/ETA): {total_steps}")
+    if stop_reason:
+        st.caption(f"Причина остановки: `{stop_reason}`")
+    if min_lr_ratio is not None and float(min_lr_ratio) > 0:
+        st.caption(f"Cosine LR floor включён: min_lr_ratio={float(min_lr_ratio):.2f}")
     
     with col5:
         eta = metrics.get("eta_seconds", 0)
@@ -3104,8 +3164,8 @@ def main():
                         checkpoints = metrics.get("checkpoints", [])
                         if checkpoints:
                             st.markdown("**📦 Чекпоинты:**")
-                            for ckpt in checkpoints[-5:]:  # Последние 5
-                                st.caption(f"Step {ckpt['step']}: `{ckpt['path']}`")
+                            for ckpt in checkpoints:
+                                st.caption(f"Step {ckpt['step']}: {ckpt['path']}")
                         
                         # Кнопки
                         btn_col1, btn_col2, btn_col3 = st.columns(3)

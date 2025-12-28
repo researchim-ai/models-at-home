@@ -339,9 +339,18 @@ class ModelAdapter:
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Unwrap модель если нужно
-        unwrapped_model = accelerator.unwrap_model(model)
+
+        # ВАЖНО: сохраняем только на main process (остальные просто дождутся barrier выше по стеку)
+        if hasattr(accelerator, "is_main_process") and not accelerator.is_main_process:
+            return
+
+        # Unwrap модель БЕЗ accelerate.unwrap_model():
+        # accelerate.unwrap_model() внутри пытается `import deepspeed`, даже если вы не используете DeepSpeed.
+        # В окружениях без `distutils` это падает на этапе сохранения.
+        unwrapped_model = model
+        # DDP / DataParallel / другие обёртки
+        while hasattr(unwrapped_model, "module"):
+            unwrapped_model = unwrapped_model.module
         
         # Если это PEFT-модель (LoRA/QLoRA) — мерджим адаптер в базу
         if PEFT_AVAILABLE and PeftModel is not None:
@@ -353,12 +362,35 @@ class ModelAdapter:
             except Exception as e:
                 logger.warning(f"LoRA merge failed, saving as-is: {e}")
         
-        # Сохраняем в HF формате
-        unwrapped_model.save_pretrained(
-            str(output_dir),
-            safe_serialization=True,
-            save_function=accelerator.save,
-        )
+        # Сохраняем в HF формате БЕЗ вызова transformers.save_pretrained(),
+        # потому что transformers внутри делает unwrap_model() -> accelerate -> import deepspeed,
+        # а deepspeed может падать (например, если в runtime нет nvcc).
+        #
+        # Вместо этого сохраняем:
+        # - config.json
+        # - model.safetensors
+        # - (опционально) generation_config.json
+        try:
+            unwrapped_model.config.save_pretrained(str(output_dir))
+        except Exception as e:
+            logger.warning(f"Failed to save config.json: {e}")
+
+        try:
+            if getattr(unwrapped_model, "generation_config", None) is not None:
+                unwrapped_model.generation_config.save_pretrained(str(output_dir))
+        except Exception as e:
+            logger.warning(f"Failed to save generation_config.json: {e}")
+
+        try:
+            from safetensors.torch import save_file as _save_safetensors
+
+            # Сохраняем state_dict на CPU (для детерминированного и независимого сейва)
+            state_dict = unwrapped_model.state_dict()
+            cpu_state = {k: v.detach().cpu() for k, v in state_dict.items()}
+            _save_safetensors(cpu_state, str(output_dir / "model.safetensors"))
+        except Exception as e:
+            logger.error(f"Failed to save model.safetensors: {e}")
+            raise
         
         # Если модель построена по blueprint — сохраняем blueprint рядом
         bp_dict = getattr(unwrapped_model.config, "blueprint", None)

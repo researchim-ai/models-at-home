@@ -68,6 +68,11 @@ class StreamingTextDataset(IterableDataset):
         split: str = "train",      # "train" | "val"
         val_ratio: float = 0.0,    # если >0, часть строк уходит в val
         shard: bool = True,        # для val поставим False
+        # Strict resume: если задано, можем мгновенно восстановить позицию в .jsonl по byte offset.
+        # ВАЖНО: для .gz строгий seek невозможен без отдельного индексированного формата.
+        resume_byte_offset: int = 0,
+        resume_global_idx: int = 0,
+        strict_resume: bool = True,
     ):
         super().__init__()
         self.file_path = Path(file_path)
@@ -78,6 +83,15 @@ class StreamingTextDataset(IterableDataset):
         self.split = split
         self.val_ratio = float(val_ratio or 0.0)
         self.shard = bool(shard)
+        self.resume_byte_offset = int(resume_byte_offset or 0)
+        self.resume_global_idx = int(resume_global_idx or 0)
+        self.strict_resume = bool(strict_resume)
+
+        # Будем обновлять при итерации: позиция (следующий offset/idx) для точного resume
+        self._resume_state = {
+            "byte_offset": self.resume_byte_offset,
+            "global_idx": self.resume_global_idx,
+        }
 
         if not self.file_path.exists():
             raise FileNotFoundError(f"Dataset {self.file_path} not found")
@@ -113,6 +127,24 @@ class StreamingTextDataset(IterableDataset):
         finally:
             f.close()
 
+    def get_resume_state(self) -> dict:
+        """
+        Возвращает состояние потока для строгого resume.
+        Для .gz resume возможен только через slow-skip (или отдельный индексированный формат).
+        """
+        return {
+            "file_path": str(self.file_path),
+            "is_gz": bool(self._is_gz),
+            "is_jsonl": bool(self._is_jsonl),
+            "split": self.split,
+            "val_ratio": self.val_ratio,
+            "shard": self.shard,
+            "num_replicas": int(self.num_replicas),
+            "rank": int(self.rank),
+            "byte_offset": int(self._resume_state.get("byte_offset", 0) or 0),
+            "global_idx": int(self._resume_state.get("global_idx", 0) or 0),
+        }
+
     def __iter__(self):
         """
         Итератор с опциональным шардированием.
@@ -130,9 +162,56 @@ class StreamingTextDataset(IterableDataset):
         # Train/val split параметры
         scale = 10000
         threshold = int(self.val_ratio * scale)
-        
-        # Базовый итератор всех строк с глобальным индексом
-        base_iter = enumerate(self._read_lines())
+
+        # Базовый итератор всех строк с глобальным индексом.
+        # Для строгого resume на .jsonl используем бинарное чтение + seek по byte_offset.
+        # Это сохраняет ПОЛНУЮ детерминированность при resume (при условии, что файл не менялся).
+        if self.strict_resume and not self._is_gz and self._is_jsonl:
+            start_off = int(self.resume_byte_offset or 0)
+            start_idx = int(self.resume_global_idx or 0)
+
+            def iter_with_offsets():
+                idx = start_idx
+                with open(self.file_path, "rb") as f:
+                    if start_off > 0:
+                        f.seek(start_off)
+                    # Обновим состояние "мы на этой позиции"
+                    self._resume_state = {"byte_offset": int(f.tell()), "global_idx": int(idx)}
+
+                    while True:
+                        off = int(f.tell())
+                        raw = f.readline()
+                        if not raw:
+                            break
+
+                        # Декодируем и чистим
+                        line = raw.decode("utf-8", errors="ignore").strip()
+                        if not line:
+                            continue
+
+                        # Парсим JSONL (text поле), полностью повторяя старую семантику _read_lines()
+                        try:
+                            obj = json.loads(line)
+                            line = obj.get("text", "")
+                        except json.JSONDecodeError:
+                            continue
+
+                        line = (line or "").strip()
+                        if not line:
+                            continue
+
+                        # ВАЖНО: idx — это глобальный индекс ПОСЛЕ фильтрации пустых/битых строк,
+                        # т.е. ровно то, что раньше давал enumerate(self._read_lines()).
+                        # Сохраняем next-state на "следующую валидную строку"
+                        next_off = int(f.tell())
+                        self._resume_state = {"byte_offset": next_off, "global_idx": int(idx + 1)}
+                        yield idx, line
+                        idx += 1
+
+            base_iter = iter_with_offsets()
+        else:
+            # Фолбэк: старый путь (для .txt или .gz). Строгий seek тут не гарантируется.
+            base_iter = enumerate(self._read_lines())
         
         # 1. Применяем train/val split по глобальному индексу
         def apply_split(idx_text_pair):

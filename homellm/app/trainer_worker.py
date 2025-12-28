@@ -259,6 +259,16 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         tokenizer = adapter.prepare_tokenizer(tokenizer)  # pad_token = eos_token
         
         metrics.update(status=f"loading_dataset ({stage})")
+
+        # ---------------------------
+        # Sharding mode
+        # ---------------------------
+        # auto: для IterableDataset выбираем dataset-level шардинг (строгое поведение + совместимо с strict resume)
+        # accelerate: шардинг делает accelerator.prepare(DataLoader)
+        # dataset: шардинг делает датасет (shard=True) и DataLoader НЕ заворачиваем в accelerate.prepare
+        sharding_mode = str(config.get("sharding_mode", "auto")).lower().strip()
+        if sharding_mode not in ("auto", "dataset", "accelerate"):
+            raise ValueError(f"Invalid sharding_mode={sharding_mode}. Expected one of: auto|dataset|accelerate")
         
         # ВАЖНО: Вычисляем val_ratio ДО создания train_dataset, чтобы избежать data leakage
         val_ratio = float(config.get("val_ratio", 0.0))
@@ -272,6 +282,9 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         # ВАЖНО: Шардирование делает accelerate.prepare() через DataLoaderShard/Dispatcher
         # Датасет только делает train/val split, но НЕ шардирует между процессами (shard=False)
         if stage == "sft":
+            # SFTDataset — IterableDataset, поэтому auto -> dataset-level
+            effective_shard_mode = "dataset" if sharding_mode == "auto" else sharding_mode
+            ds_shard = (effective_shard_mode == "dataset")
             train_dataset = SFTDataset(
                 config["data_path"],
                 tokenizer,
@@ -282,7 +295,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 rank=accelerator.process_index,  # ✅ Явное шардирование
                 split="train",
                 val_ratio=holdout_ratio,
-                shard=True,  # ✅ Включаем шардирование внутри датасета
+                shard=ds_shard,
             )
             
             # Получаем пример сформированного промпта для отображения (для SFT)
@@ -307,6 +320,29 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             collate_fn = default_data_collator
         else:
             # Pretrain или Continual Pretrain - используем StreamingTextDataset
+            # Strict resume для StreamingTextDataset (.jsonl): пытаемся прочитать byte_offset/global_idx из checkpoint
+            resume_state = None
+            resume_from_checkpoint_cfg = config.get("resume_from_checkpoint")
+            strict_resume = bool(config.get("strict_dataloader_resume", True))
+            effective_shard_mode = "dataset" if sharding_mode == "auto" else sharding_mode
+            if strict_resume and effective_shard_mode != "dataset":
+                # Иначе мы не можем гарантировать строгую детерминированность потока по rank
+                raise ValueError("strict_dataloader_resume=True requires sharding_mode='dataset' for streaming datasets")
+            if resume_from_checkpoint_cfg and strict_resume:
+                try:
+                    p = Path(resume_from_checkpoint_cfg)
+                    # per-rank state
+                    rs_path = p / f"dataloader_state_rank{accelerator.process_index}.json"
+                    if rs_path.exists():
+                        with open(rs_path, "r", encoding="utf-8") as f:
+                            resume_state = json.load(f)
+                        logger.info(
+                            f"Loaded dataloader resume state for rank {accelerator.process_index}: "
+                            f"byte_offset={resume_state.get('byte_offset')} global_idx={resume_state.get('global_idx')}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to load dataloader resume state: {e}")
+
             train_dataset = StreamingTextDataset(
                 config["data_path"], 
                 tokenizer, 
@@ -315,7 +351,10 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 rank=accelerator.process_index,  # ✅ Явное шардирование
                 split="train",
                 val_ratio=holdout_ratio,
-                shard=True,  # ✅ Включаем шардирование внутри датасета
+                shard=(effective_shard_mode == "dataset"),
+                resume_byte_offset=(resume_state.get("byte_offset", 0) if resume_state else 0),
+                resume_global_idx=(resume_state.get("global_idx", 0) if resume_state else 0),
+                strict_resume=strict_resume,
             )
             
             # Получаем пример текста для отображения (для pretrain/continual_pretrain)
@@ -357,6 +396,9 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             # Датасет только делает train/val split, но НЕ шардирует между процессами (shard=False)
             if stage == "sft":
                 from homellm.training.sft import SFTDataset
+                # reuse effective_shard_mode from above if set, otherwise compute here
+                effective_shard_mode = "dataset" if sharding_mode == "auto" else sharding_mode
+                ds_shard = (effective_shard_mode == "dataset")
                 val_dataset = SFTDataset(
                     config["data_path"],
                     tokenizer,
@@ -367,12 +409,13 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     rank=accelerator.process_index,  # ✅ Явное шардирование
                     split="val",
                     val_ratio=holdout_ratio,
-                    shard=True,  # ✅ Включаем шардирование внутри датасета
+                    shard=ds_shard,
                 )
                 from transformers import default_data_collator
                 val_collate = default_data_collator
             else:
                 # Используем уже импортированный StreamingTextDataset
+                effective_shard_mode = "dataset" if sharding_mode == "auto" else sharding_mode
                 val_dataset = StreamingTextDataset(
                     config["data_path"],
                     tokenizer,
@@ -381,7 +424,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     rank=accelerator.process_index,  # ✅ Явное шардирование
                     split="val",
                     val_ratio=holdout_ratio,
-                    shard=True,  # ✅ Включаем шардирование внутри датасета
+                    shard=(effective_shard_mode == "dataset"),
+                    strict_resume=False,  # val не резюмим строго
                 )
                 # Используем тот же кастомный collator для val, что и для train
                 def causal_lm_collator(batch):
@@ -485,7 +529,12 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 # Для streaming dataset без __len__ - используем save_every * 10 как оценку
                 max_train_steps = config.get("save_every", 5000) * 2
         
-        metrics.update(total_steps=max_train_steps, max_steps_estimated=config.get("max_steps") is None)
+        planned_total_steps = int(max_train_steps)
+        metrics.update(
+            total_steps=planned_total_steps,
+            planned_total_steps=planned_total_steps,
+            max_steps_estimated=config.get("max_steps") is None,
+        )
         
         # ВАЖНО: Для LoRA/QLoRA оптимизатор должен брать только trainable параметры
         # Это критично для QLoRA, где базовые веса заморожены и огромные
@@ -503,23 +552,69 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             eps=1e-8,
             weight_decay=config.get("weight_decay", 0.1)
         )
-        lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=config["warmup_steps"],
-            num_training_steps=max_train_steps,
-        )
-        
-        if val_loader is not None:
-            model, optimizer, train_loader, val_loader, lr_scheduler = accelerator.prepare(
-                model, optimizer, train_loader, val_loader, lr_scheduler
-            )
+        # LR scheduler
+        # По умолчанию cosine schedule уходит к ~0 к концу (это нормальное поведение).
+        # Если нужно, можно задать min_lr_ratio (например 0.05), чтобы LR не падал ниже 5% от base LR.
+        min_lr_ratio = float(config.get("min_lr_ratio", 0.0) or 0.0)
+        warmup_steps = int(config["warmup_steps"])
+        total_steps_for_sched = int(max_train_steps)
+        if min_lr_ratio > 0:
+            import math as _math
+            from torch.optim.lr_scheduler import LambdaLR
+
+            def lr_lambda(step: int) -> float:
+                if warmup_steps > 0 and step < warmup_steps:
+                    return float(step) / float(max(1, warmup_steps))
+                if total_steps_for_sched <= warmup_steps:
+                    return 1.0
+                progress = float(step - warmup_steps) / float(max(1, total_steps_for_sched - warmup_steps))
+                progress = min(max(progress, 0.0), 1.0)
+                cosine = 0.5 * (1.0 + _math.cos(_math.pi * progress))
+                return float(min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
+
+            lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+            metrics.update(min_lr_ratio=min_lr_ratio)
         else:
-            model, optimizer, train_loader, lr_scheduler = accelerator.prepare(
-                model, optimizer, train_loader, lr_scheduler
+            lr_scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps_for_sched,
             )
+        
+        # IMPORTANT (Sharding contract):
+        # У нас ДВА возможных способа шардирования данных:
+        #  1) dataset-level (StreamingTextDataset/SFTDataset с shard=True, явный num_replicas/rank)
+        #  2) accelerate-level (accelerator.prepare(DataLoader) -> DataLoaderShard/Dispatcher)
+        #
+        # НЕЛЬЗЯ включать оба одновременно — иначе будет "двойной шардинг" и данные/шаги станут меньше в N раз.
+        # Для IterableDataset мы используем dataset-level шардинг как источник правды.
+        is_streaming_sharded = isinstance(train_dataset, IterableDataset) and getattr(train_dataset, "shard", False) is True
+        effective_shard_mode = "dataset" if is_streaming_sharded else "accelerate"
+        if accelerator.is_main_process:
+            metrics.update(
+                sharding_mode=effective_shard_mode,
+                sharding_mode_requested=sharding_mode,
+                num_processes=int(accelerator.num_processes),
+            )
+        if is_streaming_sharded:
+            if val_loader is not None:
+                model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+            else:
+                model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+            logger.info("Using dataset-level sharding for IterableDataset -> skipping accelerator.prepare() for DataLoader(s)")
+        else:
+            if val_loader is not None:
+                model, optimizer, train_loader, val_loader, lr_scheduler = accelerator.prepare(
+                    model, optimizer, train_loader, val_loader, lr_scheduler
+                )
+            else:
+                model, optimizer, train_loader, lr_scheduler = accelerator.prepare(
+                    model, optimizer, train_loader, lr_scheduler
+                )
         
         # Resume из checkpoint (универсально для всех стадий)
         starting_step = 0
+        resume_batches_to_skip = 0
         
         # Если передан аргумент resume_from_checkpoint через конфиг (от CLI)
         if config.get("resume_from_checkpoint"):
@@ -550,12 +645,40 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 logger.info(f"Resumed from step {starting_step}")
                 metrics.update(status="resumed", resumed_from_step=starting_step)
                 
-                # ВАЖНО: Пропускаем уже пройденные батчи
-                if starting_step > 0:
-                    # Для IterableDataset нужно пропустить (starting_step * gradient_accumulation) батчей
-                    batches_to_skip = starting_step * config["gradient_accumulation"]
-                    logger.info(f"Skipping {batches_to_skip} batches to sync dataloader...")
-                    train_loader = accelerator.skip_first_batches(train_loader, num_batches=batches_to_skip)
+                # ВАЖНО: восстановление положения даталоадера
+                #
+                # - Для map-style датасетов accelerate.load_state() восстанавливает sampler state, и доп. skip НЕ нужен.
+                # - Для IterableDataset sampler state не существует => единственный вариант "синхронизировать" — реально
+                #   прогнать N батчей и выбросить. Это может занимать много времени (и выглядит как зависание),
+                #   поэтому делаем это явно с прогресс-логами в первом epoch.
+                if starting_step > 0 and isinstance(train_dataset, IterableDataset):
+                    resume_skip_enabled = bool(config.get("resume_skip_batches", True))
+                    # Если у StreamingTextDataset включён strict_resume и загружен byte_offset, skip не нужен.
+                    try:
+                        if hasattr(train_dataset, "get_resume_state"):
+                            rs = train_dataset.get_resume_state()
+                            if rs.get("byte_offset", 0) and bool(config.get("strict_dataloader_resume", True)):
+                                logger.info("Strict dataloader resume active (byte_offset present) -> skipping batches is NOT required.")
+                                resume_skip_enabled = False
+                    except Exception:
+                        pass
+                    if resume_skip_enabled:
+                        resume_batches_to_skip = int(starting_step) * int(config["gradient_accumulation"])
+                        # Опциональный лимит, чтобы не "висеть" часами при большом starting_step
+                        max_skip = config.get("resume_skip_batches_max")
+                        if max_skip is not None:
+                            max_skip = int(max_skip)
+                            if resume_batches_to_skip > max_skip:
+                                logger.warning(
+                                    f"Requested to skip {resume_batches_to_skip} batches, but resume_skip_batches_max={max_skip}. "
+                                    f"Capping skip to {max_skip}. (May slightly desync dataloader position.)"
+                                )
+                                resume_batches_to_skip = max_skip
+                        logger.info(f"Will skip {resume_batches_to_skip} batches (IterableDataset) to sync dataloader...")
+                        metrics.update(status="skipping", skipping_batches=resume_batches_to_skip)
+                    else:
+                        logger.warning("resume_skip_batches=False: will NOT skip dataloader batches for IterableDataset (data order may differ after resume).")
+                        resume_batches_to_skip = 0
                     
             except Exception as e:
                 logger.error(f"Failed to resume from checkpoint {resume_from_checkpoint}: {e}")
@@ -594,6 +717,9 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 for i, batch in enumerate(val_loader):
                     if i >= eval_batches:
                         break
+                    # Если DataLoader не был подготовлен accelerate'ом — вручную кладём батч на устройство
+                    if is_streaming_sharded:
+                        batch = {k: (v.to(accelerator.device) if hasattr(v, "to") else v) for k, v in batch.items()}
                     out = model(**batch)
                     loss = out.loss.detach()
                     # Усредняем loss по всем процессам (каждый процесс видит свою часть val данных)
@@ -610,12 +736,19 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         # ВАЖНО: global_step уже инициализирован выше как starting_step (для resume)
         # Если resume не было, starting_step = 0, поэтому global_step = 0
         start_time = time.time()
+        last_heartbeat = time.time()
+        heartbeat_every = float(config.get("metrics_heartbeat_seconds", 20.0))
         
         # Debug: проверка дублей между процессами (первые N шагов)
-        # ВАЖНО: Включается только если в конфиге есть debug_check_duplicates=True
-        debug_check_duplicates = config.get("debug_check_duplicates", False)
+        # По умолчанию ВКЛ в multi-GPU (это наш "safety check", чтобы гарантировать корректный шардинг).
+        if "debug_check_duplicates" in config:
+            debug_check_duplicates = bool(config.get("debug_check_duplicates"))
+        else:
+            debug_check_duplicates = bool(accelerator.num_processes > 1)
         debug_sample_ids = []  # Собираем sample_id для первых шагов
         debug_max_samples = 20  # Проверяем первые 20 примеров
+        if debug_check_duplicates and accelerator.is_main_process:
+            metrics.update(debug_check_duplicates=True, debug_max_samples=int(debug_max_samples))
         
         # Loss tracking:
         # - micro_* для проверки divergence на КАЖДОМ update-step
@@ -627,6 +760,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         update_start_time = time.time()
 
         training_complete = False
+        stop_reason = None
         
         for epoch in range(config["epochs"]):
             if training_complete:
@@ -634,8 +768,43 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 
             metrics.update(epoch=epoch + 1)
             model.train()
-            
-            for step, batch in enumerate(train_loader):
+
+            # Если resume из IterableDataset: пропускаем батчи ЯВНО в начале первого epoch
+            epoch_loader = train_loader
+            if epoch == 0 and resume_batches_to_skip > 0:
+                it = iter(train_loader)
+                to_skip = int(resume_batches_to_skip)
+                log_every = int(config.get("resume_skip_log_every", 500))
+                t0 = time.time()
+                skipped = 0
+                logger.info(f"Skipping {to_skip} batches now... (logging every {log_every})")
+                while skipped < to_skip:
+                    try:
+                        next(it)
+                    except StopIteration:
+                        logger.warning(f"Reached end of iterable dataloader while skipping at {skipped}/{to_skip}. Continuing from start of next epoch.")
+                        break
+                    skipped += 1
+                    if skipped % log_every == 0 or skipped == to_skip:
+                        dt = max(1e-6, time.time() - t0)
+                        bps = skipped / dt
+                        eta = (to_skip - skipped) / bps if bps > 0 else float("inf")
+                        logger.info(f"Skipped {skipped}/{to_skip} batches ({bps:.2f} batches/s), ETA ~{eta:.0f}s")
+                epoch_loader = it  # продолжаем этот epoch с текущей позиции
+                if accelerator.is_main_process:
+                    metrics.update(status="training", skipped_batches_done=int(skipped))
+                resume_batches_to_skip = 0  # только один раз
+
+            for step, batch in enumerate(epoch_loader):
+                # Heartbeat: обновляем metrics.json по времени, даже если log_every большой
+                if accelerator.is_main_process and heartbeat_every > 0:
+                    now = time.time()
+                    if now - last_heartbeat >= heartbeat_every:
+                        try:
+                            metrics.update(last_heartbeat=datetime.now().isoformat())
+                        except Exception:
+                            pass
+                        last_heartbeat = now
                 # Одноразовый лог: реальный per-process batch и оценка "почему много VRAM"
                 if step == 0 and epoch == 0 and accelerator.is_main_process and global_step == starting_step:
                     try:
@@ -660,7 +829,6 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                             f"[BATCH CHECK] input_ids shape={getattr(batch.get('input_ids', None), 'shape', None)} | "
                             f"per-GPU microbatch={bsz}, grad_accum={grad_accum} -> effective per-GPU={eff_per_gpu}, global={global_batch} (x{num_gpus}). "
                             f"Estimated logits memory ~{logits_gb:.2f} GB (B*S*V, dtype={mp}). "
-                            f"Если VRAM ~22GB, почти наверняка per-GPU batch не 1."
                         )
                     except Exception as e:
                         logger.warning(f"[BATCH CHECK] failed: {e}")
@@ -674,6 +842,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                         debug_sample_ids.append((global_step, accelerator.process_index, sample_hash))
                 
                 with accelerator.accumulate(model):
+                    if is_streaming_sharded:
+                        batch = {k: (v.to(accelerator.device) if hasattr(v, "to") else v) for k, v in batch.items()}
                     outputs = model(**batch)
                     loss = outputs.loss
                     
@@ -750,31 +920,37 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     log_updates += 1
 
                     # Debug: проверка дублей после первых N шагов
-                    # ВАЖНО: При dispatch_batches=True нужно собирать хэши со всех процессов через gather
+                    # ВАЖНО: gather() — коллективная операция, должна вызываться на ВСЕХ процессах!
                     if debug_check_duplicates and global_step == debug_max_samples:
-                        # Собираем количество хэшей с каждого процесса
+                        # 1) Собираем количество хэшей с каждого процесса (ВСЕ процессы вызывают gather)
                         hash_counts = torch.tensor([len(debug_sample_ids)], device=accelerator.device, dtype=torch.long)
-                        all_counts = accelerator.gather(hash_counts)
+                        all_counts = accelerator.gather(hash_counts)  # collective op
                         
+                        # 2) Готовим локальные хэши для gather (ВСЕ процессы)
+                        max_len = int(all_counts.max().item()) if all_counts.numel() > 0 else 0
+                        if len(debug_sample_ids) > 0 and max_len > 0:
+                            local_hashes = torch.tensor([h for _, _, h in debug_sample_ids], device=accelerator.device, dtype=torch.long)
+                            # Pad до максимальной длины для gather
+                            if len(local_hashes) < max_len:
+                                padding = torch.full((max_len - len(local_hashes),), -1, device=accelerator.device, dtype=torch.long)
+                                local_hashes = torch.cat([local_hashes, padding])
+                        else:
+                            # Пустой тензор если нет хэшей (но всё равно участвуем в gather)
+                            local_hashes = torch.full((max(1, max_len),), -1, device=accelerator.device, dtype=torch.long)
+                        
+                        # 3) Собираем хэши со всех процессов (ВСЕ процессы вызывают gather)
+                        all_hashes = accelerator.gather(local_hashes.unsqueeze(0))  # collective op
+                        
+                        # 4) Анализ дублей — только на main process (после завершения gather)
                         if accelerator.is_main_process:
-                            total_hashes = all_counts.sum().item()
+                            total_hashes = int(all_counts.sum().item())
                             logger.info(f"Debug: collected {total_hashes} sample hashes across all processes")
                             
-                            # Собираем все хэши со всех процессов для проверки дублей
-                            # Создаем тензоры с хэшами (каждый процесс отправляет свои хэши)
-                            if len(debug_sample_ids) > 0:
-                                local_hashes = torch.tensor([h for _, _, h in debug_sample_ids], device=accelerator.device, dtype=torch.long)
-                                # Pad до максимальной длины для gather
-                                max_len = all_counts.max().item()
-                                if len(local_hashes) < max_len:
-                                    padding = torch.full((max_len - len(local_hashes),), -1, device=accelerator.device, dtype=torch.long)
-                                    local_hashes = torch.cat([local_hashes, padding])
-                                
-                                all_hashes = accelerator.gather(local_hashes.unsqueeze(0))
-                                # Убираем padding (-1) и проверяем дубли
-                                all_hashes_flat = all_hashes.flatten()
-                                valid_hashes = all_hashes_flat[all_hashes_flat != -1].cpu().numpy()
-                                
+                            # Убираем padding (-1) и проверяем дубли
+                            all_hashes_flat = all_hashes.flatten()
+                            valid_hashes = all_hashes_flat[all_hashes_flat != -1].cpu().numpy()
+                            
+                            if len(valid_hashes) > 0:
                                 unique_hashes = set(valid_hashes)
                                 if len(valid_hashes) != len(unique_hashes):
                                     duplicates = len(valid_hashes) - len(unique_hashes)
@@ -782,7 +958,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                                 else:
                                     logger.info(f"Debug: No duplicates found in first {debug_max_samples} steps (all {len(valid_hashes)} samples unique across all processes)")
                             else:
-                                logger.warning("Debug: No sample hashes collected on main process")
+                                logger.warning("Debug: No sample hashes collected")
                     
                     # Логирование
                     if global_step % config.get("log_every", 10) == 0 or global_step == 1:
@@ -809,6 +985,31 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     if global_step % config.get("save_every", 5000) == 0:
                         ckpt_path = output_dir / f"checkpoint_step{global_step}"
                         accelerator.save_state(ckpt_path)
+                        # Сохраняем строгий dataloader state (per-rank) рядом с accelerate checkpoint
+                        try:
+                            if hasattr(train_dataset, "get_resume_state"):
+                                ds_state = train_dataset.get_resume_state()
+                                st_path = ckpt_path / f"dataloader_state_rank{accelerator.process_index}.json"
+                                with open(st_path, "w", encoding="utf-8") as f:
+                                    json.dump(ds_state, f, ensure_ascii=False, indent=2)
+                        except Exception as e:
+                            logger.warning(f"Failed to save dataloader state: {e}")
+                        # Сохраняем метаданные чекпоинта (для честного UI/возобновления планов)
+                        try:
+                            if accelerator.is_main_process:
+                                meta = {
+                                    "global_step": int(global_step),
+                                    "planned_total_steps": int(metrics.metrics.get("planned_total_steps", max_train_steps)),
+                                    "learning_rate": float(config.get("learning_rate", 0.0)),
+                                    "warmup_steps": int(config.get("warmup_steps", 0)),
+                                    "min_lr_ratio": float(config.get("min_lr_ratio", 0.0) or 0.0),
+                                    "scheduler": "cosine_with_warmup",
+                                    "timestamp": datetime.now().isoformat(),
+                                }
+                                with open(ckpt_path / "checkpoint_metadata.json", "w", encoding="utf-8") as f:
+                                    json.dump(meta, f, ensure_ascii=False, indent=2)
+                        except Exception as e:
+                            logger.warning(f"Failed to save checkpoint metadata: {e}")
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
                             model_config.save_pretrained(ckpt_path)
@@ -826,8 +1027,29 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     # Проверяем достигли ли лимита шагов
                     if global_step >= max_train_steps:
                         training_complete = True
+                        stop_reason = "max_train_steps_reached"
                         break
         
+        # Если закончили не по max_train_steps, то либо эпохи кончились, либо даталоадер исчерпался.
+        if stop_reason is None:
+            if global_step >= max_train_steps:
+                stop_reason = "max_train_steps_reached"
+            else:
+                # Для IterableDataset длина часто оценочная (пустые/битые строки отбрасываются),
+                # поэтому достижение EOF может случиться раньше planned_total_steps.
+                stop_reason = "epochs_completed_or_dataloader_exhausted"
+
+        # Если "план" оказался больше факта — фиксируем метрики так, чтобы прогресс был 100%,
+        # но сохраняем исходный план отдельно (planned_total_steps).
+        if accelerator.is_main_process:
+            try:
+                if metrics.metrics.get("planned_total_steps", 0) and global_step < int(metrics.metrics.get("planned_total_steps", 0)):
+                    metrics.update(total_steps=int(global_step), stop_reason=stop_reason)
+                else:
+                    metrics.update(stop_reason=stop_reason)
+            except Exception:
+                pass
+
         # Final save - только на main process
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
