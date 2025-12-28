@@ -636,6 +636,34 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             model.train()
             
             for step, batch in enumerate(train_loader):
+                # Одноразовый лог: реальный per-process batch и оценка "почему много VRAM"
+                if step == 0 and epoch == 0 and accelerator.is_main_process and global_step == starting_step:
+                    try:
+                        if "input_ids" in batch and hasattr(batch["input_ids"], "shape"):
+                            bsz, seqlen = int(batch["input_ids"].shape[0]), int(batch["input_ids"].shape[1])
+                        else:
+                            bsz, seqlen = int(config.get("batch_size", 0)), int(config.get("seq_len", 0))
+
+                        vocab_size = int(config.get("vocab_size", 50257))
+                        mp = str(config.get("mixed_precision", "no")).lower()
+                        bytes_per = 2 if mp in ("fp16", "bf16") else 4
+
+                        # logits: (B,S,V) — это часто главный пожиратель памяти при больших B и длинном S
+                        logits_gb = (bsz * seqlen * vocab_size * bytes_per) / (1024**3)
+
+                        num_gpus = int(accelerator.num_processes or 1)
+                        grad_accum = int(config.get("gradient_accumulation", 1))
+                        eff_per_gpu = bsz * grad_accum
+                        global_batch = eff_per_gpu * num_gpus
+
+                        logger.warning(
+                            f"[BATCH CHECK] input_ids shape={getattr(batch.get('input_ids', None), 'shape', None)} | "
+                            f"per-GPU microbatch={bsz}, grad_accum={grad_accum} -> effective per-GPU={eff_per_gpu}, global={global_batch} (x{num_gpus}). "
+                            f"Estimated logits memory ~{logits_gb:.2f} GB (B*S*V, dtype={mp}). "
+                            f"Если VRAM ~22GB, почти наверняка per-GPU batch не 1."
+                        )
+                    except Exception as e:
+                        logger.warning(f"[BATCH CHECK] failed: {e}")
                 # Debug: проверка дублей (только первые N примеров)
                 # ВАЖНО: При dispatch_batches=True нужно собирать хэши со всех процессов через gather
                 if debug_check_duplicates and global_step < debug_max_samples:
@@ -665,6 +693,28 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     
                     # ВАЖНО: шаг оптимизатора только на update-step
                     if accelerator.sync_gradients:
+                        # Одноразовый лог реального peak VRAM (allocator) на первом update-step (по каждому ранку)
+                        if epoch == 0 and global_step == starting_step and not metrics.metrics.get("logged_cuda_peak", False):
+                            try:
+                                if torch.cuda.is_available():
+                                    dev = accelerator.device
+                                    torch.cuda.synchronize(dev)
+                                    peak_alloc = torch.cuda.max_memory_allocated(dev) / (1024**3)
+                                    peak_res = torch.cuda.max_memory_reserved(dev) / (1024**3)
+                                    cur_alloc = torch.cuda.memory_allocated(dev) / (1024**3)
+                                    cur_res = torch.cuda.memory_reserved(dev) / (1024**3)
+                                    logger.warning(
+                                        f"[CUDA PEAK] rank={accelerator.process_index} device={dev} | "
+                                        f"peak_alloc={peak_alloc:.2f}GB peak_reserved={peak_res:.2f}GB | "
+                                        f"cur_alloc={cur_alloc:.2f}GB cur_reserved={cur_res:.2f}GB"
+                                    )
+                                # помечаем только на main process через metrics-файл (чтобы не спамить при долгом прогоне)
+                                if accelerator.is_main_process:
+                                    metrics.metrics["logged_cuda_peak"] = True
+                                    metrics._save()
+                            except Exception as e:
+                                logger.warning(f"[CUDA PEAK] failed: {e}")
+
                         # Gradient clipping для стабильности
                         max_grad_norm = config.get("max_grad_norm", 1.0)
                         if max_grad_norm > 0:
@@ -672,7 +722,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                         
                         optimizer.step()
                         lr_scheduler.step()
-                        optimizer.zero_grad()
+                        optimizer.zero_grad(set_to_none=True)
                 
                 # Проверяем, произошел ли шаг оптимизатора (синхронизация градиентов)
                 if accelerator.sync_gradients:

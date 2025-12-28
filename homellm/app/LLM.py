@@ -1621,7 +1621,7 @@ def get_available_models():
     return models
 
 
-def render_distributed_config():
+def render_distributed_config(training_config: dict | None = None):
     """Конфигурация distributed training."""
     st.sidebar.header("🖥️ GPU и параллелизм")
     
@@ -1728,6 +1728,22 @@ def render_distributed_config():
         launch_info = f"**Устройства:** {num_gpus} × GPU\n**Режим:** {mode_info['type']}"
     
     st.sidebar.info(launch_info)
+
+    # Пояснение про batch semantics (частая причина "почему так много VRAM в DDP")
+    if training_config:
+        try:
+            micro_bsz = int(training_config.get("batch_size", 1))
+            grad_accum = int(training_config.get("gradient_accumulation", 1))
+            eff_per_gpu = micro_bsz * grad_accum
+            global_batch = eff_per_gpu * max(1, int(num_gpus or 1))
+            st.sidebar.caption(
+                f"Batch semantics: **per‑GPU microbatch** = {micro_bsz}, "
+                f"accum = {grad_accum} → **effective per‑GPU** = {eff_per_gpu}, "
+                f"**global** = {global_batch} (×{max(1, int(num_gpus or 1))} GPU)"
+            )
+            st.sidebar.caption("Важно: в DDP `batch_size` применяется на каждом процессе, т.е. это именно per‑GPU.")
+        except Exception:
+            pass
     
     return {
         "distributed_mode": selected_mode,
@@ -2356,76 +2372,341 @@ def render_data_manager():
                         st.error(f"Ошибка чтения файла: {e}")
 
 
-def calculate_memory_footprint(config, batch_size, distributed_mode="default", num_gpus=1):
+def _bytes_to_gb(x: int) -> float:
+    return float(x) / (1024**3)
+
+
+def _sum_tensor_bytes(obj) -> int:
     """
-    Рассчитывает потребление VRAM (в ГБ) для обучения.
-    Учитывает: веса, оптимизатор, градиенты и активации.
+    Считает байты тензоров на CUDA внутри структуры (тензор/список/кортеж/словарь).
+    """
+    import torch
+
+    total = 0
+    if obj is None:
+        return 0
+    if torch.is_tensor(obj):
+        if obj.is_cuda:
+            return int(obj.numel() * obj.element_size())
+        return 0
+    if isinstance(obj, dict):
+        for v in obj.values():
+            total += _sum_tensor_bytes(v)
+        return total
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            total += _sum_tensor_bytes(v)
+        return total
+    return 0
+
+
+def _estimate_memory_footprint(config, batch_size, distributed_mode="default", num_gpus=1):
+    """
+    Быстрая (и заведомо приблизительная) оценка VRAM. Нужна как fallback, когда нет CUDA.
     """
     try:
-        hidden_size = config["hidden_size"]
-        num_layers = config["num_layers"]
-        n_heads = config["n_heads"]
-        seq_len = config["seq_len"]
-        vocab_size = 50257  # Примерно для GPT-2 / Llama
-        
-        # 1. Параметры модели (P)
-        embed_params = vocab_size * hidden_size
-        layer_params = 12 * hidden_size**2 + 13 * hidden_size # Упрощенная формула для блока трансформера
-        total_params = embed_params + num_layers * layer_params
-        
-        # 2. Статическая память (Веса + Градиенты + Оптимизатор)
-        # Базовая Mixed Precision (fp16/bf16):
-        # - Weights (fp16): 2 bytes
-        # - Gradients (fp16): 2 bytes
-        # - Optimizer (AdamW):
-        #    - FP32 Master weights: 4 bytes
-        #    - Momentum (fp32): 4 bytes
-        #    - Variance (fp32): 4 bytes
-        # Итого: ~16-18 байт на параметр.
-        
-        bytes_per_param = 18 
-        
-        # Учет Distributed стратегий
-        if "deepspeed_zero3" in distributed_mode:
-            # ZeRO-3 шардирует все (веса, градиенты, оптимизатор)
-            static_mem_bytes = (total_params * bytes_per_param) / max(1, num_gpus)
-        elif "deepspeed_zero2" in distributed_mode:
-            # ZeRO-2 шардирует градиенты и оптимизатор (8+4+4=16 bytes), но веса (2 bytes) дублируются
-            sharded_part = (total_params * 16) / max(1, num_gpus)
-            replicated_part = total_params * 2
-            static_mem_bytes = sharded_part + replicated_part
-        elif distributed_mode == "fsdp":
-            # FSDP похож на ZeRO-3
-            static_mem_bytes = (total_params * bytes_per_param) / max(1, num_gpus)
-        else:
-            # DDP или Single GPU: полная копия у всех
-            static_mem_bytes = total_params * bytes_per_param
+        hidden_size = int(config["hidden_size"])
+        num_layers = int(config["num_layers"])
+        n_heads = int(config.get("n_heads", 0) or 0)
+        seq_len = int(config["seq_len"])
+        vocab_size = int(config.get("vocab_size", 50257))
+        intermediate_size = int(config.get("intermediate_size") or (hidden_size * 4))
 
-        # 3. Динамическая память (Активации)
-        # Зависит от Batch Size и Seq Len.
-        # Формула: Batch * Seq * Hidden * Layers * Bytes * Overhead_Factor
-        # Overhead_Factor для трансформеров без checkpointing ~34 (храним все промежуточные состояния)
-        # С checkpointing ~4 (храним только входы слоев + пересчет)
-        
-        overhead_factor = 4 if config.get("grad_checkpoint") else 34
-        activation_bytes = batch_size * seq_len * hidden_size * num_layers * 2 * overhead_factor
-        
-        # Конвертация в ГБ
+        mp = (config.get("mixed_precision") or "no").lower()
+        opt = (config.get("optimizer") or "adamw").lower()
+        grad_checkpoint = bool(config.get("grad_checkpoint", False))
+
+        # ---- 1) Точное число параметров для HomeForCausalLM (без сборки модели) ----
+        #
+        # По `homellm/models/home_model.py`:
+        # - embed_tokens: vocab_size * hidden_size
+        # - каждый блок:
+        #   - Attention: q/k/v/out: 4 * (H*H) (bias=False)
+        #   - MLP (SwiGLU-like): w1(H->I), w2(I->H), w3(H->I) => 3 * (H*I)
+        #   - RMSNorm weights: 2 * H
+        # - final_norm: H
+        # - lm_head tied к embed_tokens (параметры не удваиваются)
+        embed_params = vocab_size * hidden_size
+        attn_params_per_layer = 4 * hidden_size * hidden_size
+        mlp_params_per_layer = 3 * hidden_size * intermediate_size
+        norm_params_per_layer = 2 * hidden_size
+        final_norm_params = hidden_size
+        total_params = int(embed_params + num_layers * (attn_params_per_layer + mlp_params_per_layer + norm_params_per_layer) + final_norm_params)
+
+        # ---- 2) Static memory: weights/grads/optimizer ----
+        if mp in ("fp16", "bf16"):
+            param_bytes = 2
+        else:
+            param_bytes = 4
+
+        # Grads: в большинстве режимов совпадает с dtype параметров (очень грубо).
+        grad_bytes = param_bytes
+
+        # Optimizer state: сильно зависит от реализации/фьюза.
+        # Для AdamW часто state хранится в fp32 (exp_avg/exp_avg_sq), даже при fp16/bf16 моделях.
+        # Можно переопределить через config["optimizer_state_dtype"] = "fp16"|"bf16"|"fp32".
+        opt_state_dtype = (config.get("optimizer_state_dtype") or ("fp32" if opt in ("adam", "adamw") else mp)).lower()
+        if opt_state_dtype in ("fp16", "bf16"):
+            opt_state_bytes = 2
+        else:
+            opt_state_bytes = 4
+
+        weights_bytes = total_params * param_bytes
+        grads_bytes = total_params * grad_bytes
+        if opt in ("adam", "adamw"):
+            # exp_avg + exp_avg_sq
+            optim_bytes = total_params * (2 * opt_state_bytes)
+        elif opt == "sgd":
+            # momentum (если есть) — здесь считаем как 1 state
+            momentum = float(config.get("momentum") or 0.0)
+            optim_bytes = total_params * (opt_state_bytes if momentum > 0 else 0)
+        else:
+            optim_bytes = total_params * (2 * opt_state_bytes)
+
+        # ---- 3) Distributed sharding (очень приблизительно, без построения реального sharder'а) ----
+        # Важно: ZeRO/FSDP часто держат часть state на CPU/offload, это тут не учитывается.
+        shard = max(1, int(num_gpus or 1))
+        if "deepspeed_zero3" in distributed_mode or distributed_mode == "fsdp":
+            weights_bytes /= shard
+            grads_bytes /= shard
+            optim_bytes /= shard
+        elif "deepspeed_zero2" in distributed_mode:
+            # weights реплицируются; grads+optim шардируются
+            grads_bytes /= shard
+            optim_bytes /= shard
+
+        static_mem_bytes = int(weights_bytes + grads_bytes + optim_bytes)
+
+        # ---- 4) Activations (структурная оценка, без сборки модели) ----
+        # Тут критично различать 2 режима attention:
+        # - flash/mem_efficient (SDPA): не материализует (B,heads,S,S)
+        # - math: материализует scores/probs (часто в fp32), что на S=2048 может давать +8–10GB
+        #
+        # Мы не можем надёжно определить backend без запуска на GPU,
+        # поэтому считаем ОБА сценария и отдаём консервативный верхний предел.
+        dtype_act_bytes = param_bytes  # активации обычно в bf16/fp16 при autocast
+
+        b = int(batch_size)
+        s = int(seq_len)
+        h = int(hidden_size)
+        i = int(intermediate_size)
+        v = int(vocab_size)
+        nh = max(1, int(n_heads or 1))
+
+        # Базовые тензоры
+        embed_act = b * s * h
+        logits_act = b * s * v
+
+        # Пер-слой, без учёта S×S:
+        # q,k,v + attn_out + residual/norm + mlp interms
+        if grad_checkpoint:
+            per_layer_saved_no_ss = b * s * h
+        else:
+            per_layer_saved_no_ss = b * s * (6 * h + 3 * i)
+
+        # Worst-case math attention: scores + probs (и часто softmax в fp32).
+        # Для консервативной оценки считаем оба как fp32 и что они нужны для backward.
+        attn_ss_elems = b * nh * s * s
+        attn_ss_bytes_worst = int(attn_ss_elems * 8)  # scores fp32 (4) + probs fp32 (4)
+
+        # Flash-like: (B,heads,S,S) не материализуется (или сильно меньше), считаем как 0.
+        attn_ss_bytes_flash = 0
+
+        # Итог по сценариям
+        act_bytes_flash = int((embed_act + num_layers * per_layer_saved_no_ss + logits_act) * dtype_act_bytes) + attn_ss_bytes_flash
+        act_bytes_math = int((embed_act + num_layers * per_layer_saved_no_ss + logits_act) * dtype_act_bytes) + int(num_layers * attn_ss_bytes_worst)
+
+        # Выбор режима: auto -> верхняя оценка, можно форсировать через config["attention_estimate_mode"]
+        attn_mode = str(config.get("attention_estimate_mode", "auto")).lower()  # auto|flash|math
+        if attn_mode == "flash":
+            act_bytes = act_bytes_flash
+        elif attn_mode == "math":
+            act_bytes = act_bytes_math
+        else:
+            act_bytes = max(act_bytes_flash, act_bytes_math)
+
+        # ---- 5) Buffer / allocator slack ----
+        # Вместо фиксированных 1.5GB: берём долю от (static+act) с нижней границей.
         static_gb = static_mem_bytes / (1024**3)
-        act_gb = activation_bytes / (1024**3)
-        buffer_gb = 1.5  # Буфер для PyTorch context, cuda kernels fragmentation
-        
+        act_gb = act_bytes / (1024**3)
+        buffer_gb = max(0.5, 0.12 * (static_gb + act_gb))
         total_gb = static_gb + act_gb + buffer_gb
-        
+
+        detail = {
+            "weights_gb": round(_bytes_to_gb(int(weights_bytes)), 3),
+            "grads_gb": round(_bytes_to_gb(int(grads_bytes)), 3),
+            "optim_state_gb": round(_bytes_to_gb(int(optim_bytes)), 3),
+            "logits_act_gb": round(_bytes_to_gb(int(logits_act * dtype_act_bytes)), 3),
+            "act_flash_gb": round(_bytes_to_gb(int(act_bytes_flash)), 3),
+            "act_math_gb": round(_bytes_to_gb(int(act_bytes_math)), 3),
+            "attention_estimate_mode": attn_mode,
+            "buffer_rule": "max(0.5GB, 12% of (static+act))",
+        }
+
+        notes = (
+            "Оценка без сборки модели: параметры считаются по точной схеме Home (qkv/o + SwiGLU MLP + RMSNorm). "
+            "Act включает logits (B×S×V). Для attention считаются два сценария: flash (без S×S) и math (с S×S, fp32 softmax) — auto берёт верхнюю оценку. "
+            "Optimizer state и sharding (ZeRO/FSDP) учтены приближённо; offload/8bit не учитываются."
+        )
+
         return {
+            "method": "estimate",
             "total_gb": round(total_gb, 2),
             "model_gb": round(static_gb, 2),
             "act_gb": round(act_gb, 2),
-            "params": total_params
+            "buf_gb": round(buffer_gb, 2),
+            "params": total_params,
+            "detail": detail,
+            "notes": notes,
         }
     except Exception as e:
-        print(f"Error calculating VRAM: {e}")
-        return {"total_gb": 0, "model_gb": 0, "act_gb": 0, "params": 0}
+        print(f"Error calculating VRAM estimate: {e}")
+        return {"method": "estimate", "total_gb": 0, "model_gb": 0, "act_gb": 0, "buf_gb": 0, "params": 0, "notes": str(e)}
+
+
+def _profile_memory_footprint_cuda(config, batch_size: int):
+    """
+    Точный (насколько возможно) замер по фактическим CUDA аллокациям:
+    - делаем warmup шаг, чтобы AdamW проинициализировал state
+    - затем меряем peak allocated/reserved на следующем шаге
+    Возвращаем breakdown: Model+Optim (steady), Act (peak - steady), Buf (reserved - peak).
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA недоступна")
+
+    # Собираем HomeForCausalLM (для Blueprint режима лучше делать отдельно; пока профилируем базовую Home модель)
+    from homellm.models.home_model import HomeConfig, HomeForCausalLM
+
+    vocab_size = int(config.get("vocab_size", 50257))
+    hidden_size = int(config["hidden_size"])
+    num_layers = int(config["num_layers"])
+    n_heads = int(config["n_heads"])
+    seq_len = int(config["seq_len"])
+
+    mp = (config.get("mixed_precision") or "no").lower()
+    if mp == "bf16":
+        dtype = torch.bfloat16
+    elif mp == "fp16":
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+
+    model_cfg = HomeConfig(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        num_hidden_layers=num_layers,
+        num_attention_heads=n_heads,
+        max_position_embeddings=seq_len,
+        dropout=float(config.get("dropout", 0.0)),
+    )
+
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+
+    model = HomeForCausalLM(model_cfg).to(device=device, dtype=dtype)
+    model.train()
+    if config.get("grad_checkpoint", False) and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+
+    opt_name = (config.get("optimizer") or "adamw").lower()
+    lr = float(config.get("lr", 1e-3))
+    wd = float(config.get("weight_decay", 0.01))
+    if opt_name == "adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+
+    def run_step():
+        input_ids = torch.randint(0, vocab_size, (int(batch_size), seq_len), device=device)
+        labels = input_ids.clone()
+        out = model(input_ids=input_ids, labels=labels, use_cache=False)
+        loss = out.loss
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    # Warmup: инициализация optimizer state + прогрев allocator'а
+    torch.cuda.synchronize()
+    run_step()
+    torch.cuda.synchronize()
+
+    # Измерение
+    torch.cuda.reset_peak_memory_stats(device)
+    alloc_before = torch.cuda.memory_allocated(device)
+    reserved_before = torch.cuda.memory_reserved(device)
+
+    run_step()
+    torch.cuda.synchronize()
+
+    peak_alloc = torch.cuda.max_memory_allocated(device)
+    peak_reserved = torch.cuda.max_memory_reserved(device)
+    alloc_after = torch.cuda.memory_allocated(device)
+
+    # Tensor-based breakdown (приближает "что именно живёт", независимо от caching allocator)
+    weights_bytes = 0
+    for p in model.parameters():
+        if p.is_cuda:
+            weights_bytes += int(p.numel() * p.element_size())
+    for b in model.buffers():
+        if torch.is_tensor(b) and b.is_cuda:
+            weights_bytes += int(b.numel() * b.element_size())
+
+    opt_state_bytes = 0
+    for st in optimizer.state.values():
+        opt_state_bytes += _sum_tensor_bytes(st)
+
+    # После zero_grad(set_to_none=True) градиенты не должны держать память
+    grads_bytes = 0
+    for p in model.parameters():
+        if p.grad is not None and p.grad.is_cuda:
+            grads_bytes += int(p.grad.numel() * p.grad.element_size())
+
+    steady_alloc = alloc_after
+    act_alloc = max(0, int(peak_alloc - steady_alloc))
+    buf_alloc = max(0, int(peak_reserved - peak_alloc))
+
+    total_peak = peak_reserved  # самый честный "сколько попросил у драйвера" на пике шага
+
+    return {
+        "method": "profile_cuda",
+        "total_gb": round(_bytes_to_gb(total_peak), 2),
+        "model_gb": round(_bytes_to_gb(steady_alloc), 2),
+        "act_gb": round(_bytes_to_gb(act_alloc), 2),
+        "buf_gb": round(_bytes_to_gb(buf_alloc), 2),
+        "params": int(sum(p.numel() for p in model.parameters())),
+        "detail": {
+            "alloc_before_gb": round(_bytes_to_gb(alloc_before), 3),
+            "reserved_before_gb": round(_bytes_to_gb(reserved_before), 3),
+            "peak_alloc_gb": round(_bytes_to_gb(peak_alloc), 3),
+            "peak_reserved_gb": round(_bytes_to_gb(peak_reserved), 3),
+            "alloc_after_gb": round(_bytes_to_gb(alloc_after), 3),
+            "tensor_weights_gb": round(_bytes_to_gb(weights_bytes), 3),
+            "tensor_opt_state_gb": round(_bytes_to_gb(opt_state_bytes), 3),
+            "tensor_grads_gb": round(_bytes_to_gb(grads_bytes), 3),
+        },
+        "notes": "Профилирование CUDA: warmup + измерение peak. 'Buf' = caching allocator (reserved - peak allocated).",
+    }
+
+
+def calculate_memory_footprint(config, batch_size, distributed_mode="default", num_gpus=1, *, method: str = "estimate"):
+    """
+    Возвращает оценку/замер VRAM для превью.
+    method:
+      - 'estimate': быстрая формула (fallback)
+      - 'profile_cuda': реальный замер на текущей GPU (может быть медленно/может OOM)
+    """
+    try:
+        if method == "profile_cuda":
+            return _profile_memory_footprint_cuda(config, batch_size=int(batch_size))
+        return _estimate_memory_footprint(config, batch_size=int(batch_size), distributed_mode=distributed_mode, num_gpus=num_gpus)
+    except Exception as e:
+        print(f"Error calculating VRAM ({method}): {e}")
+        # Фолбэк на оценку
+        out = _estimate_memory_footprint(config, batch_size=int(batch_size), distributed_mode=distributed_mode, num_gpus=num_gpus)
+        out["notes"] = f"{out.get('notes','')} | profile error: {e}"
+        return out
 
 
 def render_model_preview(config: dict, distributed_config: dict = None):
@@ -2443,8 +2724,16 @@ def render_model_preview(config: dict, distributed_config: dict = None):
     batch_size = config.get("batch_size", 1)
     dist_mode = distributed_config.get("distributed_mode", "default") if distributed_config else "default"
     n_gpus = distributed_config.get("num_gpus", 1) if distributed_config else 1
-    
-    mem_info = calculate_memory_footprint(config, batch_size, dist_mode, n_gpus)
+
+    mem_method = "estimate"
+    if torch.cuda.is_available():
+        with st.expander("🧠 Память GPU: оценка vs точный замер", expanded=False):
+            st.caption("Оценка — мгновенно, но приблизительно. Точный замер — запускает 2 train-step на GPU (warmup + измерение) и может быть медленным/может упасть по OOM.")
+            do_profile = st.checkbox("Сделать точный замер на CUDA (2 шага)", value=False, key="profile_vram_cuda")
+            if do_profile:
+                mem_method = "profile_cuda"
+
+    mem_info = calculate_memory_footprint(config, batch_size, dist_mode, n_gpus, method=mem_method)
     
     col1, col2, col3 = st.columns(3)
     
@@ -2464,23 +2753,25 @@ def render_model_preview(config: dict, distributed_config: dict = None):
         color = "normal"
         if val > 24: color = "off" # красный оттенок в дельте обычно
         
+        title = "VRAM (Profile)" if mem_info.get("method") == "profile_cuda" else "VRAM (Estimate)"
         st.metric(
-            "VRAM (Estimate)", 
-            f"{val:.1f} GB", 
+            title,
+            f"{val:.1f} GB",
             delta=f"M: {mem_info['model_gb']} + A: {mem_info['act_gb']} GB",
             delta_color=color,
-            help="M: Static Model Memory (Weights+Optim)\nA: Activations (Batch Size dependent)"
+            help=(mem_info.get("notes") or "M: Model+Optim (steady)\nA: Activations/temporaries (peak - steady)\nBuf: caching allocator")
         )
     
     # Визуализация использования памяти
     if mem_info["total_gb"] > 0:
-        st.caption("📊 Примерное распределение памяти GPU:")
+        st.caption("📊 Распределение памяти GPU:")
         
         # Создаем простой бар чарт через HTML/CSS для наглядности
         total = mem_info["total_gb"]
         p_model = (mem_info["model_gb"] / total) * 100
         p_act = (mem_info["act_gb"] / total) * 100
-        p_buff = 100 - p_model - p_act
+        buf_gb = float(mem_info.get("buf_gb", 0.0))
+        p_buff = (buf_gb / total) * 100 if total > 0 else 0
         
         st.markdown(f"""
         <div style="display: flex; height: 20px; width: 100%; background: #333; border-radius: 4px; overflow: hidden; margin-top: 5px;">
@@ -2493,6 +2784,13 @@ def render_model_preview(config: dict, distributed_config: dict = None):
             <span>Activations: {mem_info['act_gb']} GB</span>
         </div>
         """, unsafe_allow_html=True)
+
+        if mem_info.get("notes"):
+            st.caption(mem_info["notes"])
+
+        if mem_info.get("method") == "profile_cuda" and isinstance(mem_info.get("detail"), dict):
+            with st.expander("🔍 Детали замера (CUDA allocator / tensor sums)", expanded=False):
+                st.json(mem_info["detail"])
 
         if mem_info["act_gb"] > mem_info["model_gb"] * 2:
             st.warning("⚠️ Активации занимают много памяти! Включите Gradient Checkpointing или уменьшите Batch Size.")
@@ -2679,7 +2977,7 @@ def main():
     st.session_state.current_model_name = model_config.get("model_name_input", "home_model")
     
     training_config = render_training_config()
-    distributed_config = render_distributed_config()
+    distributed_config = render_distributed_config(training_config=training_config)
     
     # Передаем stage в dataset_config
     dataset_config = render_dataset_config(stage=model_config.get("stage", "pretrain"))
