@@ -1229,6 +1229,9 @@ def render_model_config():
         n_heads = num_attention_heads
         seq_len = max_position_embeddings
         
+        # Слайдеры отключены — параметры зафиксированы
+        disabled_sliders = True
+        
         # Отображаем просто текстом/метриками
         c1, c2 = st.sidebar.columns(2)
         c1.metric("Hidden Size", hidden_size)
@@ -1236,7 +1239,7 @@ def render_model_config():
         c1.metric("Heads", n_heads)
         c2.metric("Seq Len", seq_len)
         
-        st.sidebar.info("🔒 Параметры зафиксированы (наследуются от базы)")
+        st.sidebar.info("🔒 Параметры зафиксированы (наследуются от базовой модели)")
         
     else:
         # Дефолтные значения
@@ -2604,9 +2607,7 @@ def _estimate_memory_footprint(config, batch_size, distributed_mode="default", n
         }
 
         notes = (
-            "Оценка без сборки модели: параметры считаются по точной схеме Home (qkv/o + SwiGLU MLP + RMSNorm). "
-            "Act включает logits (B×S×V). Для attention считаются два сценария: flash (без S×S) и math (с S×S, fp32 softmax) — auto берёт верхнюю оценку. "
-            "Optimizer state и sharding (ZeRO/FSDP) учтены приближённо; offload/8bit не учитываются."
+            "Приближенная оценка памяти занимаемая моделью"
         )
 
         return {
@@ -2786,12 +2787,12 @@ def render_model_preview(config: dict, distributed_config: dict = None):
     n_gpus = distributed_config.get("num_gpus", 1) if distributed_config else 1
 
     mem_method = "estimate"
-    if torch.cuda.is_available():
-        with st.expander("🧠 Память GPU: оценка vs точный замер", expanded=False):
-            st.caption("Оценка — мгновенно, но приблизительно. Точный замер — запускает 2 train-step на GPU (warmup + измерение) и может быть медленным/может упасть по OOM.")
-            do_profile = st.checkbox("Сделать точный замер на CUDA (2 шага)", value=False, key="profile_vram_cuda")
-            if do_profile:
-                mem_method = "profile_cuda"
+    # if torch.cuda.is_available():
+    #     with st.expander("🧠 Память GPU: оценка vs точный замер", expanded=False):
+    #         st.caption("Оценка — мгновенно, но приблизительно. Точный замер — запускает 2 train-step на GPU (warmup + измерение) и может быть медленным/может упасть по OOM.")
+    #         do_profile = st.checkbox("Сделать точный замер на CUDA (2 шага)", value=False, key="profile_vram_cuda")
+    #         if do_profile:
+    #             mem_method = "profile_cuda"
 
     mem_info = calculate_memory_footprint(config, batch_size, dist_mode, n_gpus, method=mem_method)
     

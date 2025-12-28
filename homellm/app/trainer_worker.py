@@ -395,7 +395,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             # ВАЖНО: Шардирование делает accelerate.prepare() через DataLoaderShard/Dispatcher
             # Датасет только делает train/val split, но НЕ шардирует между процессами (shard=False)
             if stage == "sft":
-                from homellm.training.sft import SFTDataset
+                # SFTDataset уже импортирован глобально
                 # reuse effective_shard_mode from above if set, otherwise compute here
                 effective_shard_mode = "dataset" if sharding_mode == "auto" else sharding_mode
                 ds_shard = (effective_shard_mode == "dataset")
