@@ -375,15 +375,39 @@ PARALLEL_TYPES = {
 }
 
 
-def estimate_parameters(hidden_size: int, num_layers: int, vocab_size: int = 50257) -> int:
-    """Примерная оценка количества параметров."""
-    # Embedding: vocab_size * hidden_size
-    embed = vocab_size * hidden_size
-    # Each layer: attention (4 * hidden^2) + FFN (8 * hidden^2) + norms
-    per_layer = 4 * hidden_size ** 2 + 8 * hidden_size ** 2 + 2 * hidden_size
-    # LM head is tied, so not counted
-    total = embed + num_layers * per_layer
-    return total
+def estimate_parameters(
+    hidden_size: int,
+    num_layers: int,
+    vocab_size: int = 50257,
+    intermediate_size: int | None = None,
+) -> int:
+    """
+    Оценка количества параметров для нашей `HomeModel` (см. `homellm/models/home_model.py`).
+
+    ВАЖНО:
+    - У нас RoPE (позиционные эмбеддинги НЕ обучаемые) => `seq_len` на число параметров не влияет.
+    - lm_head weight tied к embed_tokens => не удваиваем vocab*hidden.
+    """
+    h = int(hidden_size)
+    l = int(num_layers)
+    v = int(vocab_size)
+    i = int(intermediate_size) if intermediate_size is not None else int(h * 4)
+
+    # Embedding
+    embed = v * h
+
+    # Per-layer:
+    # - Attention: q/k/v/out, bias=False => 4 * (H*H)
+    attn = 4 * h * h
+    # - SwiGLU MLP: w1(H->I), w2(I->H), w3(H->I), bias=False => 3 * (H*I)
+    mlp = 3 * h * i
+    # - RMSNorm weights: 2 * H
+    norms = 2 * h
+
+    # Final norm
+    final_norm = h
+
+    return int(embed + l * (attn + mlp + norms) + final_norm)
 
 
 def format_params(n: int) -> str:
@@ -1129,26 +1153,44 @@ def render_model_config():
     
     if selected_stage in ("sft", "continual_pretrain") and base_model_path:
         # Пытаемся загрузить конфиг
+        # ВАЖНО: различаем run_config.json (training params) и config.json (model params)
         try:
             base_path = Path(base_model_path)
-            # Вариант 1: config.json прямо в папке (final_model)
-            cfg_path = base_path / "config.json"
-            # Вариант 2: это чекпоинт
-            if not cfg_path.exists():
-                # Пробуем найти run_config.json в родительской
-                if (base_path.parent / "run_config.json").exists():
-                    cfg_path = base_path.parent / "run_config.json"
-                elif (base_path / "run_config.json").exists(): # иногда сохраняем так
-                     cfg_path = base_path / "run_config.json"
+            cfg_path = None
+            cfg_type = None  # "run" или "model"
             
-            if cfg_path.exists():
+            # 1. Сначала ищем run_config.json (полный training config)
+            # Для чекпоинтов: checkpoint_step6800 -> parent/run_config.json
+            if (base_path.parent / "run_config.json").exists():
+                cfg_path = base_path.parent / "run_config.json"
+                cfg_type = "run"
+            elif (base_path / "run_config.json").exists():
+                cfg_path = base_path / "run_config.json"
+                cfg_type = "run"
+            # 2. Если run_config нет — используем config.json (только model params)
+            elif (base_path / "config.json").exists():
+                cfg_path = base_path / "config.json"
+                cfg_type = "model"
+            
+            if cfg_path and cfg_path.exists():
                 with open(cfg_path) as f:
                     loaded_config = json.load(f)
-                st.sidebar.success("✅ Параметры загружены из базовой модели")
+                if cfg_type == "run":
+                    st.sidebar.success("✅ Параметры загружены из run_config.json")
+                else:
+                    # config.json содержит только параметры модели, нужно адаптировать ключи
+                    # transformers config -> наш формат
+                    if "num_hidden_layers" in loaded_config and "num_layers" not in loaded_config:
+                        loaded_config["num_layers"] = loaded_config["num_hidden_layers"]
+                    if "num_attention_heads" in loaded_config and "n_heads" not in loaded_config:
+                        loaded_config["n_heads"] = loaded_config["num_attention_heads"]
+                    if "max_position_embeddings" in loaded_config and "seq_len" not in loaded_config:
+                        loaded_config["seq_len"] = loaded_config["max_position_embeddings"]
+                    st.sidebar.info("ℹ️ Параметры модели загружены из config.json (training params не найдены)")
             else:
-                st.sidebar.warning("⚠️ config.json не найден, введите параметры вручную")
+                st.sidebar.warning("⚠️ Конфиг не найден, введите параметры вручную")
         except Exception as e:
-             st.sidebar.error(f"Ошибка чтения config.json: {e}")
+             st.sidebar.error(f"Ошибка чтения config: {e}")
 
     st.sidebar.subheader("⚙️ Параметры модели")
 
@@ -1320,8 +1362,16 @@ def render_model_config():
         if valid_heads:
             st.sidebar.info(f"Рекомендуемые значения n_heads: {', '.join(valid_heads)}")
     
-    # Оценка параметров
-    est_params = estimate_parameters(hidden_size, num_layers)
+    # Оценка параметров (HomeModel RoPE/SwiGLU)
+    # Используем loaded_config если есть, иначе дефолты
+    vocab_size = int(loaded_config.get("vocab_size", 50257)) if loaded_config else 50257
+    intermediate_size = int(loaded_config.get("intermediate_size") or (int(hidden_size) * 4)) if loaded_config else (int(hidden_size) * 4)
+    est_params = estimate_parameters(
+        hidden_size,
+        num_layers,
+        vocab_size=vocab_size,
+        intermediate_size=intermediate_size,
+    )
     st.sidebar.metric("Параметры (≈)", format_params(est_params))
     
     # Model ID для pretrain from scratch (опционально, для HF моделей)
@@ -1435,6 +1485,28 @@ def render_training_config():
         format_func=lambda x: f"{x:.0e}"
     )
 
+    lr_schedule_label = st.sidebar.selectbox(
+        "LR scheduler",
+        options=[
+            "Cosine (with warmup)",
+            "Linear (with warmup)",
+            "Constant (with warmup)",
+            "Cosine with Restarts (with warmup)",
+        ],
+        index=0,
+        help=(
+            "Выберите как менять learning rate по мере обучения. "
+            "Важно: scheduler шагает на update-step (после grad_accum), не на каждом micro-batch."
+        ),
+    )
+    lr_schedule_map = {
+        "Cosine (with warmup)": "cosine",
+        "Linear (with warmup)": "linear",
+        "Constant (with warmup)": "constant_with_warmup",
+        "Cosine with Restarts (with warmup)": "cosine_with_restarts",
+    }
+    lr_schedule = lr_schedule_map[lr_schedule_label]
+
     min_lr_ratio = st.sidebar.slider(
         "Min LR Ratio (Cosine floor)",
         min_value=0.0,
@@ -1449,6 +1521,15 @@ def render_training_config():
         min_value=0,
         max_value=10000,
         value=1000
+    )
+
+    scheduler_resync_on_resume = st.sidebar.checkbox(
+        "Resync LR scheduler при resume (фикс для старых чекпоинтов)",
+        value=True,
+        help=(
+            "Если чекпоинт был сохранён со scheduler, который шагал по micro-batch (а не по update-step), "
+            "LR при resume может стать почти 0. Этот флаг принудительно выставляет scheduler на global_step."
+        ),
     )
     
     # Выбор: epochs или max_steps
@@ -1548,8 +1629,10 @@ def render_training_config():
         "batch_size": batch_size,
         "gradient_accumulation": grad_accum,
         "learning_rate": learning_rate,
+        "lr_schedule": lr_schedule,
         "min_lr_ratio": min_lr_ratio,
         "warmup_steps": warmup_steps,
+        "scheduler_resync_on_resume": scheduler_resync_on_resume,
         "epochs": epochs,
         "max_steps": max_steps,
         "mixed_precision": mixed_precision,
@@ -1601,6 +1684,15 @@ def render_output_config(model_name="training_run"):
         step=100,
         help="Как часто сохранять чекпоинты"
     )
+
+    export_on_checkpoint = st.sidebar.checkbox(
+        "Экспортировать final_model при каждом сохранении чекпоинта",
+        value=True,
+        help=(
+            "Будет обновлять `final_model/` на каждом checkpoint, чтобы модель можно было сразу грузить в чат. "
+            "Минус: дополнительное время и место на диске."
+        ),
+    )
     
     log_every = st.sidebar.number_input(
         "Log Every N Steps",
@@ -1625,6 +1717,7 @@ def render_output_config(model_name="training_run"):
     return {
         "output_dir": output_dir,
         "save_every": save_every,
+        "export_on_checkpoint": export_on_checkpoint,
         "log_every": log_every,
         "tokenizer_path": "gpt2"
     }
@@ -3311,12 +3404,29 @@ def main():
                     temperature = st.slider("Temperature", 0.1, 2.0, 0.8, 0.1)
                 with gen_col3:
                     top_p = st.slider("Top-p", 0.1, 1.0, 0.9, 0.05)
+
+                # Режим промпта (2 режима, но дефолт выбираем автоматически):
+                # - если у модели есть chat_template -> Диалог
+                # - если нет -> Completion
+                if "chat_prompt_mode" not in st.session_state:
+                    st.session_state.chat_prompt_mode = "completion"  # до загрузки модели
+                prompt_mode_label = st.selectbox(
+                    "Режим промпта",
+                    options=["Диалог (chat_template)", "Completion (plain text)"],
+                    index=0 if st.session_state.chat_prompt_mode == "chat" else 1,
+                    help="По умолчанию: если у модели есть chat_template — включаем Диалог, иначе Completion. Можно переключить вручную.",
+                    key="chat_prompt_mode_select",
+                )
+                prompt_mode = "chat" if prompt_mode_label.startswith("Диалог") else "completion"
+                st.session_state.chat_prompt_mode = prompt_mode
             
             # Инициализация чата
             if "chat_model" not in st.session_state:
                 st.session_state.chat_model = None
                 st.session_state.chat_tokenizer = None
                 st.session_state.chat_model_path = None
+                st.session_state.chat_has_template = False
+                st.session_state.chat_prompt_mode = "completion"
             
             if "messages" not in st.session_state:
                 st.session_state.messages = []
@@ -3328,9 +3438,11 @@ def main():
                         try:
                             from transformers import AutoTokenizer, AutoModelForCausalLM
                             from homellm.models.adapters import detect_model_type
+                            from homellm.models.home_model import HomeForCausalLM
                             
                             model_path = Path(selected_model["path"])
                             device = "cuda" if torch.cuda.is_available() else "cpu"
+                            dtype = torch.float16 if device == "cuda" else torch.float32
                             
                             # Проверяем наличие config.json
                             config_json = model_path / "config.json"
@@ -3339,38 +3451,56 @@ def main():
                             
                             # Определяем тип модели
                             model_type = detect_model_type(model_path)
+                            st.info(f"Загружаем {model_type.upper()} модель...")
                             
                             # Загружаем токенизатор
-                            tokenizer_json = model_path / "tokenizer.json"
-                            tokenizer_config = model_path / "tokenizer_config.json"
+                            try:
+                                tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+                            except Exception:
+                                # Для accelerate checkpoint'ов токенизатора обычно нет внутри checkpoint_stepXXXX.
+                                # Пробуем взять tokenizer_path/base_model_path из run config.
+                                tokenizer = None
+                                try:
+                                    run_root = model_path.parent if "checkpoint" in model_path.name else model_path
+                                    run_id = run_root.name
+                                    run_cfg_path = RUNS_DIR / run_id / "config.json"
+                                    if run_cfg_path.exists():
+                                        with open(run_cfg_path, "r", encoding="utf-8") as f:
+                                            run_cfg = json.load(f)
+                                        tok_src = run_cfg.get("tokenizer_path") or run_cfg.get("base_model_path")
+                                        if tok_src:
+                                            tokenizer = AutoTokenizer.from_pretrained(str(tok_src), trust_remote_code=True)
+                                except Exception:
+                                    tokenizer = None
+
+                                if tokenizer is None:
+                                    tokenizer = AutoTokenizer.from_pretrained("gpt2")
                             
-                            if tokenizer_json.exists() or tokenizer_config.exists():
-                                # Токенизатор есть в модели
-                                st.info(f"Загружаем {model_type.upper()} модель...")
-                                st.session_state.chat_tokenizer = AutoTokenizer.from_pretrained(
-                                    str(model_path),
-                                    trust_remote_code=True
-                                )
+                            # Загружаем модель в зависимости от типа
+                            if model_type == "home":
+                                model = HomeForCausalLM.from_pretrained(str(model_path), torch_dtype=dtype)
                             else:
-                                # Fallback на gpt2 токенизатор
-                                st.warning("Токенизатор не найден в модели, используем gpt2")
-                                st.session_state.chat_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+                                model = AutoModelForCausalLM.from_pretrained(
+                                    str(model_path), trust_remote_code=True, torch_dtype=dtype
+                                )
+                            
+                            # Переносим на device
+                            model = model.to(device)
+                            model.eval()
                             
                             # Подготавливаем токенизатор (pad_token = eos_token)
-                            if st.session_state.chat_tokenizer.pad_token is None:
-                                if st.session_state.chat_tokenizer.eos_token:
-                                    st.session_state.chat_tokenizer.pad_token = st.session_state.chat_tokenizer.eos_token
+                            if tokenizer.pad_token is None:
+                                if tokenizer.eos_token:
+                                    tokenizer.pad_token = tokenizer.eos_token
                             
-                            # Загружаем модель через AutoModelForCausalLM (универсально для всех типов)
-                            st.session_state.chat_model = AutoModelForCausalLM.from_pretrained(
-                                str(model_path),
-                                trust_remote_code=True,
-                                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-                            ).to(device)
-                            
-                            st.session_state.chat_model.eval()
+                            st.session_state.chat_model = model
+                            st.session_state.chat_tokenizer = tokenizer
                             st.session_state.chat_model_path = str(model_path)
                             st.session_state.messages = []
+                            # Автоподтягивание режима: если у токенизатора есть chat_template, ставим "Диалог",
+                            # иначе "Completion". Пользователь может переключить вручную после загрузки.
+                            st.session_state.chat_has_template = bool(getattr(tokenizer, "chat_template", None))
+                            st.session_state.chat_prompt_mode = "chat" if st.session_state.chat_has_template else "completion"
                             st.success("✅ Модель загружена!")
                             st.rerun()
                         except Exception as e:
@@ -3504,14 +3634,19 @@ def main():
                                     device = next(model.parameters()).device
                                     
                                     # Формируем полный контекст
-                                    # Используем chat_template если он есть (для SFT моделей)
-                                    # Иначе просто склеиваем текст (для Pretrain моделей)
+                                    # Пользователь контролирует режим: auto/chat_template/plain
                                     
                                     # Берем историю + новое сообщение
                                     conversation = st.session_state.messages.copy() # [{"role": "user", ...}, ...]
                                     
-                                    # Обработка системного промпта (только для моделей с chat_template)
-                                    if tokenizer.chat_template:
+                                    has_template = bool(getattr(tokenizer, "chat_template", None))
+                                    use_chat_template = (prompt_mode == "chat") and has_template
+                                    if prompt_mode == "chat" and not has_template:
+                                        st.warning("У выбранной модели нет chat_template — использую Completion.")
+                                        use_chat_template = False
+
+                                    # Обработка системного промпта (только для режима chat_template)
+                                    if use_chat_template:
                                         system_prompt = st.session_state.get("system_prompt", "").strip()
                                         
                                         # Удаляем существующее системное сообщение из conversation (если есть)
@@ -3524,7 +3659,7 @@ def main():
                                             conversation.insert(0, {"role": "system", "content": system_prompt})
                                         # Если системный промпт пустой, шаблон использует дефолтный из модели
                                     
-                                    if tokenizer.chat_template:
+                                    if use_chat_template:
                                         # Для SFT модели: применяем шаблон с тегами
                                         prompt_text = tokenizer.apply_chat_template(
                                             conversation, 
@@ -3540,9 +3675,68 @@ def main():
                                             prompt_text += f"{m['role']}: {m['content']}\n"
                                         prompt_text += "assistant: "
                                     
-                                    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+                                    # ВАЖНО:
+                                    # - inputs должны быть на ТОМ ЖЕ устройстве, что и модель (модель может быть на cuda:1)
+                                    # - заранее проверяем, что token ids не выходят за vocab модели (иначе будет CUDA assert)
+                                    device = next(model.parameters()).device
+                                    device_type = str(device.type)
+
+                                    enc = tokenizer(prompt_text, return_tensors="pt")
+                                    try:
+                                        if hasattr(model, "get_input_embeddings") and model.get_input_embeddings() is not None:
+                                            vocab_size = int(model.get_input_embeddings().weight.shape[0])
+                                            max_id = int(enc["input_ids"].max().item())
+                                            min_id = int(enc["input_ids"].min().item())
+                                            if min_id < 0 or max_id >= vocab_size:
+                                                raise ValueError(
+                                                    f"Tokenizer выдаёт token_id вне vocab модели: min_id={min_id}, max_id={max_id}, "
+                                                    f"vocab_size(model)={vocab_size}. "
+                                                    f"Проверьте, что с моделью загружен правильный tokenizer (тот же, что был при обучении)."
+                                                )
+                                    except Exception as e:
+                                        raise RuntimeError(f"Проблема токенизации/вокаба перед генерацией: {e}")
+
+                                    inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in enc.items()}
                                     
-                                    with torch.no_grad():
+                                    # Приводим dtype для стабильной генерации (особенно после SFT checkpoints bf16)
+                                    model_dtype = next(model.parameters()).dtype
+                                    autocast_enabled = (device_type == "cuda")
+                                    autocast_dtype = torch.bfloat16 if model_dtype == torch.bfloat16 else torch.float16
+
+                                    # attention_mask должен оставаться int/bool (не bf16/fp16).
+
+                                    # Ограничиваем контекстное окно (иначе возможен CUDA index out of bounds при позиционных индексах).
+                                    max_ctx = None
+                                    try:
+                                        cfg = getattr(model, "config", None)
+                                        for key in ("max_position_embeddings", "n_positions", "seq_len", "max_seq_len"):
+                                            if cfg is not None and hasattr(cfg, key):
+                                                v = getattr(cfg, key)
+                                                if v is not None:
+                                                    max_ctx = int(v)
+                                                    break
+                                    except Exception:
+                                        max_ctx = None
+
+                                    if max_ctx is not None and max_ctx > 0 and "input_ids" in inputs:
+                                        in_len = int(inputs["input_ids"].shape[1])
+                                        if in_len > max_ctx:
+                                            cut = in_len - max_ctx
+                                            inputs["input_ids"] = inputs["input_ids"][:, cut:]
+                                            if "attention_mask" in inputs and hasattr(inputs["attention_mask"], "shape"):
+                                                inputs["attention_mask"] = inputs["attention_mask"][:, cut:]
+                                            in_len = int(inputs["input_ids"].shape[1])
+
+                                        allowed_new = int(max_ctx - in_len)
+                                        if allowed_new <= 0:
+                                            raise RuntimeError(
+                                                f"Контекст уже достиг максимума модели (max_ctx={max_ctx}). "
+                                                f"Уменьшите историю/системный промпт или используйте модель с большим контекстом."
+                                            )
+                                        if int(max_tokens) > allowed_new:
+                                            max_tokens = allowed_new
+
+                                    with torch.no_grad(), torch.autocast(device_type=device_type, dtype=autocast_dtype, enabled=autocast_enabled):
                                         outputs = model.generate(
                                             **inputs,
                                             max_new_tokens=max_tokens,
@@ -3561,7 +3755,10 @@ def main():
                                     st.write(response)
                                     st.session_state.messages.append({"role": "assistant", "content": response})
                                 except Exception as e:
+                                    import traceback
+                                    st.session_state.last_chat_error = traceback.format_exc()
                                     st.error(f"Ошибка генерации: {e}")
+                                    st.code(st.session_state.last_chat_error)
                 
                 # Кнопка очистки чата
                 if st.session_state.messages:

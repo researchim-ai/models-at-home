@@ -22,6 +22,7 @@ from accelerate.utils import DataLoaderConfiguration
 from transformers import (
     AutoTokenizer,
     get_cosine_schedule_with_warmup,
+    get_scheduler,
     DataCollatorForLanguageModeling,
 )
 
@@ -553,12 +554,15 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             weight_decay=config.get("weight_decay", 0.1)
         )
         # LR scheduler
-        # По умолчанию cosine schedule уходит к ~0 к концу (это нормальное поведение).
-        # Если нужно, можно задать min_lr_ratio (например 0.05), чтобы LR не падал ниже 5% от base LR.
+        # ВАЖНО: мы шагаем scheduler на UPDATE-step (когда accelerator.sync_gradients=True).
+        # Для resume из старых чекпоинтов это критично: раньше scheduler мог шагать по micro-step,
+        # и тогда на resume LR становится ~0.
+        lr_schedule = str(config.get("lr_schedule", "cosine")).strip().lower()
         min_lr_ratio = float(config.get("min_lr_ratio", 0.0) or 0.0)
-        warmup_steps = int(config["warmup_steps"])
+        warmup_steps = int(config.get("warmup_steps", 0))
         total_steps_for_sched = int(max_train_steps)
-        if min_lr_ratio > 0:
+
+        if lr_schedule in ("cosine", "cosine_with_warmup") and min_lr_ratio > 0:
             import math as _math
             from torch.optim.lr_scheduler import LambdaLR
 
@@ -573,13 +577,22 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 return float(min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
 
             lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-            metrics.update(min_lr_ratio=min_lr_ratio)
         else:
-            lr_scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
+            # get_scheduler поддерживает: linear/cosine/constant/cosine_with_restarts/...
+            # Для совместимости: старое значение "cosine_with_warmup" маппим в "cosine".
+            sched_name = "cosine" if lr_schedule == "cosine_with_warmup" else lr_schedule
+            lr_scheduler = get_scheduler(
+                name=sched_name,
+                optimizer=optimizer,
                 num_warmup_steps=warmup_steps,
                 num_training_steps=total_steps_for_sched,
             )
+
+        metrics.update(
+            scheduler=str(lr_schedule),
+            warmup_steps=int(warmup_steps),
+            min_lr_ratio=float(min_lr_ratio),
+        )
         
         # IMPORTANT (Sharding contract):
         # У нас ДВА возможных способа шардирования данных:
@@ -697,11 +710,41 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         output_dir = Path(config["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Сохраняем run_config.json в папку эксперимента для загрузки при resume
+        if accelerator.is_main_process:
+            run_config_path = output_dir / "run_config.json"
+            if not run_config_path.exists():  # Не перезаписываем при resume
+                with open(run_config_path, "w", encoding="utf-8") as f:
+                    json.dump(config, f, ensure_ascii=False, indent=2)
+                logger.info(f"Saved run_config.json to {run_config_path}")
+        
         metrics.update(status="training")
         
         # ВАЖНО: Синхронизируем global_step с starting_step после resume
         # Это критично для правильной работы LR scheduler и checkpointing
         global_step = starting_step
+        # ВАЖНО: ресинхронизируем scheduler к update-step индексу.
+        # Это лечит ситуацию, когда scheduler в чекпоинте был "прокручен" по micro-step и LR улетает в ~0.
+        if starting_step > 0 and bool(config.get("scheduler_resync_on_resume", True)):
+            try:
+                lr_scheduler.step(int(global_step))
+                if accelerator.is_main_process:
+                    metrics.update(resume_scheduler_resynced=True, resume_scheduler_step=int(global_step))
+            except TypeError:
+                # fallback для scheduler-ов без аргумента step(epoch)
+                try:
+                    lr_scheduler.last_epoch = int(global_step)
+                    lr_scheduler.step()
+                    if accelerator.is_main_process:
+                        metrics.update(resume_scheduler_resynced=True, resume_scheduler_step=int(global_step))
+                except Exception as e:
+                    logger.warning(f"Failed to resync LR scheduler on resume: {e}")
+                    if accelerator.is_main_process:
+                        metrics.update(resume_scheduler_resynced=False, resume_scheduler_error=str(e))
+            except Exception as e:
+                logger.warning(f"Failed to resync LR scheduler on resume: {e}")
+                if accelerator.is_main_process:
+                    metrics.update(resume_scheduler_resynced=False, resume_scheduler_error=str(e))
         
         # Функция для валидации (использует eval_batches из замыкания)
         def evaluate(val_loader):
@@ -1003,7 +1046,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                                     "learning_rate": float(config.get("learning_rate", 0.0)),
                                     "warmup_steps": int(config.get("warmup_steps", 0)),
                                     "min_lr_ratio": float(config.get("min_lr_ratio", 0.0) or 0.0),
-                                    "scheduler": "cosine_with_warmup",
+                                    "scheduler": str(config.get("lr_schedule", "cosine")),
                                     "timestamp": datetime.now().isoformat(),
                                 }
                                 with open(ckpt_path / "checkpoint_metadata.json", "w", encoding="utf-8") as f:
@@ -1014,6 +1057,54 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                         if accelerator.is_main_process:
                             model_config.save_pretrained(ckpt_path)
                             metrics.log_checkpoint(str(ckpt_path))
+
+                            # (Опционально) Экспортируем инференс-модель для чата при каждом checkpoint.
+                            # Это НЕ resume-state, а просто удобный "latest final_model" для загрузки.
+                            if bool(config.get("export_on_checkpoint", True)):
+                                try:
+                                    import shutil
+                                    tmp_dir = output_dir / "final_model.__tmp__"
+                                    final_dir = output_dir / "final_model"
+                                    if tmp_dir.exists():
+                                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                                    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+                                    # SFT: убедимся, что chat_template попадает в tokenizer_config.json
+                                    if stage == "sft" and config.get("sft_template"):
+                                        tmpl = config["sft_template"]
+                                        default_sys = tmpl.get("system", "You are a helpful assistant.")
+                                        u_tag = tmpl.get("user_tag", "### User:")
+                                        b_tag = tmpl.get("bot_tag", "### Assistant:")
+                                        default_sys_escaped = default_sys.replace("'", "\\'")
+                                        u_tag_escaped = u_tag.replace("'", "\\'")
+                                        b_tag_escaped = b_tag.replace("'", "\\'")
+                                        tokenizer.chat_template = (
+                                            "{% if messages and messages[0]['role'] == 'system' %}"
+                                            "{{ messages[0]['content'] }}\n\n"
+                                            "{% else %}"
+                                            f"{{{{ '{default_sys_escaped}' }}}}\n\n"
+                                            "{% endif %}"
+                                            "{% for message in messages %}"
+                                            "{% if message['role'] == 'user' %}"
+                                            f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                                            "{% elif message['role'] == 'assistant' %}"
+                                            f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                                            "{% endif %}"
+                                            "{% endfor %}"
+                                            "{% if add_generation_prompt %}"
+                                            f"{b_tag_escaped}\n"
+                                            "{% endif %}"
+                                        )
+
+                                    adapter.save_final(accelerator, model, tokenizer, tmp_dir)
+
+                                    # Атомарно заменяем final_model
+                                    if final_dir.exists():
+                                        shutil.rmtree(final_dir, ignore_errors=True)
+                                    tmp_dir.rename(final_dir)
+                                    logger.info(f"Updated final_model at checkpoint step {global_step}")
+                                except Exception as e:
+                                    logger.warning(f"Failed to export final_model on checkpoint: {e}")
                     
                     # Validation
                     # ВАЖНО: evaluate() вызывается на всех процессах, т.к. val_loader зашардирован
