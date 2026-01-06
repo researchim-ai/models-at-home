@@ -195,15 +195,22 @@ class MetricsLogger:
         
         self._save()
     
-    def log_checkpoint(self, path: str):
+    def log_checkpoint(self, path: str, loss: float = None):
         if not self.enabled:
             return
         
-        self.metrics["checkpoints"].append({
+        checkpoint_data = {
             "path": path,
             "step": self.metrics["current_step"],
             "time": datetime.now().isoformat()
-        })
+        }
+        # Добавляем loss если передан
+        if loss is not None:
+            checkpoint_data["loss"] = float(loss)
+        elif "current_loss" in self.metrics:
+            checkpoint_data["loss"] = float(self.metrics["current_loss"])
+        
+        self.metrics["checkpoints"].append(checkpoint_data)
         self._save()
     
     def log_eval(self, step: int, val_loss: float):
@@ -1056,7 +1063,9 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
                             model_config.save_pretrained(ckpt_path)
-                            metrics.log_checkpoint(str(ckpt_path))
+                            # Передаем текущий loss в чекпоинт
+                            current_loss = metrics.metrics.get("current_loss", 0.0)
+                            metrics.log_checkpoint(str(ckpt_path), loss=current_loss)
 
                             # (Опционально) Экспортируем инференс-модель для чата при каждом checkpoint.
                             # Это НЕ resume-state, а просто удобный "latest final_model" для загрузки.

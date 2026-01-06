@@ -1957,8 +1957,35 @@ def render_metrics_dashboard(metrics: dict):
     
     st.subheader(f"{status_emoji} Статус: {status.upper()}")
     
+    # Параметры модели из metrics.json (если есть) или из config
+    model_params = None
+    try:
+        # Сначала пробуем взять из metrics.json (более точно)
+        if "num_parameters" in metrics:
+            model_params = metrics["num_parameters"]
+        else:
+            # Fallback: рассчитываем из config
+            run_id = st.session_state.get("current_run_id", "active")
+            if run_id and run_id != "active":
+                run_dir = RUNS_DIR / run_id
+                config_path = run_dir / "config.json"
+                if config_path.exists():
+                    with open(config_path) as f:
+                        rc = json.load(f)
+                        if "hidden_size" in rc and "num_layers" in rc:
+                            vocab_size = rc.get("vocab_size", 50257)
+                            intermediate_size = rc.get("intermediate_size")
+                            model_params = estimate_parameters(
+                                rc["hidden_size"],
+                                rc["num_layers"],
+                                vocab_size=vocab_size,
+                                intermediate_size=intermediate_size,
+                            )
+    except Exception:
+        pass
+    
     # Metrics cards
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     
     with col1:
         current_step = metrics.get("current_step", 0)
@@ -1984,6 +2011,12 @@ def render_metrics_dashboard(metrics: dict):
     with col4:
         lr = metrics.get("current_lr", 0)
         st.metric("Learning Rate", f"{lr:.2e}")
+    
+    with col5:
+        if model_params:
+            st.metric("Параметры", format_params(model_params))
+        else:
+            st.metric("Параметры", "—")
 
     # Доп. пояснения: план vs факт, причина остановки, LR floor
     planned_total = metrics.get("planned_total_steps", None)
@@ -1997,7 +2030,7 @@ def render_metrics_dashboard(metrics: dict):
     if min_lr_ratio is not None and float(min_lr_ratio) > 0:
         st.caption(f"Cosine LR floor включён: min_lr_ratio={float(min_lr_ratio):.2f}")
     
-    with col5:
+    with col6:
         eta = metrics.get("eta_seconds", 0)
         elapsed = metrics.get("elapsed_seconds", 0)
         st.metric("Время", f"{format_time(elapsed)}", delta=f"Ост: {format_time(eta)}", delta_color="normal")
@@ -2064,7 +2097,11 @@ def render_metrics_dashboard(metrics: dict):
     if metrics.get("checkpoints"):
         with st.expander("📦 Checkpoints"):
             for ckpt in metrics["checkpoints"]:
-                st.text(f"Step {ckpt['step']}: {ckpt['path']}")
+                ckpt_loss = ckpt.get("loss")
+                if ckpt_loss is not None:
+                    st.text(f"Step {ckpt['step']}: Loss {ckpt_loss:.4f} | {ckpt['path']}")
+                else:
+                    st.text(f"Step {ckpt['step']}: {ckpt['path']}")
     
     # Пример сформированного промпта (для SFT)
     sample_prompt = metrics.get("sample_prompt")
@@ -3100,22 +3137,67 @@ def main():
                         pass
                     
                     with st.expander(f"{status_emoji} {model_name_display}"):
-                        col1, col2, col3, col4 = st.columns(4)
+                        # Параметры модели из metrics.json (если есть) или из config
+                        model_params = None
+                        try:
+                            # Сначала пробуем взять из metrics.json (более точно)
+                            if "num_parameters" in metrics:
+                                model_params = metrics["num_parameters"]
+                            else:
+                                # Fallback: рассчитываем из config
+                                config_path = run_dir / "config.json"
+                                if config_path.exists():
+                                    with open(config_path) as f:
+                                        rc = json.load(f)
+                                        if "hidden_size" in rc and "num_layers" in rc:
+                                            vocab_size = rc.get("vocab_size", 50257)
+                                            intermediate_size = rc.get("intermediate_size")
+                                            model_params = estimate_parameters(
+                                                rc["hidden_size"],
+                                                rc["num_layers"],
+                                                vocab_size=vocab_size,
+                                                intermediate_size=intermediate_size,
+                                            )
+                        except Exception:
+                            pass
+                        
+                        col1, col2, col3, col4, col5 = st.columns(5)
                         with col1:
                             st.metric("Steps", metrics.get("current_step", 0))
                         with col2:
                             st.metric("Final Loss", f"{metrics.get('current_loss', 0):.4f}")
                         with col3:
-                            st.metric("Status", status)
+                            if model_params:
+                                st.metric("Параметры", format_params(model_params))
+                            else:
+                                st.metric("Параметры", "—")
                         with col4:
+                            st.metric("Status", status)
+                        with col5:
                             st.metric("Duration", metrics.get("training_duration", "-"))
                         
                         # Чекпоинты этого запуска
                         checkpoints = metrics.get("checkpoints", [])
                         if checkpoints:
                             st.markdown("**📦 Чекпоинты:**")
+                            # Для получения loss из history, если его нет в чекпоинте
+                            loss_history = metrics.get("loss_history", [])
+                            steps_history = metrics.get("steps_history", [])
+                            
                             for ckpt in checkpoints:
-                                st.caption(f"Step {ckpt['step']}: {ckpt['path']}")
+                                ckpt_loss = ckpt.get("loss")
+                                # Если loss нет в чекпоинте, пытаемся найти в loss_history
+                                if ckpt_loss is None and steps_history and loss_history:
+                                    ckpt_step = ckpt.get("step")
+                                    if ckpt_step in steps_history:
+                                        idx = steps_history.index(ckpt_step)
+                                        if idx < len(loss_history):
+                                            ckpt_loss = loss_history[idx]
+                                
+                                if ckpt_loss is not None:
+                                    st.caption(f"Step {ckpt['step']}: Loss {ckpt_loss:.4f} | {ckpt['path']}")
+                                else:
+                                    st.caption(f"Step {ckpt['step']}: {ckpt['path']}")
                         
                         # Кнопки
                         btn_col1, btn_col2, btn_col3 = st.columns(3)
