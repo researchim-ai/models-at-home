@@ -17,6 +17,7 @@ services:
       - ./out:/app/out
       - ./.runs:/app/.runs
       - ./blueprints:/app/blueprints
+      - ./models:/app/models
     environment:
       - PYTHONUNBUFFERED=1
       - MKL_THREADING_LAYER=GNU

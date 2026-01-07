@@ -40,9 +40,11 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 CONFIGS_DIR = PROJECT_ROOT / "configs"
 DATASET_DIR = PROJECT_ROOT / "datasets"  # datasets с "s"!
+MODELS_DIR = PROJECT_ROOT / "models"  # Скачанные HF модели
 OUTPUT_DIR = PROJECT_ROOT / "out"
 RUNS_DIR = PROJECT_ROOT / ".runs"
 RUNS_DIR.mkdir(exist_ok=True)
+MODELS_DIR.mkdir(exist_ok=True)
 
 # ============================================================================
 # Page Config
@@ -1090,14 +1092,15 @@ def render_model_config():
         available = get_available_models()
         
         if selected_stage == "continual_pretrain":
-            # Для continual_pretrain фильтруем: предпочитаем final/export модели
+            # Для continual_pretrain фильтруем: предпочитаем final/export модели и HF модели
             # Checkpoint'ы тоже разрешены (для resume), но с предупреждением
+            hf_models = [m for m in available if m["type"] == "hf"]
             final_models = [m for m in available if m["type"] == "final"]
             checkpoint_models = [m for m in available if m["type"] == "checkpoint"]
             
-            if final_models:
-                st.sidebar.info("💡 Рекомендуется использовать final_model для continual pretraining")
-                available_filtered = final_models + checkpoint_models
+            if hf_models or final_models:
+                st.sidebar.info("💡 Рекомендуется использовать 🤗 HF модель или final_model для continual pretraining")
+                available_filtered = hf_models + final_models + checkpoint_models
             else:
                 if checkpoint_models:
                     st.sidebar.warning(
@@ -1106,45 +1109,46 @@ def render_model_config():
                     )
                 available_filtered = checkpoint_models if checkpoint_models else available
         else:
-            # Для SFT показываем все модели
-            available_filtered = available
+            # Для SFT показываем все модели (HF модели первыми)
+            hf_models = [m for m in available if m["type"] == "hf"]
+            other_models = [m for m in available if m["type"] != "hf"]
+            available_filtered = hf_models + other_models
         
         if not available_filtered:
-            st.sidebar.warning(f"Нет доступных моделей для {stage_label}. Сначала обучите Pretrain модель!")
+            st.sidebar.warning(f"Нет доступных моделей для {stage_label}. Скачайте модель на вкладке 🤖 Модели или обучите Pretrain!")
             # Можно дать возможность ввести путь вручную
             base_model_path = st.sidebar.text_input("Путь к модели вручную", placeholder="/path/to/model")
         else:
             # Создаем список опций с пометками типов
-            if selected_stage == "continual_pretrain":
-                model_options = [
-                    f"{m['name']} ({'✅ final' if m['type'] == 'final' else '⚠️ checkpoint'})" 
-                    for m in available_filtered
-                ]
-            else:
-                model_options = [m["name"] for m in available_filtered]
+            def get_model_label(m):
+                if m["type"] == "hf":
+                    return m["name"]  # Уже содержит 🤗
+                elif m["type"] == "final":
+                    return f"{m['name']} (✅ final)"
+                else:
+                    return f"{m['name']} (⚠️ checkpoint)"
+            
+            model_options = [get_model_label(m) for m in available_filtered]
             
             selected_base_name = st.sidebar.selectbox(
                 "Выберите модель", 
                 options=model_options,
-                help="Для continual_pretrain рекомендуется final_model (✅ final)"
+                help="🤗 — модели с HuggingFace, ✅ final — обученные модели, ⚠️ checkpoint — для resume"
             )
             
-            # Извлекаем реальное имя модели (убираем пометки)
-            if selected_stage == "continual_pretrain":
-                real_name = selected_base_name.split(" (")[0]
-            else:
-                real_name = selected_base_name
-            
-            # Находим путь
-            base_model_path = next(m["path"] for m in available_filtered if m["name"] == real_name)
+            # Находим модель по индексу (model_options и available_filtered соответствуют друг другу)
+            selected_idx = model_options.index(selected_base_name)
+            selected_model = available_filtered[selected_idx]
+            base_model_path = selected_model["path"]
             
             # Показываем предупреждение для checkpoint в continual_pretrain
-            selected_model = next(m for m in available_filtered if m["name"] == real_name)
             if selected_stage == "continual_pretrain" and selected_model["type"] == "checkpoint":
                 st.sidebar.info(
                     "ℹ️ Выбран checkpoint. Будет выполнен resume (восстановление оптимизатора и scheduler). "
-                    "Для начала нового continual pretraining лучше использовать final_model."
+                    "Для начала нового continual pretraining лучше использовать final_model или 🤗 HF модель."
                 )
+            elif selected_model["type"] == "hf":
+                st.sidebar.success("✅ HuggingFace модель — отлично подходит для Continual Pretrain / SFT!")
             
             st.sidebar.caption(f"Путь: `{base_model_path}`")
     
@@ -1194,28 +1198,31 @@ def render_model_config():
 
     st.sidebar.subheader("⚙️ Параметры модели")
 
-    # === ИНТЕГРАЦИЯ С VISUAL MODEL BUILDER ===
-    # ВАЖНО: Visual Model Builder сохраняет проекты в корневую папку `blueprints/` (а не `homellm/blueprints/`)
-    blueprints_dir = PROJECT_ROOT / "blueprints"
-    blueprints_dir.mkdir(exist_ok=True)
-    blueprints = list(blueprints_dir.glob("*.json"))
-        
-    # Пункт Blueprint всегда показываем, даже если пока нет файлов (тогда дадим ввести путь вручную)
-    arch_options = ["HomeModel (GPT-2 style)", "Llama (Custom)", "Mistral (Custom)", "Custom Blueprint (Visual Builder)"]
-    
-    # Выбор архитектуры
-    model_type = st.sidebar.selectbox(
-        "Архитектура модели",
-        options=arch_options,
-        index=0,
-        help="Выберите архитектуру. Custom Blueprint позволяет использовать модели из Visual Builder."
-    )
-    
     blueprint_path = ""
+    model_type = "HomeModel (GPT-2 style)"  # default
     # Базовые значения для переопределения
     default_h, default_l, default_n, default_seq = 512, 8, 8, 2048
 
-    if model_type == "Custom Blueprint (Visual Builder)":
+    # Выбор архитектуры ТОЛЬКО для pretrain (с нуля)
+    # Для SFT/Continual Pretrain архитектура определяется базовой моделью
+    if not loaded_config:
+        # === ИНТЕГРАЦИЯ С VISUAL MODEL BUILDER ===
+        blueprints_dir = PROJECT_ROOT / "blueprints"
+        blueprints_dir.mkdir(exist_ok=True)
+        blueprints = list(blueprints_dir.glob("*.json"))
+            
+        arch_options = ["HomeModel (GPT-2 style)", "Llama (Custom)", "Mistral (Custom)", "Custom Blueprint (Visual Builder)"]
+        
+        model_type = st.sidebar.selectbox(
+            "Архитектура модели",
+            options=arch_options,
+            index=0,
+            help="Выберите архитектуру. Custom Blueprint позволяет использовать модели из Visual Builder."
+        )
+
+    if not loaded_config and model_type == "Custom Blueprint (Visual Builder)":
+        blueprints_dir = PROJECT_ROOT / "blueprints"
+        blueprints = list(blueprints_dir.glob("*.json"))
         # Логика для Blueprint проектов
         if blueprints:
             bp_names = [b.name for b in blueprints]
@@ -1250,38 +1257,66 @@ def render_model_config():
         except Exception as e:
             st.sidebar.error(f"Invalid Blueprint: {e}")
             tokenizer_path = "gpt2"
-            
+    elif not loaded_config:
+        # Стандартный токенизатор для pretrain
+        tokenizer_path = None  # Будет определен стандартно
     else:
-        # Старая логика ручного выбора
-        tokenizer_path = None # Будет определен стандартно
-    
-    # Сохраняем путь в переменную для возврата
-    # (blueprint_path уже установлен выше)
+        # Для SFT/Continual Pretrain токенизатор берется из базовой модели
+        tokenizer_path = None
 
     if loaded_config:
-        # Режим только чтения для SFT/Continual Pretrain с загруженным конфигом
+        # Режим для SFT/Continual Pretrain с загруженным конфигом
+        # Слайдеры отключены - параметры архитектуры зафиксированы
+        disabled_sliders = True
+        
         # Используем значения из конфига (поддержка разных имен ключей)
         hidden_size = loaded_config.get("hidden_size", 512)
         # num_hidden_layers - HF, num_layers - наш конфиг
         num_layers = loaded_config.get("num_hidden_layers", loaded_config.get("num_layers", 8))
         num_attention_heads = loaded_config.get("num_attention_heads", loaded_config.get("n_heads", 8))
-        max_position_embeddings = loaded_config.get("max_position_embeddings", loaded_config.get("seq_len", 512))
+        max_position_embeddings = loaded_config.get("max_position_embeddings", loaded_config.get("seq_len", 2048))
         
         # Для совместимости возвращаем имена переменных как ожидается
         n_heads = num_attention_heads
-        seq_len = max_position_embeddings
         
-        # Слайдеры отключены — параметры зафиксированы
-        disabled_sliders = True
+        # Показываем тип модели из конфига
+        base_model_type = loaded_config.get("model_type", loaded_config.get("architectures", ["Unknown"])[0] if "architectures" in loaded_config else "HomeModel")
+        if isinstance(base_model_type, list):
+            base_model_type = base_model_type[0] if base_model_type else "Unknown"
+        st.sidebar.markdown(f"**Тип модели:** `{base_model_type}`")
         
-        # Отображаем просто текстом/метриками
+        # Отображаем фиксированные параметры
         c1, c2 = st.sidebar.columns(2)
         c1.metric("Hidden Size", hidden_size)
         c2.metric("Layers", num_layers)
         c1.metric("Heads", n_heads)
-        c2.metric("Seq Len", seq_len)
+        c2.metric("Max Context", f"{max_position_embeddings:,}")
         
-        st.sidebar.info("🔒 Параметры зафиксированы (наследуются от базовой модели)")
+        st.sidebar.info("🔒 Архитектура зафиксирована (от базовой модели)")
+        
+        # seq_len МОЖНО менять - тренировать на меньшем контексте
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**⚙️ Контекст для обучения**")
+        
+        # Опции seq_len: стандартные + максимум модели
+        seq_len_opts = [512, 1024, 2048, 4096, 8192]
+        if max_position_embeddings not in seq_len_opts:
+            seq_len_opts.append(max_position_embeddings)
+        seq_len_opts = sorted([s for s in seq_len_opts if s <= max_position_embeddings])
+        
+        # По умолчанию 2048 или максимум если меньше
+        default_seq = min(2048, max_position_embeddings)
+        default_idx = seq_len_opts.index(default_seq) if default_seq in seq_len_opts else len(seq_len_opts) - 1
+        
+        seq_len = st.sidebar.selectbox(
+            "Seq Length (обучение)",
+            seq_len_opts,
+            index=default_idx,
+            help=f"Длина контекста для обучения. Макс. модели: {max_position_embeddings:,}. Можно использовать меньше для экономии памяти."
+        )
+        
+        if seq_len < max_position_embeddings:
+            st.sidebar.caption(f"💡 Обучение на контексте {seq_len}, модель поддерживает до {max_position_embeddings:,}")
         
     else:
         # Дефолтные значения
@@ -1727,7 +1762,7 @@ def get_available_models():
     """Получить список доступных обученных моделей (рекурсивный поиск)."""
     models = []
     
-    # Ищем рекурсивно в out/
+    # 1. Ищем рекурсивно в out/ (обученные модели)
     if OUTPUT_DIR.exists():
         # Ищем любые config.json внутри out/
         for config_file in OUTPUT_DIR.rglob("config.json"):
@@ -1755,6 +1790,28 @@ def get_available_models():
                     "type": m_type,
                     "time": model_dir.stat().st_mtime
                 })
+    
+    # 2. Ищем в models/ (скачанные с HuggingFace)
+    if MODELS_DIR.exists():
+        for model_dir in MODELS_DIR.iterdir():
+            if model_dir.is_dir():
+                config_file = model_dir / "config.json"
+                if config_file.exists():
+                    # Проверяем наличие весов
+                    has_weights = (
+                        (model_dir / "pytorch_model.bin").exists() or 
+                        (model_dir / "model.safetensors").exists() or
+                        any(model_dir.glob("*.safetensors")) or
+                        any(model_dir.glob("pytorch_model*.bin"))
+                    )
+                    
+                    if has_weights:
+                        models.append({
+                            "name": f"🤗 {model_dir.name}",
+                            "path": str(model_dir),
+                            "type": "hf",  # HuggingFace модель
+                            "time": model_dir.stat().st_mtime
+                        })
     
     # Сортируем по времени (новые сверху)
     models.sort(key=lambda x: x["time"], reverse=True)
@@ -2565,6 +2622,251 @@ def render_data_manager():
                         st.error(f"Ошибка чтения файла: {e}")
 
 
+def download_hf_model(repo_id: str, save_name: str, revision: str = "main"):
+    """
+    Скачивает модель с HuggingFace и сохраняет локально в MODELS_DIR.
+    """
+    from huggingface_hub import snapshot_download
+    
+    save_path = MODELS_DIR / save_name
+    
+    # Проверяем, не существует ли уже
+    if save_path.exists():
+        st.warning(f"⚠️ Модель `{save_name}` уже существует!")
+        return False
+    
+    try:
+        with st.spinner(f"⏳ Скачиваем {repo_id}..."):
+            # Создаем прогресс-бар
+            progress_bar = st.progress(0, text="Инициализация...")
+            status_text = st.empty()
+            
+            # Скачиваем модель
+            status_text.text(f"Скачиваем файлы модели из {repo_id}...")
+            progress_bar.progress(10, text="Загрузка файлов...")
+            
+            # snapshot_download скачивает всю модель
+            local_path = snapshot_download(
+                repo_id=repo_id,
+                revision=revision,
+                local_dir=str(save_path),
+                local_dir_use_symlinks=False,  # Копируем файлы, не симлинки
+                ignore_patterns=["*.md", "*.txt", "*.gitattributes", ".git*"],  # Пропускаем ненужное
+            )
+            
+            progress_bar.progress(90, text="Проверка...")
+            
+            # Проверяем, что скачалось
+            config_file = save_path / "config.json"
+            if not config_file.exists():
+                st.error("❌ Не найден config.json в скачанной модели")
+                return False
+            
+            # Читаем конфиг для отображения информации
+            import json
+            with open(config_file) as f:
+                model_config = json.load(f)
+            
+            # Получаем информацию о модели
+            model_type = model_config.get("model_type", "unknown")
+            hidden_size = model_config.get("hidden_size", "?")
+            num_layers = model_config.get("num_hidden_layers", model_config.get("n_layer", "?"))
+            vocab_size = model_config.get("vocab_size", "?")
+            
+            progress_bar.progress(100, text="Готово!")
+            status_text.empty()
+            
+            st.success(f"""✅ Модель скачана!
+- **Путь:** `{save_path}`
+- **Тип:** {model_type}
+- **Hidden:** {hidden_size}, **Layers:** {num_layers}, **Vocab:** {vocab_size}
+""")
+            return True
+            
+    except Exception as e:
+        st.error(f"❌ Ошибка скачивания: {e}")
+        import traceback
+        print(traceback.format_exc())
+        # Удаляем частично скачанное
+        if save_path.exists():
+            import shutil
+            shutil.rmtree(save_path, ignore_errors=True)
+        return False
+
+
+def render_model_manager():
+    """Вкладка управления моделями (скачивание с HuggingFace)."""
+    st.header("🤖 Управление моделями")
+    
+    col_download, col_list = st.columns([1, 2])
+    
+    with col_download:
+        st.subheader("🤗 Скачать с HuggingFace")
+        
+        # Пресеты популярных небольших моделей для continual pretraining / SFT
+        model_presets = {
+            "🔥 SmolLM2-135M (135M params)": ("HuggingFaceTB/SmolLM2-135M", "SmolLM2-135M"),
+            "🔥 SmolLM2-360M (360M params)": ("HuggingFaceTB/SmolLM2-360M", "SmolLM2-360M"),
+            "🔥 SmolLM2-1.7B (1.7B params)": ("HuggingFaceTB/SmolLM2-1.7B", "SmolLM2-1.7B"),
+            "🦙 TinyLlama-1.1B (1.1B params)": ("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T", "TinyLlama-1.1B"),
+            "🐍 Pythia-70M (70M params)": ("EleutherAI/pythia-70m", "Pythia-70M"),
+            "🐍 Pythia-160M (160M params)": ("EleutherAI/pythia-160m", "Pythia-160M"),
+            "🐍 Pythia-410M (410M params)": ("EleutherAI/pythia-410m", "Pythia-410M"),
+            "🐍 Pythia-1B (1B params)": ("EleutherAI/pythia-1b", "Pythia-1B"),
+            "🤖 GPT-2 Small (124M params)": ("openai-community/gpt2", "GPT2-Small"),
+            "🤖 GPT-2 Medium (355M params)": ("openai-community/gpt2-medium", "GPT2-Medium"),
+            "🦊 Qwen2.5-0.5B (0.5B params)": ("Qwen/Qwen2.5-0.5B", "Qwen2.5-0.5B"),
+            "🦊 Qwen2.5-1.5B (1.5B params)": ("Qwen/Qwen2.5-1.5B", "Qwen2.5-1.5B"),
+            "🇷🇺 ruGPT3-Small (125M, Russian)": ("ai-forever/rugpt3small_based_on_gpt2", "ruGPT3-Small"),
+            "📝 Ввести вручную...": (None, None),
+        }
+        
+        # Инициализация
+        if "model_repo_id" not in st.session_state:
+            st.session_state.model_repo_id = "HuggingFaceTB/SmolLM2-135M"
+        if "model_save_name" not in st.session_state:
+            st.session_state.model_save_name = "SmolLM2-135M"
+        
+        def on_model_preset_change():
+            sel = st.session_state.model_preset_selector
+            preset_data = model_presets.get(sel)
+            if preset_data and preset_data[0]:
+                st.session_state.model_repo_id = preset_data[0]
+                st.session_state.model_save_name = preset_data[1]
+        
+        st.selectbox(
+            "📚 Популярные модели",
+            options=list(model_presets.keys()),
+            index=0,
+            key="model_preset_selector",
+            on_change=on_model_preset_change,
+            help="Выберите модель — repo_id заполнится автоматически"
+        )
+        
+        repo_id = st.text_input("Репозиторий (ID)", key="model_repo_id")
+        save_name = st.text_input("Название для сохранения", key="model_save_name", 
+                                   help="Папка в models/, куда будет сохранена модель")
+        
+        # Информация о модели
+        st.markdown("""
+<div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+            padding: 12px; border-radius: 8px; margin: 10px 0;
+            border: 1px solid #0f3460; color: #e8e8e8;">
+<b style="color: #4fc3f7;">💡 Рекомендации:</b><br>
+• <b style="color: #81d4fa;">SmolLM2</b> — современные компактные модели от HuggingFace<br>
+• <b style="color: #81d4fa;">Pythia</b> — отличные для экспериментов, разные размеры<br>
+• <b style="color: #81d4fa;">TinyLlama</b> — популярная, хорошо обучена на 3T токенов<br>
+• <b style="color: #81d4fa;">Qwen2.5</b> — сильные модели от Alibaba
+</div>
+""", unsafe_allow_html=True)
+        
+        # Оценка размера
+        size_estimates = {
+            "70m": "~150 MB", "135m": "~300 MB", "160m": "~350 MB",
+            "360m": "~800 MB", "410m": "~900 MB", "0.5b": "~1 GB",
+            "1b": "~2 GB", "1.1b": "~2.5 GB", "1.5b": "~3 GB", "1.7b": "~3.5 GB",
+            "124m": "~500 MB", "355m": "~1.5 GB", "125m": "~500 MB",
+        }
+        
+        estimated_size = "Неизвестно"
+        repo_lower = repo_id.lower()
+        for size_key, size_val in size_estimates.items():
+            if size_key in repo_lower:
+                estimated_size = size_val
+                break
+        
+        st.caption(f"📦 Примерный размер: **{estimated_size}**")
+        
+        if st.button("⬇️ Скачать модель", type="primary"):
+            if not repo_id or not save_name:
+                st.error("Укажите repo_id и название!")
+            else:
+                success = download_hf_model(repo_id, save_name)
+                if success:
+                    time.sleep(1)
+                    st.rerun()
+    
+    with col_list:
+        st.subheader("📁 Скачанные модели")
+        
+        models = []
+        if MODELS_DIR.exists():
+            for model_dir in MODELS_DIR.iterdir():
+                if model_dir.is_dir():
+                    config_path = model_dir / "config.json"
+                    if config_path.exists():
+                        try:
+                            import json
+                            with open(config_path) as f:
+                                cfg = json.load(f)
+                            
+                            # Размер папки
+                            total_size = sum(
+                                f.stat().st_size for f in model_dir.rglob("*") if f.is_file()
+                            )
+                            size_gb = total_size / (1024**3)
+                            
+                            models.append({
+                                "name": model_dir.name,
+                                "path": model_dir,
+                                "model_type": cfg.get("model_type", "unknown"),
+                                "hidden_size": cfg.get("hidden_size", "?"),
+                                "num_layers": cfg.get("num_hidden_layers", cfg.get("n_layer", "?")),
+                                "vocab_size": cfg.get("vocab_size", "?"),
+                                "size_gb": size_gb,
+                            })
+                        except Exception:
+                            models.append({
+                                "name": model_dir.name,
+                                "path": model_dir,
+                                "model_type": "?",
+                                "hidden_size": "?",
+                                "num_layers": "?",
+                                "vocab_size": "?",
+                                "size_gb": 0,
+                            })
+        
+        if not models:
+            st.info("Нет скачанных моделей. Скачайте модель слева для Continual Pretraining или SFT.")
+        else:
+            for m in sorted(models, key=lambda x: x["name"]):
+                with st.expander(f"🤖 {m['name']} ({m['size_gb']:.2f} GB)"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown(f"""
+- **Тип:** `{m['model_type']}`
+- **Hidden Size:** {m['hidden_size']}
+- **Layers:** {m['num_layers']}
+- **Vocab:** {m['vocab_size']}
+""")
+                    with col2:
+                        st.caption(f"📂 Путь: `{m['path']}`")
+                        
+                        # Кнопка использования
+                        if st.button("🚀 Использовать", key=f"use_{m['name']}", 
+                                     help="Выбрать эту модель для Continual Pretrain / SFT"):
+                            st.session_state.selected_base_model = str(m['path'])
+                            st.toast(f"Модель {m['name']} выбрана! Перейдите в Запуск и выберите Continual Pretrain или SFT.", icon="✅")
+                        
+                        # Кнопка удаления
+                        if st.button("🗑️ Удалить", key=f"del_model_{m['name']}"):
+                            import shutil
+                            shutil.rmtree(m['path'])
+                            st.toast(f"Модель {m['name']} удалена", icon="🗑️")
+                            time.sleep(1)
+                            st.rerun()
+        
+        # Подсказка
+        st.markdown("---")
+        st.info("""
+💡 **Как использовать скачанную модель:**
+1. Нажмите **🚀 Использовать** на нужной модели
+2. Перейдите на вкладку **🚀 Запуск**
+3. В сайдбаре выберите режим **Continual Pretrain** или **SFT**
+4. Модель автоматически подставится как базовая
+""")
+
+
 def _bytes_to_gb(x: int) -> float:
     return float(x) / (1024**3)
 
@@ -2754,6 +3056,8 @@ def render_model_preview(config: dict, distributed_config: dict = None):
     stage = config.get("stage", "pretrain")
     if stage == "sft":
         st.info(f"🔄 **Режим SFT** (Fine-Tuning)\nБазовая модель: `{Path(config.get('base_model_path') or 'Unknown').name}`")
+    elif stage == "continual_pretrain":
+        st.info(f"🔄 **Режим Continual Pretraining** (Продолжение)\nБазовая модель: `{Path(config.get('base_model_path') or 'Unknown').name}`")
     else:
         st.success("🏗️ **Режим Pretraining** (С нуля)")
 
@@ -3043,7 +3347,7 @@ def main():
         full_config["tokenizer_path"] = model_config["base_model_path"]
     
     # Main content
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🚀 Запуск", "📊 Мониторинг", "💬 Чат", "📜 История", "💾 Данные", "📚 Учебник"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["🚀 Запуск", "📊 Мониторинг", "💬 Чат", "📜 История", "💾 Данные", "🤖 Модели", "📚 Учебник"])
     
     with tab1:
         col1, col2 = st.columns([2, 1])
@@ -3286,6 +3590,9 @@ def main():
         st.info("💡 Чтобы пообщаться с моделью, перейдите на вкладку **💬 Чат** (в верхней части страницы)")
 
     with tab6:
+        render_model_manager()
+    
+    with tab7:
         render_docs()
     
     with tab3:
