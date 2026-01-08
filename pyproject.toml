@@ -38,6 +38,12 @@ full = [
     "streamlit>=1.32.0",
     "plotly>=5.18.0",
 ]
+rl = [
+    "datasets>=2.19.0",
+    "peft>=0.10.0",
+    "bitsandbytes>=0.43.0",
+    "wandb>=0.17.0",
+]
 dev = [
     "pytest>=7.0.0",
     "black>=23.0.0",
@@ -47,6 +53,7 @@ dev = [
 [project.scripts]
 mah-train = "homellm.training.pretrain:main"
 mah-chat = "homellm.cli.chat:main"
+mah-grpo = "homellm.training.rl.train_gsm8k:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

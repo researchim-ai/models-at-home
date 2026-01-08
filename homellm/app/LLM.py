@@ -622,6 +622,100 @@ def stop_training():
     return stopped
 
 
+def start_grpo_training(config: dict) -> tuple[str, subprocess.Popen]:
+    """Запустить GRPO обучение в фоне."""
+    run_id = datetime.now().strftime("grpo_%Y%m%d_%H%M%S")
+    
+    # Папки для сохранения
+    experiment_root = Path(PROJECT_ROOT) / config.get("output_dir", "out/grpo")
+    run_output_dir = experiment_root / run_id
+    
+    config["output_dir"] = str(run_output_dir)
+    
+    run_dir = RUNS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    config_path = run_dir / "config.json"
+    metrics_path = run_dir / "metrics.json"
+    stdout_path = run_dir / "stdout.log"
+    stderr_path = run_dir / "stderr.log"
+    
+    # Сохраняем конфиг
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    
+    # Начальные метрики
+    with open(metrics_path, "w") as f:
+        json.dump({"status": "starting", "current_step": 0, "stage": "grpo"}, f)
+    
+    # Формируем команду для запуска GRPO
+    import sys
+    cmd = [
+        sys.executable, "-m", "homellm.training.rl.train_gsm8k",
+        "--model", config.get("base_model_path", ""),
+        "--algorithm", config.get("grpo_algorithm", "grpo"),
+        "--output_dir", str(run_output_dir),
+        "--group_size", str(config.get("grpo_group_size", 8)),
+        "--batch_size", str(config.get("batch_size", 4)),
+        "--max_new_tokens", str(config.get("grpo_max_new_tokens", 1024)),
+        "--learning_rate", str(config.get("grpo_learning_rate", 5e-6)),
+        "--max_steps", str(config.get("grpo_max_steps", 500)),
+        "--log_steps", str(config.get("log_steps", 10)),
+        "--save_steps", str(config.get("save_steps", 100)),
+        "--reasoning_format", config.get("grpo_reasoning_format", "deepseek"),
+    ]
+    
+    # LoRA параметры
+    tuning_method = config.get("tuning_method", "lora")
+    if tuning_method in ("lora", "qlora"):
+        cmd.append("--use_lora")
+        if config.get("lora_r"):
+            cmd.extend(["--lora_r", str(config.get("lora_r"))])
+    else:
+        cmd.append("--no_lora")
+    
+    if tuning_method == "qlora" or config.get("use_4bit"):
+        cmd.append("--use_4bit")
+    
+    # Датасет
+    if config.get("grpo_dataset_source") == "GSM8K (математика)":
+        if config.get("grpo_max_samples"):
+            cmd.extend(["--max_samples", str(config.get("grpo_max_samples"))])
+    elif config.get("grpo_dataset_path"):
+        cmd.extend(["--dataset_file", config.get("grpo_dataset_path")])
+    
+    # Сохраняем команду для отладки
+    cmd_path = run_dir / "command.txt"
+    with open(cmd_path, "w") as f:
+        f.write(" ".join(cmd))
+    
+    stdout_file = open(stdout_path, "w")
+    stderr_file = open(stderr_path, "w")
+    
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        stdout=stdout_file,
+        stderr=stderr_file,
+        start_new_session=True,
+        env=env,
+    )
+    
+    st.session_state[f"stdout_file_{run_id}"] = stdout_file
+    st.session_state[f"stderr_file_{run_id}"] = stderr_file
+    
+    # Сохраняем PID
+    pid_path = run_dir / "pid"
+    with open(pid_path, "w") as f:
+        f.write(str(process.pid))
+    
+    return run_id, process
+
+
 def is_process_running(run_id: str) -> bool:
     """Проверить, запущен ли процесс."""
     pid_path = RUNS_DIR / run_id / "pid"
@@ -1058,6 +1152,322 @@ def render_sft_main_config(data_path: str):
     return {"sft_columns": sft_columns, "sft_template": sft_template}
 
 
+# ============================================================================
+# GRPO Configuration
+# ============================================================================
+
+def render_grpo_sidebar_config():
+    """Конфигурация GRPO в сайдбаре."""
+    st.sidebar.subheader("🧠 Параметры GRPO")
+    
+    # Алгоритм
+    algorithm = st.sidebar.selectbox(
+        "Алгоритм",
+        ["grpo", "drgrpo", "dapo"],
+        format_func=lambda x: {
+            "grpo": "GRPO (стандартный)",
+            "drgrpo": "Dr.GRPO (улучшенный)",
+            "dapo": "DAPO (полный)",
+        }[x],
+        help="""
+        **GRPO**: Стандартный Group Relative Policy Optimization
+        **Dr.GRPO**: Без деления на std, фиксированная нормализация
+        **DAPO**: + асимметричный клиппинг, + dynamic sampling
+        """
+    )
+    
+    # Генерация
+    group_size = st.sidebar.slider(
+        "Group size (G)",
+        min_value=2,
+        max_value=32,
+        value=8,
+        help="Количество генераций на один промпт"
+    )
+    
+    max_new_tokens = st.sidebar.slider(
+        "Max new tokens",
+        min_value=128,
+        max_value=4096,
+        value=1024,
+        step=128,
+        help="Максимальная длина генерируемого ответа"
+    )
+    
+    temperature = st.sidebar.slider(
+        "Temperature",
+        min_value=0.1,
+        max_value=2.0,
+        value=0.7,
+        step=0.1,
+        help="Температура сэмплирования"
+    )
+    
+    # Обучение
+    grpo_learning_rate = st.sidebar.select_slider(
+        "Learning Rate (GRPO)",
+        options=[1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5],
+        value=5e-6,
+        format_func=lambda x: f"{x:.0e}",
+        help="Для RL обычно требуется меньший LR чем для SFT"
+    )
+    
+    max_steps = st.sidebar.number_input(
+        "Max steps",
+        min_value=10,
+        max_value=10000,
+        value=500,
+        step=50,
+    )
+    
+    epochs_per_step = st.sidebar.slider(
+        "Epochs per step",
+        min_value=1,
+        max_value=5,
+        value=1,
+        help="Сколько раз обновлять политику на каждом батче rollout'ов"
+    )
+    
+    # KL
+    kl_weight = st.sidebar.slider(
+        "KL weight",
+        min_value=0.0,
+        max_value=0.1,
+        value=0.0,
+        step=0.01,
+        help="Вес KL-штрафа. Для reasoning обычно 0"
+    )
+    
+    # Клиппинг
+    with st.sidebar.expander("⚙️ Продвинутые параметры"):
+        clip_eps_low = st.slider("Clip ε (low)", 0.1, 0.3, 0.2, 0.01)
+        clip_eps_high = st.slider(
+            "Clip ε (high)", 
+            0.1, 0.4, 
+            0.28 if algorithm == "dapo" else 0.2, 
+            0.01,
+            help="DAPO рекомендует 0.28 для верхней границы"
+        )
+        
+        dynamic_sampling = st.checkbox(
+            "Dynamic sampling",
+            value=algorithm == "dapo",
+            help="Фильтровать группы с нулевым градиентом"
+        )
+        
+        token_level_loss = st.checkbox(
+            "Token-level loss",
+            value=algorithm == "dapo",
+            help="Агрегировать loss по токенам, а не по сэмплам"
+        )
+    
+    return {
+        "grpo_algorithm": algorithm,
+        "grpo_group_size": group_size,
+        "grpo_max_new_tokens": max_new_tokens,
+        "grpo_temperature": temperature,
+        "grpo_learning_rate": grpo_learning_rate,
+        "grpo_max_steps": max_steps,
+        "grpo_epochs_per_step": epochs_per_step,
+        "grpo_kl_weight": kl_weight,
+        "grpo_clip_eps_low": clip_eps_low,
+        "grpo_clip_eps_high": clip_eps_high,
+        "grpo_dynamic_sampling": dynamic_sampling,
+        "grpo_token_level_loss": token_level_loss,
+    }
+
+
+def render_grpo_main_config(data_path: str = None):
+    """Конфигурация GRPO в основной области (reward функции)."""
+    st.markdown("### 🎯 Настройка Reward функций")
+    
+    st.info("""
+    **Reward функции** определяют, как оценивать качество ответов модели.
+    Можно комбинировать несколько функций с разными весами.
+    """)
+    
+    # Датасет
+    st.markdown("#### 📚 Датасет для обучения")
+    
+    dataset_source = st.radio(
+        "Источник данных",
+        ["GSM8K (математика)", "Свой датасет (JSONL)"],
+        horizontal=True,
+    )
+    
+    grpo_dataset_path = None
+    grpo_max_samples = None
+    
+    if dataset_source == "GSM8K (математика)":
+        st.caption("GSM8K — датасет математических задач для обучения reasoning")
+        grpo_max_samples = st.number_input(
+            "Количество примеров",
+            min_value=10,
+            max_value=10000,
+            value=500,
+            step=50,
+        )
+    else:
+        if data_path and data_path.endswith(".jsonl"):
+            grpo_dataset_path = data_path
+            st.success(f"Используется выбранный датасет: `{Path(data_path).name}`")
+        else:
+            grpo_dataset_path = st.text_input(
+                "Путь к JSONL файлу",
+                placeholder="/path/to/dataset.jsonl",
+                help="JSONL файл с полями: prompt (или question), answer"
+            )
+    
+    st.markdown("---")
+    st.markdown("#### 🏆 Reward функции")
+    
+    # Пресеты reward функций
+    reward_preset = st.selectbox(
+        "Пресет",
+        [
+            "🧮 Математика (GSM8K)",
+            "💬 Общий reasoning",
+            "🔧 Кастомный",
+        ],
+        help="Выберите пресет или настройте reward функции вручную"
+    )
+    
+    reward_configs = []
+    
+    if reward_preset == "🧮 Математика (GSM8K)":
+        # Показываем какие функции включены
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown("**✅ Format Check**")
+            st.caption("Проверка наличия <reasoning> и <answer> тегов")
+            format_weight = st.slider("Вес", 0.0, 2.0, 1.0, 0.1, key="format_w")
+        with col2:
+            st.markdown("**✅ Reasoning Quality**")
+            st.caption("Бонус за содержательное reasoning")
+            reasoning_weight = st.slider("Вес", 0.0, 2.0, 0.5, 0.1, key="reasoning_w")
+        with col3:
+            st.markdown("**✅ Math Correctness**")
+            st.caption("Проверка правильности числового ответа")
+            correctness_weight = st.slider("Вес", 0.0, 5.0, 2.0, 0.1, key="correctness_w")
+        
+        reward_configs = [
+            {"type": "format", "weight": format_weight},
+            {"type": "reasoning_quality", "weight": reasoning_weight},
+            {"type": "gsm8k_correctness", "weight": correctness_weight},
+        ]
+        
+    elif reward_preset == "💬 Общий reasoning":
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**✅ Format Check**")
+            format_weight = st.slider("Вес", 0.0, 2.0, 1.0, 0.1, key="format_w2")
+        with col2:
+            st.markdown("**✅ Reasoning Quality**")
+            reasoning_weight = st.slider("Вес", 0.0, 2.0, 1.0, 0.1, key="reasoning_w2")
+        
+        reward_configs = [
+            {"type": "format", "weight": format_weight},
+            {"type": "reasoning_quality", "weight": reasoning_weight},
+        ]
+        
+    else:  # Кастомный
+        st.markdown("Добавьте reward функции:")
+        
+        # Динамическое добавление функций
+        if "custom_rewards" not in st.session_state:
+            st.session_state.custom_rewards = [{"type": "format", "weight": 1.0}]
+        
+        reward_types = {
+            "format": "Format Check (теги <reasoning>, <answer>)",
+            "reasoning_quality": "Reasoning Quality (длина и содержание)",
+            "gsm8k_correctness": "GSM8K Correctness (числовой ответ)",
+            "exact_match": "Exact Match (точное совпадение)",
+            "contains_answer": "Contains Answer (ответ содержится)",
+            "length_penalty": "Length Penalty (штраф за длину)",
+        }
+        
+        for i, reward in enumerate(st.session_state.custom_rewards):
+            col1, col2, col3 = st.columns([3, 1, 1])
+            with col1:
+                reward["type"] = st.selectbox(
+                    f"Функция {i+1}",
+                    options=list(reward_types.keys()),
+                    format_func=lambda x: reward_types.get(x, x),
+                    index=list(reward_types.keys()).index(reward["type"]) if reward["type"] in reward_types else 0,
+                    key=f"reward_type_{i}",
+                )
+            with col2:
+                reward["weight"] = st.number_input(
+                    "Вес",
+                    min_value=0.0,
+                    max_value=10.0,
+                    value=reward.get("weight", 1.0),
+                    step=0.1,
+                    key=f"reward_weight_{i}",
+                )
+            with col3:
+                if st.button("🗑️", key=f"remove_reward_{i}"):
+                    st.session_state.custom_rewards.pop(i)
+                    st.rerun()
+        
+        if st.button("➕ Добавить функцию"):
+            st.session_state.custom_rewards.append({"type": "format", "weight": 1.0})
+            st.rerun()
+        
+        reward_configs = st.session_state.custom_rewards.copy()
+    
+    # Формат reasoning
+    st.markdown("---")
+    st.markdown("#### 📝 Формат Reasoning")
+    
+    reasoning_format = st.selectbox(
+        "Формат тегов",
+        ["deepseek", "simple", "russian"],
+        format_func=lambda x: {
+            "deepseek": "DeepSeek (<think>...</think>, <answer>...</answer>)",
+            "simple": "Simple (<reasoning>...</reasoning>, <answer>...</answer>)",
+            "russian": "Russian (на русском языке)",
+        }[x],
+    )
+    
+    # Превью формата
+    format_examples = {
+        "deepseek": """<think>
+Дано: ... 
+Нужно найти: ...
+Решение: ...
+</think>
+<answer>
+42
+</answer>""",
+        "simple": """<reasoning>
+Шаг 1: ...
+Шаг 2: ...
+</reasoning>
+<answer>
+42
+</answer>""",
+        "russian": """<reasoning>
+Рассуждение: ...
+Вычисления: ...
+</reasoning>
+<answer>
+42
+</answer>""",
+    }
+    
+    with st.expander("📋 Пример формата ответа"):
+        st.code(format_examples[reasoning_format], language=None)
+    
+    return {
+        "grpo_dataset_source": dataset_source,
+        "grpo_dataset_path": grpo_dataset_path,
+        "grpo_max_samples": grpo_max_samples,
+        "grpo_reward_configs": reward_configs,
+        "grpo_reasoning_format": reasoning_format,
+    }
+
+
 def render_model_config():
     """Конфигуратор модели в сайдбаре."""
     st.sidebar.header("🧠 Архитектура и Режим")
@@ -1066,13 +1476,14 @@ def render_model_config():
     stage_options = {
         "pretrain": "Pretraining (с нуля)",
         "continual_pretrain": "Continual Pretraining (продолжение)",
-        "sft": "SFT (Fine-Tuning)"
+        "sft": "SFT (Fine-Tuning)",
+        "grpo": "🧠 GRPO (RL для Reasoning)"
     }
     selected_stage = st.sidebar.selectbox(
         "Этап обучения",
         options=list(stage_options.keys()),
         format_func=lambda x: stage_options[x],
-        help="Выберите этап: обучение с нуля, продолжение pretrain или дообучение (SFT)"
+        help="Выберите этап: обучение с нуля, продолжение pretrain, дообучение (SFT) или RL обучение (GRPO)"
     )
     
     # Имя модели (для папки эксперимента)
@@ -1080,14 +1491,16 @@ def render_model_config():
         model_name_default = "home_pretrain"
     elif selected_stage == "continual_pretrain":
         model_name_default = "home_continual_pretrain"
+    elif selected_stage == "grpo":
+        model_name_default = "home_grpo"
     else:
         model_name_default = "home_sft"
     model_name = st.sidebar.text_input("Название эксперимента", value=model_name_default, help="Имя папки для сохранения")
     
     base_model_path = None
     
-    if selected_stage in ("sft", "continual_pretrain"):
-        stage_label = "SFT" if selected_stage == "sft" else "Continual Pretraining"
+    if selected_stage in ("sft", "continual_pretrain", "grpo"):
+        stage_label = {"sft": "SFT", "continual_pretrain": "Continual Pretraining", "grpo": "GRPO"}.get(selected_stage, selected_stage)
         st.sidebar.subheader("📦 Базовая модель")
         available = get_available_models()
         
@@ -1155,7 +1568,7 @@ def render_model_config():
     # Флаг, что параметры загружены из конфига
     loaded_config = None
     
-    if selected_stage in ("sft", "continual_pretrain") and base_model_path:
+    if selected_stage in ("sft", "continual_pretrain", "grpo") and base_model_path:
         # Пытаемся загрузить конфиг
         # ВАЖНО: различаем run_config.json (training params) и config.json (model params)
         try:
@@ -3327,23 +3740,37 @@ def main():
     model_config = render_model_config()
     st.session_state.current_model_name = model_config.get("model_name_input", "home_model")
     
-    training_config = render_training_config()
-    distributed_config = render_distributed_config(training_config=training_config)
+    current_stage = model_config.get("stage", "pretrain")
+    
+    # GRPO имеет свою конфигурацию обучения
+    if current_stage == "grpo":
+        grpo_sidebar_config = render_grpo_sidebar_config()
+        # Для GRPO не нужна стандартная конфигурация обучения
+        training_config = {}
+        distributed_config = {"distributed_mode": "single_gpu", "num_gpus": 1, "config_file": None, "gpu_ids": []}
+    else:
+        grpo_sidebar_config = {}
+        training_config = render_training_config()
+        distributed_config = render_distributed_config(training_config=training_config)
     
     # Передаем stage в dataset_config
-    dataset_config = render_dataset_config(stage=model_config.get("stage", "pretrain"))
+    # Для GRPO датасет настраивается в main area
+    if current_stage != "grpo":
+        dataset_config = render_dataset_config(stage=current_stage)
+    else:
+        dataset_config = {}
     
     output_config = render_output_config(st.session_state.current_model_name)
     
     # Merge configs
-    full_config = {**model_config, **training_config, **dataset_config, **output_config}
+    full_config = {**model_config, **training_config, **dataset_config, **output_config, **grpo_sidebar_config}
     full_config["distributed_mode"] = distributed_config["distributed_mode"]
     full_config["num_gpus"] = distributed_config["num_gpus"]
     full_config["config_file"] = distributed_config["config_file"]
     full_config["gpu_ids"] = distributed_config.get("gpu_ids", [])
     
-    # Для SFT и Continual Pretrain используем токенизатор базовой модели (если он там сохранён)
-    if model_config.get("stage") in ("sft", "continual_pretrain") and model_config.get("base_model_path"):
+    # Для SFT, Continual Pretrain и GRPO используем токенизатор базовой модели
+    if model_config.get("stage") in ("sft", "continual_pretrain", "grpo") and model_config.get("base_model_path"):
         full_config["tokenizer_path"] = model_config["base_model_path"]
     
     # Main content
@@ -3363,6 +3790,12 @@ def main():
                 sft_cfg = render_sft_main_config(dataset_config["data_path"])
                 full_config.update(sft_cfg)
             
+            # GRPO Config (Main Area) - настройка reward функций и датасета
+            if model_config.get("stage") == "grpo":
+                st.markdown("---")
+                grpo_main_cfg = render_grpo_main_config(dataset_config.get("data_path"))
+                full_config.update(grpo_main_cfg)
+            
             st.subheader("📋 Конфигурация")
             st.json(full_config)
         
@@ -3380,19 +3813,34 @@ def main():
                     time.sleep(1)
                     st.rerun()
             else:
-                if st.button("▶️ Начать тренировку", type="primary"):
-                    with st.spinner("Запуск..."):
-                        run_id, process = start_training(full_config)
-                        st.session_state.current_run_id = run_id
-                        st.session_state.training_process = process
-                        st.session_state.training_active = True
-                        
-                        # Сохраняем активный run для persistence
-                        save_active_run(run_id, full_config)
-                        
-                        st.success(f"Тренировка запущена! Run ID: {run_id}")
-                        time.sleep(1)
-                        st.rerun()
+                # Для GRPO другая кнопка и логика
+                if model_config.get("stage") == "grpo":
+                    if st.button("🧠 Начать GRPO обучение", type="primary"):
+                        with st.spinner("Запуск GRPO..."):
+                            run_id, process = start_grpo_training(full_config)
+                            st.session_state.current_run_id = run_id
+                            st.session_state.training_process = process
+                            st.session_state.training_active = True
+                            
+                            save_active_run(run_id, full_config)
+                            
+                            st.success(f"GRPO обучение запущено! Run ID: {run_id}")
+                            time.sleep(1)
+                            st.rerun()
+                else:
+                    if st.button("▶️ Начать тренировку", type="primary"):
+                        with st.spinner("Запуск..."):
+                            run_id, process = start_training(full_config)
+                            st.session_state.current_run_id = run_id
+                            st.session_state.training_process = process
+                            st.session_state.training_active = True
+                            
+                            # Сохраняем активный run для persistence
+                            save_active_run(run_id, full_config)
+                            
+                            st.success(f"Тренировка запущена! Run ID: {run_id}")
+                            time.sleep(1)
+                            st.rerun()
     
     with tab2:
         # Используем fragment для автоматического обновления без перезагрузки страницы
