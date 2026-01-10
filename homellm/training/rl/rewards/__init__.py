@@ -5,15 +5,17 @@ Reward функции для GRPO.
 - math: Математические задачи (GSM8K, MATH)
 - format: Проверка формата reasoning
 - code: Задачи на код
+- universal: Универсальные правила из Reward Designer
 """
 
-from .base import RewardFunction, CombinedReward
+from .base import RewardFunction, CombinedReward, UniversalRuleReward
 from .math import MathReward, GSM8KReward
 from .format import FormatReward, ReasoningQualityReward
 
 __all__ = [
     "RewardFunction",
     "CombinedReward",
+    "UniversalRuleReward",
     "MathReward",
     "GSM8KReward", 
     "FormatReward",

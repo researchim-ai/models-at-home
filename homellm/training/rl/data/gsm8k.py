@@ -50,11 +50,39 @@ class GSM8KDataset(RLDataset):
     Датасет GSM8K для обучения математическому reasoning.
     
     Поддерживает:
-    - Загрузку из HuggingFace datasets
+    - Загрузку из HuggingFace datasets (GSM8K, GSM8K-RU, MATH-RU, MGSM)
     - Загрузку из локального JSONL файла
     - Фильтрацию по сложности
     - Форматирование с reasoning тегами
     """
+    
+    # Поддерживаемые датасеты
+    SUPPORTED_DATASETS = {
+        "gsm8k": {
+            "hf_name": "gsm8k",
+            "config": "main",
+            "question_field": "question",
+            "answer_field": "answer",
+        },
+        "gsm8k_ru": {
+            "hf_name": "d0rj/gsm8k-ru",
+            "config": None,
+            "question_field": "question",
+            "answer_field": "answer",
+        },
+        "math_ru": {
+            "hf_name": "d0rj/competition_math_ru",
+            "config": None,
+            "question_field": "problem",
+            "answer_field": "solution",
+        },
+        "mgsm": {
+            "hf_name": "juletxara/mgsm",
+            "config": "ru",  # Русская часть
+            "question_field": "question",
+            "answer_field": "answer_number",  # MGSM имеет числовой ответ
+        },
+    }
     
     # Системные промпты для разных форматов
     SYSTEM_PROMPTS = {
@@ -93,6 +121,7 @@ The assistant first thinks about the reasoning process in the mind and then prov
         max_samples: Optional[int] = None,
         reasoning_format: str = "deepseek",
         language: str = "en",
+        dataset_key: Optional[str] = None,
         min_answer: Optional[int] = None,
         max_answer: Optional[int] = None,
     ):
@@ -104,6 +133,7 @@ The assistant first thinks about the reasoning process in the mind and then prov
             max_samples: Максимальное количество примеров
             reasoning_format: "deepseek", "simple" или "russian"
             language: Язык датасета ("en" или "ru")
+            dataset_key: Ключ датасета из SUPPORTED_DATASETS (gsm8k, gsm8k_ru, math_ru, mgsm)
             min_answer: Минимальное значение ответа (для фильтрации)
             max_answer: Максимальное значение ответа (для фильтрации)
         """
@@ -112,6 +142,7 @@ The assistant first thinks about the reasoning process in the mind and then prov
         self.file_path = file_path
         self.use_huggingface = use_huggingface
         self.language = language
+        self.dataset_key = dataset_key
         self.min_answer = min_answer
         self.max_answer = max_answer
         
@@ -133,20 +164,49 @@ The assistant first thinks about the reasoning process in the mind and then prov
         except ImportError:
             raise ImportError("Установите datasets: pip install datasets")
         
-        logger.info(f"Загрузка GSM8K из HuggingFace (split={self.split})...")
+        # Определяем какой датасет загружать
+        if self.dataset_key and self.dataset_key in self.SUPPORTED_DATASETS:
+            ds_info = self.SUPPORTED_DATASETS[self.dataset_key]
+        elif self.language == "ru":
+            ds_info = self.SUPPORTED_DATASETS["gsm8k_ru"]
+        else:
+            ds_info = self.SUPPORTED_DATASETS["gsm8k"]
         
-        # Основной датасет GSM8K
-        dataset = load_dataset("gsm8k", "main", split=self.split)
+        dataset_name = ds_info["hf_name"]
+        config = ds_info.get("config")
+        question_field = ds_info.get("question_field", "question")
+        answer_field = ds_info.get("answer_field", "answer")
+        
+        logger.info(f"Загрузка датасета из HuggingFace: {dataset_name} (split={self.split})...")
+        
+        try:
+            if config:
+                dataset = load_dataset(dataset_name, config, split=self.split)
+            else:
+                dataset = load_dataset(dataset_name, split=self.split)
+        except Exception as e:
+            logger.error(f"Ошибка загрузки датасета {dataset_name}: {e}")
+            # Fallback на английский GSM8K
+            logger.info("Fallback на английский GSM8K...")
+            dataset = load_dataset("gsm8k", "main", split=self.split)
+            question_field = "question"
+            answer_field = "answer"
         
         for item in dataset:
-            sample = self._process_item(item)
+            # Адаптируем поля для разных датасетов
+            adapted_item = {
+                "question": item.get(question_field, ""),
+                "answer": str(item.get(answer_field, "")),
+            }
+            
+            sample = self._process_item(adapted_item)
             if sample:
                 self.samples.append(sample)
                 
                 if self.max_samples and len(self.samples) >= self.max_samples:
                     break
         
-        logger.info(f"Загружено {len(self.samples)} примеров GSM8K")
+        logger.info(f"Загружено {len(self.samples)} примеров из {dataset_name}")
     
     def _load_from_file(self) -> None:
         """Загружает из локального файла."""
@@ -230,32 +290,44 @@ def load_gsm8k(
     split: str = "train",
     max_samples: Optional[int] = None,
     reasoning_format: str = "deepseek",
+    language: str = "en",
+    dataset_key: Optional[str] = None,
     **kwargs,
 ) -> GSM8KDataset:
     """
-    Удобная функция для загрузки GSM8K.
+    Удобная функция для загрузки математических датасетов.
     
     Args:
         split: "train" или "test"
         max_samples: Максимальное количество примеров
         reasoning_format: Формат reasoning тегов
+        language: "en" для английского, "ru" для русского
+        dataset_key: Ключ датасета:
+            - "gsm8k" — английский GSM8K
+            - "gsm8k_ru" — d0rj/gsm8k-ru (русский перевод)
+            - "math_ru" — d0rj/competition_math_ru (олимпиадные задачи)
+            - "mgsm" — juletxara/mgsm (многоязычный)
         
     Returns:
         GSM8KDataset
         
     Example:
+        >>> # Английский датасет
         >>> dataset = load_gsm8k(split="train", max_samples=1000)
-        >>> print(len(dataset))
-        1000
-        >>> sample = dataset[0]
-        >>> print(sample.prompt)
-        "Janet's ducks lay 16 eggs per day..."
+        
+        >>> # Русский датасет (d0rj/gsm8k-ru)
+        >>> dataset_ru = load_gsm8k(split="train", max_samples=500, language="ru")
+        
+        >>> # Конкретный датасет по ключу
+        >>> dataset_math = load_gsm8k(dataset_key="math_ru", max_samples=500)
     """
     return GSM8KDataset(
         use_huggingface=True,
         split=split,
         max_samples=max_samples,
         reasoning_format=reasoning_format,
+        language=language,
+        dataset_key=dataset_key,
         **kwargs,
     )
 

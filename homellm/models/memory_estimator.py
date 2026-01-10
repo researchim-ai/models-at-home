@@ -329,6 +329,178 @@ def get_architecture_profile(
     return ARCHITECTURE_PROFILES["home"]
 
 
+def estimate_grpo_memory_footprint(
+    config: Dict[str, Any],
+    distributed_mode: str = "default",
+    num_gpus: int = 1,
+) -> Dict[str, Any]:
+    """
+    Специализированный расчет памяти для GRPO (RL) обучения.
+    Учитывает специфику: генерация (KV cache) -> обучение (Forward/Backward).
+    """
+    try:
+        # 1. Извлекаем параметры модели
+        hidden_size = int(config["hidden_size"])
+        num_layers = int(config["num_layers"])
+        n_heads = int(config.get("n_heads", 0) or 0)
+        vocab_size = int(config.get("vocab_size", 50257))
+        intermediate_size = int(config.get("intermediate_size") or (hidden_size * 4))
+        
+        # 2. Параметры GRPO
+        group_size = int(config.get("grpo_group_size", 8))
+        train_batch_size = int(config.get("grpo_train_batch_size", 2)) # Используем train_batch_size
+        max_prompt_length = int(config.get("max_prompt_length", 512))
+        max_new_tokens = int(config.get("grpo_max_new_tokens", 1024))
+        total_seq_len = max_prompt_length + max_new_tokens
+        
+        use_lora = bool(config.get("use_lora", False))
+        use_4bit = bool(config.get("use_4bit", False))
+        use_8bit = bool(config.get("use_8bit", False))
+        kl_weight = float(config.get("grpo_kl_weight", 0.0))
+        quantize_ref = bool(config.get("quantize_reference_model", False))
+        grad_checkpoint = True # Для GRPO/LoRA почти всегда включаем
+        
+        # Профиль
+        model_type = config.get("model_type", "home")
+        arch_preset = config.get("arch_preset")
+        profile = get_architecture_profile(model_type, arch_preset)
+        
+        # 3. Расчет параметров (в FP16 эквиваленте для оценки)
+        total_params = profile.calculate_parameters(
+            vocab_size, hidden_size, num_layers, intermediate_size, total_seq_len
+        )
+        
+        # --- ФАЗА 1: СТАТИЧЕСКАЯ ПАМЯТЬ (Модели) ---
+        
+        # Базовая модель
+        if use_4bit:
+            model_bytes = total_params * 0.5  # 4 bit = 0.5 byte
+        elif use_8bit:
+            model_bytes = total_params * 1.0  # 8 bit = 1 byte
+        else:
+            model_bytes = total_params * 2.0  # bf16/fp16 = 2 bytes
+            
+        # LoRA адаптеры (примерно 1-5% от весов, берем 2%)
+        lora_bytes = (total_params * 2.0) * 0.02 if use_lora else 0
+        
+        # Reference модель (если нужна)
+        ref_model_bytes = 0
+        if kl_weight > 0:
+            if quantize_ref:
+                 # Если квантуем референс (обычно 4/8 bit)
+                 ref_model_bytes = total_params * (0.5 if use_4bit else 1.0)
+            else:
+                 # Обычно fp16
+                 ref_model_bytes = total_params * 2.0
+        
+        # Оптимизатор и Градиенты
+        # При LoRA обучаем только адаптеры (~2% параметров)
+        trainable_params = total_params if not use_lora else (total_params * 0.02)
+        
+        grads_bytes = trainable_params * 2.0 # Градиенты в fp16/bf16
+        
+        # Optimizer States (AdamW = 2 states per param)
+        # Если используем 8-bit optimizer (по умолчанию в скрипте для LoRA), то 2 байта на state
+        # Иначе 4 (fp32) или 2 (fp16)
+        # Считаем консервативно: 8 байт на параметр (2 состояния по 4 байта) или 2 байта (8-bit opt)
+        # В нашем скрипте trainer.py используется bnb.optim.AdamW8bit если доступно
+        optimizer_bytes = trainable_params * 2.0 # 8-bit optimizer assumption for LoRA
+        if not use_lora:
+            optimizer_bytes = trainable_params * 8.0 # Full finetune (fp32 optimizer states)
+            
+        static_mem_bytes = model_bytes + lora_bytes + ref_model_bytes + grads_bytes + optimizer_bytes
+        
+        # --- ФАЗА 2: ГЕНЕРАЦИЯ (KV Cache) ---
+        # KV Cache: 2 * layers * heads * head_dim * seq_len * batch
+        # batch = group_size (параллельная генерация)
+        head_dim = hidden_size // n_heads if n_heads > 0 else 64
+        kv_cache_per_token = 2 * num_layers * n_heads * head_dim * 2 # 2 bytes (fp16)
+        
+        # KV Cache растет до total_seq_len
+        kv_cache_bytes = kv_cache_per_token * total_seq_len * group_size
+        
+        # Activations при генерации (минимальны, 1 токен)
+        gen_act_bytes = group_size * hidden_size * 2 * num_layers # Очень грубо, но мало
+        
+        peak_gen_bytes = static_mem_bytes + kv_cache_bytes + gen_act_bytes
+        
+        # --- ФАЗА 3: ОБУЧЕНИЕ (Forward/Backward) ---
+        # Здесь batch = train_batch_size (микро-батч)
+        # Полная длина последовательности (prompt + completion)
+        
+        # Активации (с grad checkpointing)
+        # Используем существующую функцию
+        train_act_bytes, _ = profile.calculate_activations(
+            batch_size=train_batch_size,
+            seq_len=total_seq_len,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            intermediate_size=intermediate_size,
+            num_heads=n_heads,
+            vocab_size=vocab_size,
+            grad_checkpoint=grad_checkpoint,
+            attention_mode="flash", # GRPO обычно с FlashAttn
+            dtype_bytes=2
+        )
+        
+        peak_train_bytes = static_mem_bytes + train_act_bytes
+        
+        # Выбираем максимум
+        peak_bytes = max(peak_gen_bytes, peak_train_bytes)
+        
+        # --- ФАЗА 4: ПЕРЕВОД В GB И БУФЕР ---
+        
+        static_gb = static_mem_bytes / (1024**3)
+        peak_gb = peak_bytes / (1024**3)
+        kv_gb = kv_cache_bytes / (1024**3)
+        train_act_gb = train_act_bytes / (1024**3)
+        
+        # Buffer (overhead)
+        fixed_overhead = 4.0 # Базовый оверхед PyTorch/CUDA
+        variable_coeff = 0.1 # Фрагментация
+        
+        buffer_gb = fixed_overhead + (peak_gb * variable_coeff)
+        
+        total_gb = peak_gb + buffer_gb
+        
+        detail = {
+            "mode": "GRPO (RL)",
+            "weights_gb": round(static_gb, 2),
+            "kv_cache_gb": round(kv_gb, 2),
+            "train_act_gb": round(train_act_gb, 2),
+            "peak_phase": "Generation" if peak_gen_bytes > peak_train_bytes else "Training",
+            "train_batch": train_batch_size,
+            "group_size": group_size,
+            "seq_len": total_seq_len
+        }
+        
+        notes = (
+            f"Оценка для GRPO. Пик потребления: {detail['peak_phase']}. "
+            f"KV Cache: {kv_gb:.1f}GB (G={group_size}). "
+            f"Train Act: {train_act_gb:.1f}GB (B={train_batch_size})."
+        )
+        
+        return {
+            "method": "estimate_grpo",
+            "total_gb": round(total_gb, 2),
+            "model_gb": round(static_gb, 2),
+            "act_gb": round(max(kv_gb, train_act_gb), 2), # Показываем наибольший динамический компонент
+            "buf_gb": round(buffer_gb, 2),
+            "params": total_params,
+            "detail": detail,
+            "notes": notes,
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "method": "error",
+            "total_gb": 0,
+            "notes": f"Ошибка расчета GRPO: {e}"
+        }
+
+
 def estimate_memory_footprint(
     config: Dict[str, Any],
     batch_size: int,
@@ -347,6 +519,10 @@ def estimate_memory_footprint(
     Returns:
         Словарь с оценкой памяти
     """
+    # Если это GRPO режим, переключаемся на спец функцию
+    if config.get("stage") == "grpo":
+        return estimate_grpo_memory_footprint(config, distributed_mode, num_gpus)
+
     try:
         # Извлекаем параметры модели
         hidden_size = int(config["hidden_size"])

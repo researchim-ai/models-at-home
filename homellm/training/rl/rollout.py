@@ -137,33 +137,60 @@ def sequence_log_probs_from_logits(
     Returns:
         Log-вероятности [batch, seq_len]
     """
-    log_probs = F.log_softmax(logits, dim=-1)
-    return log_probs.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
+    # ОПТИМИЗАЦИЯ ПАМЯТИ: Используем cross_entropy(reduction='none') вместо log_softmax + gather
+    # Старый подход: log_probs = F.log_softmax(logits, dim=-1).gather(...)
+    # Это создавало тензор [Batch, SeqLen, Vocab], который для Qwen (152k vocab) занимал ~5-6 GB
+    # Новый подход: fused kernel cross_entropy вычисляет только нужные значения
+    # log(p) = -cross_entropy
+    
+    # Reshape для cross_entropy: [N, C] и [N]
+    batch_size, seq_len, vocab_size = logits.shape
+    logits_flat = logits.reshape(-1, vocab_size)
+    ids_flat = output_ids.reshape(-1)
+    
+    # Вычисляем negative log likelihood (loss) для каждого токена
+    # reduction='none' возвращает тензор того же размера, что и input (batch * seq)
+    nll = F.cross_entropy(logits_flat, ids_flat, reduction='none')
+    
+    # log_prob = -nll
+    log_probs = -nll.view(batch_size, seq_len)
+    
+    return log_probs
 
 
-@torch.no_grad()
 def compute_log_probs(
     model: PreTrainedModel,
     sequence_ids: torch.Tensor,
     attention_mask: torch.Tensor,
+    accelerator=None,
 ) -> torch.Tensor:
     """
     Вычисляет log-вероятности для последовательности.
     
+    ВАЖНО: Эта функция НЕ использует @torch.no_grad(), чтобы градиенты могли проходить
+    при использовании в обучении. Используйте torch.no_grad() вручную там где нужно.
+    
     Args:
-        model: Языковая модель
+        model: Языковая модель (может быть обернута в DDP)
         sequence_ids: Token IDs [batch, seq_len]
         attention_mask: Маска внимания [batch, seq_len]
+        accelerator: Accelerator объект для unwrap модели (опционально)
         
     Returns:
         Log-вероятности [batch, seq_len-1]
     """
+    # ВАЖНО (память): для обучения в distributed режиме НЕ делаем unwrap через Accelerator.
+    # Иначе accelerate может оборачивать forward и конвертировать выходы в fp32 (convert_to_fp32),
+    # что сильно увеличивает пик памяти на больших vocab (Qwen ~152k) и длинных seq.
+    # Для DDP/FSDP forward() доступен напрямую на подготовленной модели.
+    forward_model = model
+    
     # Position IDs
     position_ids = attention_mask.long().cumsum(dim=-1) - 1
     position_ids.masked_fill_(mask=(attention_mask == 0), value=1)
     
     # Forward pass
-    output = model(
+    output = forward_model(
         input_ids=sequence_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
@@ -174,8 +201,11 @@ def compute_log_probs(
     logits = output.logits[:, :-1]  # [batch, seq_len-1, vocab]
     target_ids = sequence_ids[:, 1:]  # [batch, seq_len-1]
     
+    # ВАЖНО: НЕ конвертируем dtype - работаем с исходным dtype модели
+    # Конвертация может разорвать граф градиентов
+    # sequence_log_probs_from_logits работает с любым float dtype
     log_probs = sequence_log_probs_from_logits(
-        logits.to(torch.float32),
+        logits,
         target_ids,
     )
     
@@ -192,12 +222,14 @@ def generate_rollouts(
     config: GRPOConfig,
     reference_model: Optional[PreTrainedModel] = None,
     device: Optional[torch.device] = None,
+    accelerator=None,
+    prompt_ids: Optional[List[int]] = None,
 ) -> List[Rollout]:
     """
     Генерирует rollout'ы для списка промптов.
     
     Args:
-        model: Языковая модель (политика)
+        model: Языковая модель (политика) - может быть обернута в DDP
         tokenizer: Токенизатор
         prompts: Список промптов (вопросов)
         reference_answers: Эталонные ответы для вычисления reward
@@ -205,13 +237,26 @@ def generate_rollouts(
         config: Конфигурация GRPO
         reference_model: Референсная модель для KL (опционально)
         device: Устройство для вычислений
+        accelerator: Accelerator объект для unwrap модели (опционально)
         
     Returns:
         Список Rollout для каждого промпта
     """
-    model.eval()
+    # ВАЖНО: Если модель обернута в DDP, нужно использовать unwrapped модель для generate()
+    # DDP не передает методы типа generate() напрямую
+    if accelerator is not None:
+        # Используем unwrapped модель для генерации
+        unwrapped_model = accelerator.unwrap_model(model)
+    elif hasattr(model, 'module'):
+        # Если модель обернута в DDP напрямую (без accelerator)
+        unwrapped_model = model.module
+    else:
+        # Модель не обернута, используем как есть
+        unwrapped_model = model
+    
+    unwrapped_model.eval()
     if device is None:
-        device = next(model.parameters()).device
+        device = next(unwrapped_model.parameters()).device
     
     rollouts = []
     
@@ -226,7 +271,10 @@ def generate_rollouts(
     )
     
     for prompt_idx, (prompt, ref_answer) in enumerate(zip(prompts, reference_answers)):
-        # Токенизация промпта
+        # Токенизация промпта.
+        # ВАЖНО: build_reasoning_prompt(...) применяется на уровне датасета/тренера
+        # (см. GRPOTrainer._train_epoch), поэтому здесь prompt уже может быть
+        # "полным" (system+user). Не добавляем system второй раз.
         prompt_inputs = tokenizer(
             prompt,
             return_tensors="pt",
@@ -237,12 +285,15 @@ def generate_rollouts(
         
         prompt_length = prompt_inputs["input_ids"].size(1)
         
-        # Дублируем для группы генераций
+        # ВАЖНО: Параллельная генерация для группы (как в re-grpo)
+        # Дублируем промпт group_size раз и генерируем все completions одним батчем
+        # Это эффективнее чем последовательная генерация
         input_ids = prompt_inputs["input_ids"].repeat(config.group_size, 1)
         attention_mask = prompt_inputs["attention_mask"].repeat(config.group_size, 1)
         
-        # Генерация
-        outputs = model.generate(
+        # Генерация всех group_size completions параллельно одним батчем
+        # ВАЖНО: Используем unwrapped_model для generate() (DDP не поддерживает generate напрямую)
+        outputs = unwrapped_model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             generation_config=generation_config,
@@ -267,13 +318,29 @@ def generate_rollouts(
         # Вычисляем rewards
         rewards = torch.zeros(config.group_size, dtype=torch.float32, device=device)
         for i, completion in enumerate(completions):
-            reward = reward_fn(
-                completion=completion,
-                reference_answer=ref_answer,
-                reasoning_format=config.reasoning_format,
-                is_truncated=is_truncated[i],
-            )
-            rewards[i] = reward
+            try:
+                reward = reward_fn(
+                    completion=completion,
+                    reference_answer=ref_answer,
+                    reasoning_format=config.reasoning_format,
+                    is_truncated=is_truncated[i],
+                )
+                # Проверяем что reward - число
+                if not isinstance(reward, (int, float)):
+                    import logging
+                    logging.warning(
+                        f"Reward не число: {type(reward)} = {reward} для completion: {completion[:100]}..."
+                    )
+                    reward = 0.0
+                rewards[i] = float(reward)
+            except Exception as e:
+                import logging
+                logging.error(
+                    f"Ошибка при вычислении reward для completion {i}: {e}\n"
+                    f"Completion: {completion[:200]}...\n"
+                    f"Reference: {ref_answer[:100]}..."
+                )
+                rewards[i] = 0.0
         
         # Создаём Rollout
         rollout = Rollout(
@@ -286,6 +353,7 @@ def generate_rollouts(
             metadata={
                 "reference_answer": ref_answer,
                 "prompt_idx": prompt_idx,
+                "prompt_id": (prompt_ids[prompt_idx] if prompt_ids is not None and prompt_idx < len(prompt_ids) else prompt_idx),
             }
         )
         rollouts.append(rollout)
@@ -300,6 +368,7 @@ def rollout_to_experiences(
     config: GRPOConfig,
     reference_model: Optional[PreTrainedModel] = None,
     device: Optional[torch.device] = None,
+    accelerator=None,
 ) -> List[Experience]:
     """
     Конвертирует Rollout в список Experience для обучения.
@@ -333,8 +402,27 @@ def rollout_to_experiences(
         # Полная последовательность: prompt + completion
         completion_ids = rollout.completion_ids[i]
         
-        # Убираем padding из completion
-        non_pad_mask = completion_ids != (tokenizer.pad_token_id or tokenizer.eos_token_id)
+        # ВАЖНО: Убираем только реальный padding, НЕ EOS!
+        # EOS - это действие, которому модель должна учиться
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = tokenizer.eos_token_id
+        
+        # Маскируем только реальный padding (после первого EOS или в конце)
+        # Но сохраняем EOS токены, так как это действия модели
+        non_pad_mask = completion_ids != pad_token_id
+        # Если pad_token == eos_token, то не маскируем EOS (это нормально)
+        if pad_token_id == tokenizer.eos_token_id:
+            # В этом случае pad_token == eos_token, маскируем только padding после первого EOS
+            # Находим первый EOS
+            eos_positions = (completion_ids == tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+            if len(eos_positions) > 0:
+                first_eos = eos_positions[0].item()
+                # Маскируем всё после первого EOS как padding
+                non_pad_mask[first_eos + 1:] = False
+                # Но сам EOS оставляем
+                non_pad_mask[first_eos] = True
+        
         completion_ids = completion_ids[non_pad_mask]
         
         sequence_ids = torch.cat([rollout.prompt_ids.to(device), completion_ids.to(device)])
@@ -342,25 +430,40 @@ def rollout_to_experiences(
         # Attention mask
         attention_mask = torch.ones_like(sequence_ids)
         
-        # Action mask (только для completion токенов)
+        # Action mask (только для completion токенов, включая EOS)
+        # ВАЖНО: EOS токены НЕ маскируются - это действия модели
         action_mask = torch.zeros(sequence_ids.size(0) - 1, dtype=torch.bool, device=device)
         action_mask[prompt_length - 1:] = True  # Начинаем с позиции после prompt
         
-        # Log probs текущей политики
-        log_probs = compute_log_probs(
-            model,
-            sequence_ids.unsqueeze(0),
-            attention_mask.unsqueeze(0),
-        ).squeeze(0)
+        # Маскируем только реальный padding в action_mask
+        # (padding уже убран из completion_ids, но на всякий случай)
+        if pad_token_id is not None:
+            # Если в sequence_ids есть pad_token_id, маскируем их
+            pad_positions = (sequence_ids == pad_token_id).nonzero(as_tuple=True)[0]
+            for pos in pad_positions:
+                if pos > 0:  # Не маскируем первый токен
+                    action_mask[pos - 1] = False
         
-        # Log probs референсной модели (для KL)
-        log_probs_ref = None
-        if reference_model is not None and config.kl_weight > 0:
-            log_probs_ref = compute_log_probs(
-                reference_model,
+        # Log probs текущей политики (старые, для сохранения в Experience)
+        # Используем no_grad т.к. это старые log_probs, не нужны градиенты
+        with torch.no_grad():
+            log_probs = compute_log_probs(
+                model,
                 sequence_ids.unsqueeze(0),
                 attention_mask.unsqueeze(0),
+                accelerator=accelerator,
             ).squeeze(0)
+        
+        # Log probs референсной модели (для KL) - всегда без градиентов
+        log_probs_ref = None
+        if reference_model is not None and config.kl_weight > 0:
+            with torch.no_grad():
+                log_probs_ref = compute_log_probs(
+                    reference_model,
+                    sequence_ids.unsqueeze(0),
+                    attention_mask.unsqueeze(0),
+                    accelerator=accelerator,
+                ).squeeze(0)
         
         exp = Experience(
             sequences=sequence_ids,

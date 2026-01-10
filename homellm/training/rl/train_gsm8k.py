@@ -29,7 +29,7 @@ from datetime import datetime
 from .config import GRPOConfig, RLAlgorithm
 from .trainer import GRPOTrainer
 from .data.gsm8k import load_gsm8k
-from .rewards.base import CombinedReward
+from .rewards.base import CombinedReward, UniversalRuleReward
 from .rewards.math import GSM8KReward
 from .rewards.format import FormatReward, ReasoningQualityReward
 
@@ -241,11 +241,21 @@ def parse_args():
         help="Random seed",
     )
     
+    # JSON конфигурация (для запуска из Streamlit UI)
+    parser.add_argument(
+        "--config_json",
+        type=str,
+        default=None,
+        help="JSON строка с полной конфигурацией (перезаписывает другие параметры)",
+    )
+    
     return parser.parse_args()
 
 
 def main():
     """Основная функция."""
+    import json
+    
     args = parse_args()
     
     # Настройка логирования
@@ -259,89 +269,222 @@ def main():
     logger.info("GRPO Training на GSM8K")
     logger.info("=" * 60)
     
+    # Если передана JSON конфигурация (из Streamlit UI)
+    ui_config = None
+    reward_rules = None
+    
+    if args.config_json:
+        logger.info("Загрузка конфигурации из JSON...")
+        ui_config = json.loads(args.config_json)
+        
+        # Извлекаем reward правила
+        reward_rules = ui_config.get("grpo_reward_rules", [])
+        if reward_rules:
+            logger.info(f"Загружено {len(reward_rules)} reward правил из UI")
+    
     # Создаём конфигурацию
     if args.preset:
         logger.info(f"Используем preset: {args.preset}")
         config = GRPOConfig.from_preset(args.preset)
     else:
+        algorithm = args.algorithm
+        if ui_config:
+            algorithm = ui_config.get("grpo_algorithm", algorithm)
         config = GRPOConfig(
-            algorithm=RLAlgorithm(args.algorithm),
+            algorithm=RLAlgorithm(algorithm),
         )
     
-    # Переопределяем параметры из аргументов
-    config.batch_size = args.batch_size
-    config.group_size = args.group_size
-    config.train_batch_size = args.train_batch_size
-    config.gradient_accumulation_steps = args.gradient_accumulation
-    config.max_new_tokens = args.max_new_tokens
-    config.temperature = args.temperature
-    config.learning_rate = args.learning_rate
-    config.num_epochs = args.num_epochs
-    config.max_steps = args.max_steps
-    config.clip_eps_low = args.clip_eps
-    config.clip_eps_high = args.clip_eps if args.algorithm != "dapo" else 0.28
-    config.kl_weight = args.kl_weight
-    config.use_lora = args.use_lora and not args.no_lora
-    config.lora_r = args.lora_r
-    config.use_4bit = args.use_4bit
-    config.use_8bit = args.use_8bit
+    # Переопределяем параметры из UI конфига
+    # ВАЖНО: Все параметры должны быть явно переданы из UI, без fallback на args
+    # Это гарантирует что мы точно знаем откуда берутся значения
+    if ui_config:
+        # GRPO параметры (обязательные из UI)
+        if "grpo_prompt_batch_size" not in ui_config:
+            raise ValueError("❌ Не задан grpo_prompt_batch_size (prompts/step) из UI.")
+        config.batch_size = ui_config["grpo_prompt_batch_size"]
+
+        config.group_size = ui_config["grpo_group_size"]
+        if config.group_size < 8:
+            raise ValueError("❌ group_size должен быть >= 8 для стабильного GRPO.")
+
+        config.train_batch_size = ui_config["grpo_train_batch_size"]
+        config.gradient_accumulation_steps = ui_config["gradient_accumulation"]
+        config.max_new_tokens = ui_config["grpo_max_new_tokens"]
+        config.temperature = ui_config["grpo_temperature"]
+        config.learning_rate = ui_config["grpo_learning_rate"]
+        config.max_steps = ui_config.get("grpo_max_steps")
+        config.clip_eps_low = ui_config["grpo_clip_eps_low"]
+        config.clip_eps_high = ui_config.get("grpo_clip_eps_high", config.clip_eps_low)
+        config.kl_weight = ui_config["grpo_kl_weight"]
+        config.epochs_per_step = ui_config.get("grpo_epochs_per_step", 1)
+        config.reasoning_format = ui_config.get("grpo_reasoning_format", config.reasoning_format)
+        
+        # LoRA параметры (обязательные из UI, если use_lora=True)
+        config.use_lora = ui_config.get("use_lora", config.use_lora)
+        if config.use_lora:
+            # ВАЖНО: Если use_lora=True, все LoRA параметры должны быть явно указаны в UI
+            if "lora_r" not in ui_config or ui_config["lora_r"] is None:
+                raise ValueError(
+                    "❌ use_lora=True но lora_r не указан в UI конфиге! "
+                    "Укажите lora_r в render_grpo_sidebar_config() или в model_config."
+                )
+            config.lora_r = ui_config["lora_r"]
+            
+            if "lora_alpha" not in ui_config or ui_config["lora_alpha"] is None:
+                raise ValueError(
+                    "❌ use_lora=True но lora_alpha не указан в UI конфиге! "
+                    "Укажите lora_alpha в render_grpo_sidebar_config() или в model_config."
+                )
+            config.lora_alpha = ui_config["lora_alpha"]
+            
+            # lora_dropout и lora_target_modules могут быть None (используются дефолты из GRPOConfig)
+            config.lora_dropout = ui_config.get("lora_dropout", config.lora_dropout)
+            config.lora_target_modules = ui_config.get("lora_target_modules", config.lora_target_modules)
+        
+        # Квантизация (обязательные из UI)
+        config.use_4bit = ui_config.get("use_4bit", False)
+        config.use_8bit = ui_config.get("use_8bit", False)
+        config.quantize_reference_model = ui_config.get("quantize_reference_model", config.quantize_reference_model)
+        
+        # Output директория
+        config.output_dir = ui_config.get("output_dir", f"./output/grpo_gsm8k/{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    else:
+        config.batch_size = args.batch_size
+        config.group_size = args.group_size
+        config.train_batch_size = args.train_batch_size
+        config.gradient_accumulation_steps = args.gradient_accumulation
+        config.max_new_tokens = args.max_new_tokens
+        config.temperature = args.temperature
+        config.learning_rate = args.learning_rate
+        config.num_epochs = args.num_epochs
+        config.max_steps = args.max_steps
+        config.clip_eps_low = args.clip_eps
+        config.clip_eps_high = args.clip_eps if args.algorithm != "dapo" else 0.28
+        config.kl_weight = args.kl_weight
+        config.use_lora = args.use_lora and not args.no_lora
+        config.lora_r = args.lora_r
+        config.use_4bit = args.use_4bit
+        config.use_8bit = args.use_8bit
+        config.reasoning_format = args.reasoning_format
+        
+        # Output директория
+        if args.output_dir:
+            config.output_dir = args.output_dir
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            config.output_dir = f"./output/grpo_gsm8k/{timestamp}"
+    
     config.save_steps = args.save_steps
     config.log_steps = args.log_steps
     config.use_wandb = args.use_wandb
     config.wandb_project = args.wandb_project
-    config.reasoning_format = args.reasoning_format
     config.seed = args.seed
     
-    # Output директория
-    if args.output_dir:
-        config.output_dir = args.output_dir
-    else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        config.output_dir = f"./output/grpo_gsm8k/{timestamp}"
+    # Определяем модель
+    model_name = args.model
+    if ui_config:
+        model_name = ui_config.get("base_model_path") or ui_config.get("model_name", model_name)
     
-    logger.info(f"Модель: {args.model}")
+    logger.info(f"Модель: {model_name}")
     logger.info(f"Алгоритм: {config.algorithm.value}")
     logger.info(f"Output: {config.output_dir}")
     
     # Загружаем датасет
-    if args.dataset_file:
-        logger.info(f"Загрузка датасета из файла: {args.dataset_file}")
+    dataset_file = args.dataset_file
+    max_samples = args.max_samples
+    dataset_language = "en"  # По умолчанию английский
+    
+    if ui_config:
+        dataset_source = ui_config.get("grpo_dataset_source", "")
+        dataset_key = ui_config.get("grpo_dataset_key", "gsm8k_en")
+        dataset_language = ui_config.get("grpo_dataset_language", "en")
+        
+        if "GSM8K" in dataset_source or dataset_key in ("gsm8k_en", "gsm8k_ru"):
+            dataset_file = None  # Используем GSM8K из HuggingFace
+            max_samples = ui_config.get("grpo_max_samples", max_samples)
+            # Определяем язык по ключу датасета
+            if dataset_key == "gsm8k_ru":
+                dataset_language = "ru"
+        else:
+            dataset_file = ui_config.get("grpo_dataset_path") or ui_config.get("data_path")
+    
+    # Определяем ключ датасета
+    dataset_key = None
+    if ui_config:
+        dataset_key = ui_config.get("grpo_dataset_key")
+    
+    if dataset_file:
+        logger.info(f"Загрузка датасета из файла: {dataset_file}")
         from .data.base import RLDataset, RLSample
-        import json
+        from .data.gsm8k import extract_gsm8k_final_answer
         
         samples = []
-        with open(args.dataset_file, "r", encoding="utf-8") as f:
+        with open(dataset_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
                     data = json.loads(line)
+                    # Если это GSM8K/GSM8K-RU стиль: answer содержит решение с "#### финал"
+                    raw_answer = data.get("answer", data.get("response", ""))
+                    ref_answer = raw_answer
+                    if isinstance(raw_answer, str) and "####" in raw_answer:
+                        ref_answer = extract_gsm8k_final_answer(raw_answer)
                     samples.append(RLSample(
                         prompt=data.get("prompt", data.get("question", "")),
-                        reference_answer=data.get("answer", data.get("response", "")),
-                        metadata=data.get("metadata", {}),
+                        reference_answer=ref_answer,
+                        metadata={
+                            **(data.get("metadata", {}) or {}),
+                            "full_answer": raw_answer,
+                        },
                     ))
-        if args.max_samples:
-            samples = samples[:args.max_samples]
+        if max_samples:
+            samples = samples[:max_samples]
         train_dataset = RLDataset(samples)
     else:
-        logger.info("Загрузка GSM8K датасета...")
+        # Загружаем датасет из HuggingFace
+        dataset_names = {
+            "gsm8k_en": "GSM8K (English)",
+            "gsm8k_ru": "GSM8K-RU (d0rj/gsm8k-ru)",
+            "math_ru": "MATH-RU (d0rj/competition_math_ru)",
+            "mgsm_ru": "MGSM (juletxara/mgsm)",
+        }
+        ds_name = dataset_names.get(dataset_key, f"GSM8K ({dataset_language})")
+        logger.info(f"Загрузка датасета: {ds_name}...")
+        
         train_dataset = load_gsm8k(
             split=args.split,
-            max_samples=args.max_samples,
-            reasoning_format=args.reasoning_format,
+            max_samples=max_samples,
+            reasoning_format=config.reasoning_format,
+            language=dataset_language,
+            dataset_key=dataset_key,
         )
     logger.info(f"Загружено {len(train_dataset)} примеров")
+    if len(train_dataset) <= 0:
+        raise ValueError(
+            "❌ Датасет пустой (0 примеров). "
+            "Проверьте, что выбран reasoning-датасет (GSM8K/GSM8K-RU/MATH-RU), "
+            "и что в JSONL есть поля question/prompt и answer/response."
+        )
     
     # Создаём reward функцию
-    reward_fn = CombinedReward([
-        FormatReward(format_reward=0.2, weight=1.0),
-        ReasoningQualityReward(max_reward=0.2, weight=0.5),
-        GSM8KReward(correct_reward=1.0, close_reward=0.3, weight=2.0),
-    ])
+    if reward_rules:
+        # Используем универсальные правила из UI
+        logger.info(f"Создание UniversalRuleReward из {len(reward_rules)} правил")
+        for rule in reward_rules:
+            logger.info(f"  - {rule.get('name')}: weight={rule.get('weight')}")
+        reward_fn = UniversalRuleReward.from_config(reward_rules)
+    else:
+        # Стандартная конфигурация для GSM8K
+        logger.info("Используем стандартную reward функцию для GSM8K")
+        reward_fn = CombinedReward([
+            FormatReward(format_reward=0.2, weight=1.0),
+            ReasoningQualityReward(max_reward=0.2, weight=0.5),
+            GSM8KReward(correct_reward=1.0, close_reward=0.3, weight=2.0),
+        ])
     
     # Создаём trainer
     trainer = GRPOTrainer(
-        model_name=args.model,
+        model_name=model_name,
         config=config,
         reward_fn=reward_fn,
     )

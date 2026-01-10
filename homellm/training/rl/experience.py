@@ -3,8 +3,9 @@ Experience буфер для GRPO.
 
 Хранит опыт от rollout'ов для последующего обучения.
 """
+from __future__ import annotations
 from dataclasses import dataclass, field, fields
-from typing import Optional, List, Self
+from typing import Optional, List
 import torch
 import torch.nn.functional as F
 
@@ -73,7 +74,7 @@ class Experience:
     prompt_id: Optional[int] = None
     completion_text: Optional[str] = None  # Для отладки
     
-    def to(self, device: torch.device) -> Self:
+    def to(self, device: torch.device) -> "ReplayBuffer":
         """Перемещает все тензоры на указанное устройство."""
         members = {}
         for f in fields(self):

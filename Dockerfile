@@ -30,10 +30,27 @@ WORKDIR /app
 # Сначала зависимости (для кеширования слоёв)
 COPY requirements.txt /app/requirements.txt
 
+# Установка основных зависимостей
 RUN python -m pip install --upgrade pip \
  && python -m pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 \
  && python -m pip install --no-cache-dir -r /app/requirements.txt \
  && python -m pip install --no-cache-dir deepspeed
+
+# Опциональная установка flash-attn
+# flash-attn требует torch во время сборки для определения версии CUDA
+# Используем --no-build-isolation чтобы использовать уже установленный torch
+ARG INSTALL_FLASH_ATTN=true
+RUN if [ "$INSTALL_FLASH_ATTN" = "true" ]; then \
+      echo "Попытка установки flash-attn..." && \
+      export MAX_JOBS=4 && \
+      export CUDA_HOME=/usr/local/cuda && \
+      export PATH=${CUDA_HOME}/bin:${PATH} && \
+      export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH} && \
+      (python -m pip install --no-cache-dir flash-attn==2.8.3 --no-build-isolation || \
+       echo "⚠️ flash-attn не установлен (возможны проблемы компиляции), будет использоваться стандартная реализация attention"); \
+    else \
+      echo "Пропуск установки flash-attn (INSTALL_FLASH_ATTN=false)"; \
+    fi
 
 # Теперь код (ВАЖНО: .dockerignore должен исключать datasets/out/.runs и т.п.)
 COPY . /app

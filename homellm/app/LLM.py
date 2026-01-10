@@ -435,7 +435,72 @@ def format_time(seconds: float) -> str:
 
 def load_metrics(run_id: str) -> dict:
     """Загрузить метрики из файла."""
-    metrics_path = RUNS_DIR / run_id / "metrics.json"
+    run_dir = RUNS_DIR / run_id
+    
+    # Для GRPO читаем из metrics.jsonl (может быть в output_dir или run_dir)
+    metrics_jsonl_paths = []
+    
+    # Пробуем найти metrics.jsonl в output_dir
+    config_path = run_dir / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+                output_dir = config.get("output_dir", "")
+                if output_dir:
+                    metrics_jsonl_paths.append(Path(output_dir) / "metrics.jsonl")
+        except:
+            pass
+    
+    # Fallback: ищем в run_dir
+    metrics_jsonl_paths.append(run_dir / "metrics.jsonl")
+    
+    for metrics_jsonl_path in metrics_jsonl_paths:
+        if metrics_jsonl_path.exists():
+            try:
+                import pandas as pd
+                # Читаем все строки из JSONL
+                lines = []
+                with open(metrics_jsonl_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip():
+                            try:
+                                lines.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                continue
+                
+                if lines:
+                    df = pd.DataFrame(lines)
+                    # Берем последнюю запись как текущие метрики
+                    latest = df.iloc[-1].to_dict()
+                    
+                    # Добавляем историю для графиков
+                    latest["reward_history"] = df["reward"].tolist() if "reward" in df.columns else []
+                    latest["loss_history"] = df["loss"].tolist() if "loss" in df.columns else []
+                    latest["kl_history"] = df["kl"].tolist() if "kl" in df.columns else []
+                    latest["steps_history"] = df["step"].tolist() if "step" in df.columns else list(range(len(df)))
+                    latest["lr_history"] = df["learning_rate"].tolist() if "learning_rate" in df.columns else (df["lr"].tolist() if "lr" in df.columns else [])
+                    
+                    # Добавляем текущие значения для метрик
+                    latest["current_step"] = latest.get("step", len(lines) - 1)
+                    latest["current_loss"] = latest.get("loss", 0)
+                    latest["current_lr"] = latest.get("learning_rate", latest.get("lr", 0))
+                    latest["reward"] = latest.get("reward", latest.get("batch_reward_mean", 0))
+                    
+                    # Добавляем семплы если есть
+                    if "samples" in df.columns:
+                        latest["samples_history"] = df["samples"].tolist()
+                    
+                    latest["status"] = latest.get("status", "training")
+                    latest["stage"] = "grpo"
+                    return latest
+            except Exception as e:
+                # Не показываем ошибку если это не последний путь
+                if metrics_jsonl_path == metrics_jsonl_paths[-1]:
+                    pass  # Логируем только для последнего пути
+    
+    # Обычный путь для других стадий
+    metrics_path = run_dir / "metrics.json"
     if metrics_path.exists():
         try:
             with open(metrics_path) as f:
@@ -643,58 +708,59 @@ def start_grpo_training(config: dict) -> tuple[str, subprocess.Popen]:
     
     # Сохраняем конфиг
     with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
+        json.dump(config, f, indent=2, default=str)
     
     # Начальные метрики
     with open(metrics_path, "w") as f:
         json.dump({"status": "starting", "current_step": 0, "stage": "grpo"}, f)
     
     # Формируем команду для запуска GRPO
+    # Используем --config_json для передачи всей конфигурации включая reward_rules
     import sys
-    cmd = [
-        sys.executable, "-m", "homellm.training.rl.train_gsm8k",
-        "--model", config.get("base_model_path", ""),
-        "--algorithm", config.get("grpo_algorithm", "grpo"),
-        "--output_dir", str(run_output_dir),
-        "--group_size", str(config.get("grpo_group_size", 8)),
-        "--batch_size", str(config.get("batch_size", 4)),
-        "--max_new_tokens", str(config.get("grpo_max_new_tokens", 1024)),
-        "--learning_rate", str(config.get("grpo_learning_rate", 5e-6)),
-        "--max_steps", str(config.get("grpo_max_steps", 500)),
-        "--log_steps", str(config.get("log_steps", 10)),
-        "--save_steps", str(config.get("save_steps", 100)),
-        "--reasoning_format", config.get("grpo_reasoning_format", "deepseek"),
-    ]
     
-    # LoRA параметры
-    tuning_method = config.get("tuning_method", "lora")
-    if tuning_method in ("lora", "qlora"):
-        cmd.append("--use_lora")
-        if config.get("lora_r"):
-            cmd.extend(["--lora_r", str(config.get("lora_r"))])
+    # Передаём конфиг как JSON строку
+    config_json = json.dumps(config, default=str)
+    
+    # Определяем режим distributed (как в start_training)
+    distributed_mode = config.get("distributed_mode", "default")
+    config_file = config.get("config_file")
+    num_gpus = config.get("num_gpus", 1)
+    
+    # Формируем команду в зависимости от режима distributed
+    if distributed_mode != "default" and config_file:
+        # Используем accelerate launch с конфигом (как в pretrain/SFT)
+        cmd = [
+            "accelerate", "launch",
+            "--config_file", config_file,
+            "--num_processes", str(num_gpus),
+            "-m", "homellm.training.rl.train_gsm8k",
+            "--config_json", config_json,
+        ]
     else:
-        cmd.append("--no_lora")
+        # Обычный запуск (single GPU или CPU)
+        cmd = [
+            sys.executable, "-m", "homellm.training.rl.train_gsm8k",
+            "--config_json", config_json,
+        ]
     
-    if tuning_method == "qlora" or config.get("use_4bit"):
-        cmd.append("--use_4bit")
-    
-    # Датасет
-    if config.get("grpo_dataset_source") == "GSM8K (математика)":
-        if config.get("grpo_max_samples"):
-            cmd.extend(["--max_samples", str(config.get("grpo_max_samples"))])
-    elif config.get("grpo_dataset_path"):
-        cmd.extend(["--dataset_file", config.get("grpo_dataset_path")])
-    
-    # Сохраняем команду для отладки
+    # Сохраняем команду для отладки (без длинного JSON)
     cmd_path = run_dir / "command.txt"
     with open(cmd_path, "w") as f:
-        f.write(" ".join(cmd))
+        if distributed_mode != "default" and config_file:
+            f.write(f"accelerate launch --config_file {config_file} --num_processes {num_gpus} -m homellm.training.rl.train_gsm8k --config_json <config from {config_path}>")
+        else:
+            f.write(f"{sys.executable} -m homellm.training.rl.train_gsm8k --config_json <config from {config_path}>")
     
     stdout_file = open(stdout_path, "w")
     stderr_file = open(stderr_path, "w")
     
+    # ВАЖНО: применяем выбор GPU из UI (как в start_training)
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    gpu_ids = config.get("gpu_ids") or []
+    if gpu_ids:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+        logger.info(f"🎯 Используются GPU: {gpu_ids}")
     
     process = subprocess.Popen(
         cmd,
@@ -1179,10 +1245,19 @@ def render_grpo_sidebar_config():
     # Генерация
     group_size = st.sidebar.slider(
         "Group size (G)",
-        min_value=2,
+        min_value=8,
         max_value=32,
         value=8,
-        help="Количество генераций на один промпт"
+        help="Количество генераций на один промпт. Важно: для GRPO обычно нужно G>=8 для стабильного обучения."
+    )
+
+    prompt_batch_size = st.sidebar.slider(
+        "Prompt batch size (prompts/step)",
+        min_value=1,
+        max_value=64,
+        value=8,
+        step=1,
+        help="Сколько разных промптов (задач) брать на один RL-шаг (rollouts_per_step в re-grpo)."
     )
     
     max_new_tokens = st.sidebar.slider(
@@ -1210,6 +1285,24 @@ def render_grpo_sidebar_config():
         value=5e-6,
         format_func=lambda x: f"{x:.0e}",
         help="Для RL обычно требуется меньший LR чем для SFT"
+    )
+    
+    train_batch_size = st.sidebar.slider(
+        "Train Batch Size",
+        min_value=1,
+        max_value=16,
+        value=2,
+        step=1,
+        help="Размер микро-батча при обучении на опыте. Уменьшите до 1-2, если возникает OOM (как в re-grpo)."
+    )
+
+    grpo_grad_accum = st.sidebar.slider(
+        "Gradient accumulation steps",
+        min_value=1,
+        max_value=32,
+        value=4,
+        step=1,
+        help="Накопление градиентов (как в PPO/GRPO). Не меняет семантику данных, только эффективный batch на шаг оптимизации."
     )
     
     max_steps = st.sidebar.number_input(
@@ -1261,12 +1354,21 @@ def render_grpo_sidebar_config():
             help="Агрегировать loss по токенам, а не по сэмплам"
         )
     
+    # ВАЖНО: LoRA параметры и квантизация берутся из render_model_config() (секция "🎯 Метод тюнинга")
+    # Здесь мы НЕ дублируем их, чтобы избежать повторения в UI
+    # Все LoRA параметры (use_lora, lora_r, lora_alpha, lora_dropout, lora_target_modules)
+    # и квантизация (use_4bit, use_8bit) будут взяты из model_config
+    
     return {
+        # GRPO параметры (обязательные)
         "grpo_algorithm": algorithm,
         "grpo_group_size": group_size,
+        "grpo_prompt_batch_size": prompt_batch_size,
         "grpo_max_new_tokens": max_new_tokens,
         "grpo_temperature": temperature,
         "grpo_learning_rate": grpo_learning_rate,
+        "grpo_train_batch_size": train_batch_size,
+        "gradient_accumulation": grpo_grad_accum,
         "grpo_max_steps": max_steps,
         "grpo_epochs_per_step": epochs_per_step,
         "grpo_kl_weight": kl_weight,
@@ -1278,145 +1380,766 @@ def render_grpo_sidebar_config():
 
 
 def render_grpo_main_config(data_path: str = None):
-    """Конфигурация GRPO в основной области (reward функции)."""
-    st.markdown("### 🎯 Настройка Reward функций")
+    """Универсальный конструктор Reward функций с визуальным редактором правил."""
+    import re
+    import json as json_lib
     
-    st.info("""
-    **Reward функции** определяют, как оценивать качество ответов модели.
-    Можно комбинировать несколько функций с разными весами.
-    """)
-    
-    # Датасет
-    st.markdown("#### 📚 Датасет для обучения")
-    
-    dataset_source = st.radio(
-        "Источник данных",
-        ["GSM8K (математика)", "Свой датасет (JSONL)"],
-        horizontal=True,
-    )
+    # =========================================================================
+    # 1. ДАТАСЕТ (первая секция!)
+    # =========================================================================
+    st.markdown("### 📚 Датасет для Reasoning")
     
     grpo_dataset_path = None
     grpo_max_samples = None
+    grpo_dataset_language = "en"
+    dataset_source = "custom"
+    dataset_key = "custom"
     
-    if dataset_source == "GSM8K (математика)":
-        st.caption("GSM8K — датасет математических задач для обучения reasoning")
-        grpo_max_samples = st.number_input(
-            "Количество примеров",
-            min_value=10,
-            max_value=10000,
-            value=500,
-            step=50,
-        )
-    else:
-        if data_path and data_path.endswith(".jsonl"):
-            grpo_dataset_path = data_path
-            st.success(f"Используется выбранный датасет: `{Path(data_path).name}`")
+    # Получаем список локальных датасетов
+    local_datasets = []
+    if DATASET_DIR.exists():
+        for f in sorted(DATASET_DIR.iterdir(), key=lambda x: x.name.lower()):
+            if f.suffix in (".jsonl", ".json"):
+                local_datasets.append(f)
+    
+    # Формируем список для выбора (все датасеты)
+    dataset_options = ["-- Выберите датасет --"]
+    for f in local_datasets:
+        dataset_options.append(str(f))
+    
+    # Если data_path передан, используем его
+    default_idx = 0
+    if data_path and data_path in dataset_options:
+        default_idx = dataset_options.index(data_path)
+    elif data_path:
+        # Проверяем по имени файла
+        for i, opt in enumerate(dataset_options):
+            if data_path in opt:
+                default_idx = i
+                break
+    
+    selected_dataset = st.selectbox(
+        "Выберите датасет",
+        options=dataset_options,
+        index=default_idx,
+        help="Скачайте датасеты на вкладке 'Данные' → 🧠 Reasoning: GSM8K, MATH-RU и др."
+    )
+    
+    # Обрабатываем выбор
+    if selected_dataset and not selected_dataset.startswith("--"):
+        grpo_dataset_path = selected_dataset
+        st.success(f"✅ Выбран: `{Path(selected_dataset).name}`")
+        
+        # Определяем язык по имени файла
+        if "ru" in selected_dataset.lower() or "russian" in selected_dataset.lower():
+            grpo_dataset_language = "ru"
         else:
-            grpo_dataset_path = st.text_input(
-                "Путь к JSONL файлу",
-                placeholder="/path/to/dataset.jsonl",
-                help="JSONL файл с полями: prompt (или question), answer"
+            grpo_dataset_language = "en"
+    else:
+        st.warning("⚠️ Выберите датасет или скачайте его на вкладке **💾 Данные** → 🧠 Reasoning")
+    
+    # Настройки датасета
+    col1, col2 = st.columns(2)
+    with col1:
+        grpo_max_samples = st.number_input(
+            "Макс. примеров (0 = все)",
+            min_value=0,
+            max_value=50000,
+            value=500,
+            step=100,
+            help="Ограничить количество примеров для обучения"
+        )
+    with col2:
+        grpo_dataset_language = st.selectbox(
+            "Язык датасета",
+            ["en", "ru"],
+            index=1 if grpo_dataset_language == "ru" else 0,
+            format_func=lambda x: "🇬🇧 English" if x == "en" else "🇷🇺 Русский",
+        )
+    
+    st.markdown("---")
+    
+    # =========================================================================
+    # 2. REWARD DESIGNER
+    # =========================================================================
+    st.markdown("### 🎯 Reward Designer")
+    st.caption("Создавайте гибкие правила вознаграждения с условиями, паттернами и формулами")
+    
+    # =========================================================================
+    # Песочница — Тестовые данные
+    # =========================================================================
+    st.markdown("#### 🧪 Песочница для проектирования")
+    
+    with st.expander("📝 Тестовые данные", expanded=True):
+        col_left, col_right = st.columns(2)
+        
+        with col_left:
+            sample_prompt = st.text_area(
+                "**Промпт** (вопрос/задача)",
+                value="Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?",
+                height=100,
+                key="sample_prompt",
+            )
+            sample_reference = st.text_input(
+                "**Эталонный ответ**",
+                value="72",
+                key="sample_reference",
+            )
+        
+        with col_right:
+            st.markdown("**Ответ модели** (редактируйте для тестов):")
+            # Пресеты ответов
+            response_presets = {
+                "✅ Правильный с тегами": """<reasoning>
+In April, Natalia sold 48 clips.
+In May, she sold half as many: 48 / 2 = 24 clips.
+Total: 48 + 24 = 72 clips.
+</reasoning>
+<answer>72</answer>""",
+                "⚠️ Неправильный ответ": """<reasoning>
+April: 48 clips
+May: 48 / 2 = 24 clips  
+Total: 48 + 24 = 70 clips
+</reasoning>
+<answer>70</answer>""",
+                "❌ Без тегов": "Natalia sold 48 clips in April and 24 in May, so 72 total.",
+                "🔁 С повторами": """<reasoning>
+Let me solve this step by step.
+Step by step I will solve this.
+In April she sold 48 clips.
+In April she sold 48 clips.
+Total is 72.
+</reasoning>
+<answer>72</answer>""",
+            }
+            preset = st.selectbox("Быстрый выбор:", list(response_presets.keys()))
+            current_response = st.text_area(
+                "Ответ модели",
+                value=response_presets[preset],
+                height=180,
+                key="current_test_response",
+                label_visibility="collapsed",
             )
     
     st.markdown("---")
-    st.markdown("#### 🏆 Reward функции")
     
-    # Пресеты reward функций
-    reward_preset = st.selectbox(
-        "Пресет",
-        [
-            "🧮 Математика (GSM8K)",
-            "💬 Общий reasoning",
-            "🔧 Кастомный",
-        ],
-        help="Выберите пресет или настройте reward функции вручную"
-    )
+    # =========================================================================
+    # Универсальный конструктор правил
+    # =========================================================================
+    st.markdown("#### 🏗️ Конструктор Reward-правил")
     
-    reward_configs = []
+    # Справка по переменным
+    with st.expander("📖 Справка: переменные и синтаксис", expanded=False):
+        st.markdown("""
+**Доступные переменные:**
+- `{{response}}` — ответ модели
+- `{{reference}}` — эталонный ответ  
+- `{{prompt}}` — исходный промпт
+- `{{extracted.имя}}` — значение, извлечённое regex-группой
+
+**Операторы сравнения:**
+- `contains` — содержит подстроку
+- `not_contains` — не содержит
+- `matches` — соответствует regex
+- `not_matches` — не соответствует regex
+- `equals` — точное совпадение
+- `==`, `!=`, `>`, `<`, `>=`, `<=` — для чисел
+
+**Пример regex с группами:**
+```
+<answer>(?P<model_answer>\\d+)</answer>
+```
+Извлечёт число в переменную `{{extracted.model_answer}}`
+
+**Формула reward:**
+```
+1.0 if {{extracted.model_answer}} == {{reference}} else 0.0
+```
+        """)
     
-    if reward_preset == "🧮 Математика (GSM8K)":
-        # Показываем какие функции включены
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("**✅ Format Check**")
-            st.caption("Проверка наличия <reasoning> и <answer> тегов")
-            format_weight = st.slider("Вес", 0.0, 2.0, 1.0, 0.1, key="format_w")
-        with col2:
-            st.markdown("**✅ Reasoning Quality**")
-            st.caption("Бонус за содержательное reasoning")
-            reasoning_weight = st.slider("Вес", 0.0, 2.0, 0.5, 0.1, key="reasoning_w")
-        with col3:
-            st.markdown("**✅ Math Correctness**")
-            st.caption("Проверка правильности числового ответа")
-            correctness_weight = st.slider("Вес", 0.0, 5.0, 2.0, 0.1, key="correctness_w")
-        
-        reward_configs = [
-            {"type": "format", "weight": format_weight},
-            {"type": "reasoning_quality", "weight": reasoning_weight},
-            {"type": "gsm8k_correctness", "weight": correctness_weight},
+    # Инициализация правил
+    if "reward_rules" not in st.session_state:
+        st.session_state.reward_rules = [
+            {
+                "id": 0,
+                "name": "Проверка формата",
+                "enabled": True,
+                "weight": 1.0,
+                "conditions": [
+                    {"type": "contains", "target": "{{response}}", "value": "<reasoning>"},
+                    {"type": "contains", "target": "{{response}}", "value": "</reasoning>"},
+                    {"type": "contains", "target": "{{response}}", "value": "<answer>"},
+                    {"type": "contains", "target": "{{response}}", "value": "</answer>"},
+                ],
+                "condition_logic": "all",  # all / any / custom
+                "reward_formula": "1.0",
+                "else_reward": "0.0",
+            },
+            {
+                "id": 1,
+                "name": "Правильный ответ",
+                "enabled": True,
+                "weight": 2.0,
+                "extractors": [
+                    {"name": "model_answer", "pattern": r"<answer>\s*(\d+)\s*</answer>", "source": "{{response}}"},
+                ],
+                "conditions": [
+                    {"type": "equals_numeric", "left": "{{extracted.model_answer}}", "right": "{{reference}}", "tolerance": 0.01},
+                ],
+                "condition_logic": "all",
+                "reward_formula": "1.0",
+                "else_reward": "0.0",
+            },
+            {
+                "id": 2,
+                "name": "Качество reasoning",
+                "enabled": True,
+                "weight": 0.5,
+                "extractors": [
+                    {"name": "reasoning_text", "pattern": r"<reasoning>(.*?)</reasoning>", "source": "{{response}}", "flags": "DOTALL"},
+                ],
+                "conditions": [
+                    {"type": "length_between", "target": "{{extracted.reasoning_text}}", "min": 50, "max": 2000},
+                ],
+                "condition_logic": "all",
+                "reward_formula": "min(len({{extracted.reasoning_text}}) / 200.0, 1.0)",
+                "else_reward": "0.0",
+            },
         ]
-        
-    elif reward_preset == "💬 Общий reasoning":
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**✅ Format Check**")
-            format_weight = st.slider("Вес", 0.0, 2.0, 1.0, 0.1, key="format_w2")
-        with col2:
-            st.markdown("**✅ Reasoning Quality**")
-            reasoning_weight = st.slider("Вес", 0.0, 2.0, 1.0, 0.1, key="reasoning_w2")
-        
-        reward_configs = [
-            {"type": "format", "weight": format_weight},
-            {"type": "reasoning_quality", "weight": reasoning_weight},
-        ]
-        
-    else:  # Кастомный
-        st.markdown("Добавьте reward функции:")
-        
-        # Динамическое добавление функций
-        if "custom_rewards" not in st.session_state:
-            st.session_state.custom_rewards = [{"type": "format", "weight": 1.0}]
-        
-        reward_types = {
-            "format": "Format Check (теги <reasoning>, <answer>)",
-            "reasoning_quality": "Reasoning Quality (длина и содержание)",
-            "gsm8k_correctness": "GSM8K Correctness (числовой ответ)",
-            "exact_match": "Exact Match (точное совпадение)",
-            "contains_answer": "Contains Answer (ответ содержится)",
-            "length_penalty": "Length Penalty (штраф за длину)",
-        }
-        
-        for i, reward in enumerate(st.session_state.custom_rewards):
-            col1, col2, col3 = st.columns([3, 1, 1])
-            with col1:
-                reward["type"] = st.selectbox(
-                    f"Функция {i+1}",
-                    options=list(reward_types.keys()),
-                    format_func=lambda x: reward_types.get(x, x),
-                    index=list(reward_types.keys()).index(reward["type"]) if reward["type"] in reward_types else 0,
-                    key=f"reward_type_{i}",
-                )
-            with col2:
-                reward["weight"] = st.number_input(
-                    "Вес",
-                    min_value=0.0,
-                    max_value=10.0,
-                    value=reward.get("weight", 1.0),
-                    step=0.1,
-                    key=f"reward_weight_{i}",
-                )
-            with col3:
-                if st.button("🗑️", key=f"remove_reward_{i}"):
-                    st.session_state.custom_rewards.pop(i)
+        st.session_state.next_rule_id = 3
+    
+    # Функция для рендеринга одного правила
+    def render_rule(rule, idx):
+        with st.expander(
+            f"{'✅' if rule['enabled'] else '⏸️'} **{rule['name']}** (вес: {rule['weight']})",
+            expanded=False
+        ):
+            # Заголовок правила
+            c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+            with c1:
+                rule["name"] = st.text_input("Название", value=rule["name"], key=f"rule_name_{rule['id']}")
+            with c2:
+                rule["weight"] = st.number_input("Вес", 0.0, 10.0, float(rule["weight"]), 0.1, key=f"rule_weight_{rule['id']}")
+            with c3:
+                rule["enabled"] = st.checkbox("Вкл", value=rule["enabled"], key=f"rule_enabled_{rule['id']}")
+            with c4:
+                if st.button("🗑️", key=f"rule_del_{rule['id']}"):
+                    st.session_state.reward_rules.pop(idx)
                     st.rerun()
-        
-        if st.button("➕ Добавить функцию"):
-            st.session_state.custom_rewards.append({"type": "format", "weight": 1.0})
-            st.rerun()
-        
-        reward_configs = st.session_state.custom_rewards.copy()
+            
+            # === EXTRACTORS (regex для извлечения значений) ===
+            st.markdown("##### 🔍 Экстракторы (regex)")
+            st.caption("Извлекают значения из текста в переменные `{{extracted.имя}}`")
+            
+            if "extractors" not in rule:
+                rule["extractors"] = []
+            
+            for ei, ext in enumerate(rule["extractors"]):
+                ec1, ec2, ec3, ec4 = st.columns([2, 4, 2, 1])
+                with ec1:
+                    ext["name"] = st.text_input("Имя", value=ext.get("name", f"var{ei}"), key=f"ext_name_{rule['id']}_{ei}")
+                with ec2:
+                    ext["pattern"] = st.text_input("Regex", value=ext.get("pattern", ""), key=f"ext_pattern_{rule['id']}_{ei}")
+                with ec3:
+                    ext["source"] = st.selectbox(
+                        "Источник", 
+                        ["{{response}}", "{{reference}}", "{{prompt}}"],
+                        index=["{{response}}", "{{reference}}", "{{prompt}}"].index(ext.get("source", "{{response}}")),
+                        key=f"ext_source_{rule['id']}_{ei}"
+                    )
+                with ec4:
+                    if st.button("✖", key=f"ext_del_{rule['id']}_{ei}"):
+                        rule["extractors"].pop(ei)
+                        st.rerun()
+            
+            if st.button("➕ Добавить экстрактор", key=f"add_ext_{rule['id']}"):
+                rule["extractors"].append({"name": f"var{len(rule['extractors'])}", "pattern": r"(.*)", "source": "{{response}}"})
+                st.rerun()
+            
+            st.markdown("---")
+            
+            # === CONDITIONS ===
+            st.markdown("##### ⚡ Условия")
+            
+            condition_types = {
+                "contains": "содержит",
+                "not_contains": "не содержит",
+                "matches": "соответствует regex",
+                "not_matches": "не соответствует regex",
+                "equals": "равно (строка)",
+                "equals_numeric": "равно (число)",
+                "greater": "> больше",
+                "less": "< меньше",
+                "length_between": "длина в диапазоне",
+                "length_min": "длина >= мин",
+                "length_max": "длина <= макс",
+            }
+            
+            if "conditions" not in rule:
+                rule["conditions"] = []
+            
+            for ci, cond in enumerate(rule["conditions"]):
+                ctype = cond.get("type", "contains")
+                
+                cc1, cc2 = st.columns([1, 4])
+                with cc1:
+                    if ci > 0:
+                        st.write("**AND**" if rule.get("condition_logic") == "all" else "**OR**")
+                    else:
+                        st.write("**IF**")
+                
+                with cc2:
+                    ccc1, ccc2, ccc3, ccc4 = st.columns([3, 2, 3, 1])
+                    
+                    with ccc1:
+                        # Левый операнд
+                        target_options = ["{{response}}", "{{reference}}", "{{prompt}}"]
+                        # Добавляем извлечённые переменные
+                        for ext in rule.get("extractors", []):
+                            target_options.append(f"{{{{extracted.{ext['name']}}}}}")
+                        
+                        left_val = cond.get("target") or cond.get("left", "{{response}}")
+                        if left_val not in target_options:
+                            target_options.append(left_val)
+                        
+                        new_left = st.selectbox(
+                            "Что проверять",
+                            target_options,
+                            index=target_options.index(left_val) if left_val in target_options else 0,
+                            key=f"cond_left_{rule['id']}_{ci}",
+                            label_visibility="collapsed"
+                        )
+                        cond["target"] = new_left
+                        cond["left"] = new_left
+                    
+                    with ccc2:
+                        new_type = st.selectbox(
+                            "Оператор",
+                            list(condition_types.keys()),
+                            format_func=lambda x: condition_types.get(x, x),
+                            index=list(condition_types.keys()).index(ctype) if ctype in condition_types else 0,
+                            key=f"cond_type_{rule['id']}_{ci}",
+                            label_visibility="collapsed"
+                        )
+                        cond["type"] = new_type
+                    
+                    with ccc3:
+                        # Правый операнд зависит от типа
+                        if new_type in ["contains", "not_contains", "equals"]:
+                            cond["value"] = st.text_input("Значение", value=cond.get("value", ""), key=f"cond_val_{rule['id']}_{ci}", label_visibility="collapsed")
+                        elif new_type in ["matches", "not_matches"]:
+                            cond["pattern"] = st.text_input("Regex", value=cond.get("pattern", ""), key=f"cond_pat_{rule['id']}_{ci}", label_visibility="collapsed")
+                        elif new_type == "equals_numeric":
+                            right_opts = ["{{reference}}"] + [f"{{{{extracted.{e['name']}}}}}" for e in rule.get("extractors", [])]
+                            right_val = cond.get("right", "{{reference}}")
+                            if right_val not in right_opts:
+                                right_opts.append(right_val)
+                            cond["right"] = st.selectbox("Сравнить с", right_opts, index=right_opts.index(right_val) if right_val in right_opts else 0, key=f"cond_right_{rule['id']}_{ci}", label_visibility="collapsed")
+                            cond["tolerance"] = st.number_input("±", 0.0, 100.0, float(cond.get("tolerance", 0.01)), 0.01, key=f"cond_tol_{rule['id']}_{ci}", label_visibility="collapsed")
+                        elif new_type in ["greater", "less"]:
+                            cond["value"] = st.number_input("Число", value=float(cond.get("value", 0)), key=f"cond_num_{rule['id']}_{ci}", label_visibility="collapsed")
+                        elif new_type == "length_between":
+                            lc1, lc2 = st.columns(2)
+                            cond["min"] = lc1.number_input("Мин", 0, 100000, int(cond.get("min", 10)), key=f"cond_min_{rule['id']}_{ci}")
+                            cond["max"] = lc2.number_input("Макс", 0, 100000, int(cond.get("max", 5000)), key=f"cond_max_{rule['id']}_{ci}")
+                        elif new_type == "length_min":
+                            cond["min"] = st.number_input("Мин длина", 0, 100000, int(cond.get("min", 10)), key=f"cond_minl_{rule['id']}_{ci}", label_visibility="collapsed")
+                        elif new_type == "length_max":
+                            cond["max"] = st.number_input("Макс длина", 0, 100000, int(cond.get("max", 5000)), key=f"cond_maxl_{rule['id']}_{ci}", label_visibility="collapsed")
+                    
+                    with ccc4:
+                        if st.button("✖", key=f"cond_del_{rule['id']}_{ci}"):
+                            rule["conditions"].pop(ci)
+                            st.rerun()
+            
+            # Логика объединения условий
+            lc1, lc2 = st.columns([2, 3])
+            with lc1:
+                rule["condition_logic"] = st.radio(
+                    "Логика",
+                    ["all", "any"],
+                    format_func=lambda x: "ВСЕ условия (AND)" if x == "all" else "ЛЮБОЕ условие (OR)",
+                    index=0 if rule.get("condition_logic", "all") == "all" else 1,
+                    key=f"cond_logic_{rule['id']}",
+                    horizontal=True
+                )
+            with lc2:
+                if st.button("➕ Добавить условие", key=f"add_cond_{rule['id']}"):
+                    rule["conditions"].append({"type": "contains", "target": "{{response}}", "value": ""})
+                    st.rerun()
+            
+            st.markdown("---")
+            
+            # === REWARD FORMULA ===
+            st.markdown("##### 🎯 Формула Reward")
+            
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                rule["reward_formula"] = st.text_input(
+                    "Если условия TRUE",
+                    value=rule.get("reward_formula", "1.0"),
+                    key=f"reward_form_{rule['id']}",
+                    help="Можно использовать переменные и Python-выражения: `min(len({{extracted.text}}) / 100, 1.0)`"
+                )
+            with rc2:
+                rule["else_reward"] = st.text_input(
+                    "Если условия FALSE",
+                    value=rule.get("else_reward", "0.0"),
+                    key=f"else_form_{rule['id']}"
+                )
     
+    # Рендерим все правила
+    for idx, rule in enumerate(st.session_state.reward_rules):
+        render_rule(rule, idx)
+    
+    # Кнопки добавления
+    st.markdown("---")
+    
+    col_add1, col_add2, col_add3 = st.columns(3)
+    
+    with col_add1:
+        if st.button("➕ Пустое правило", type="secondary"):
+            new_id = st.session_state.next_rule_id
+            st.session_state.next_rule_id += 1
+            st.session_state.reward_rules.append({
+                "id": new_id,
+                "name": f"Правило {new_id + 1}",
+                "enabled": True,
+                "weight": 1.0,
+                "extractors": [],
+                "conditions": [],
+                "condition_logic": "all",
+                "reward_formula": "1.0",
+                "else_reward": "0.0",
+            })
+            st.rerun()
+    
+    with col_add2:
+        preset_rules = st.selectbox(
+            "Добавить шаблон",
+            [
+                "-- выберите --",
+                "🔍 Regex + сравнение",
+                "🏷️ Проверка тегов",
+                "📏 Проверка длины",
+                "🔤 Ключевые слова",
+                "🔄 Штраф за повторы",
+                "🐍 Python формула",
+            ],
+            key="preset_select"
+        )
+    
+    with col_add3:
+        if st.button("➕ Добавить шаблон", type="primary"):
+            new_id = st.session_state.next_rule_id
+            st.session_state.next_rule_id += 1
+            
+            if preset_rules == "🔍 Regex + сравнение":
+                st.session_state.reward_rules.append({
+                    "id": new_id, "name": "Regex извлечение", "enabled": True, "weight": 1.0,
+                    "extractors": [{"name": "answer", "pattern": r"<answer>\s*(\d+)\s*</answer>", "source": "{{response}}"}],
+                    "conditions": [{"type": "equals_numeric", "left": "{{extracted.answer}}", "right": "{{reference}}", "tolerance": 0.01}],
+                    "condition_logic": "all", "reward_formula": "1.0", "else_reward": "0.0",
+                })
+            elif preset_rules == "🏷️ Проверка тегов":
+                st.session_state.reward_rules.append({
+                    "id": new_id, "name": "Формат тегов", "enabled": True, "weight": 1.0,
+                    "extractors": [],
+                    "conditions": [
+                        {"type": "contains", "target": "{{response}}", "value": "<reasoning>"},
+                        {"type": "contains", "target": "{{response}}", "value": "</reasoning>"},
+                        {"type": "contains", "target": "{{response}}", "value": "<answer>"},
+                        {"type": "contains", "target": "{{response}}", "value": "</answer>"},
+                    ],
+                    "condition_logic": "all", "reward_formula": "1.0", "else_reward": "0.0",
+                })
+            elif preset_rules == "📏 Проверка длины":
+                st.session_state.reward_rules.append({
+                    "id": new_id, "name": "Длина ответа", "enabled": True, "weight": 0.5,
+                    "extractors": [],
+                    "conditions": [{"type": "length_between", "target": "{{response}}", "min": 100, "max": 3000}],
+                    "condition_logic": "all", "reward_formula": "1.0", "else_reward": "-0.5",
+                })
+            elif preset_rules == "🔤 Ключевые слова":
+                st.session_state.reward_rules.append({
+                    "id": new_id, "name": "Ключевые слова", "enabled": True, "weight": 0.3,
+                    "extractors": [],
+                    "conditions": [
+                        {"type": "contains", "target": "{{response}}", "value": "therefore"},
+                    ],
+                    "condition_logic": "any", "reward_formula": "0.5", "else_reward": "0.0",
+                })
+            elif preset_rules == "🔄 Штраф за повторы":
+                st.session_state.reward_rules.append({
+                    "id": new_id, "name": "Без повторов", "enabled": True, "weight": 0.5,
+                    "extractors": [],
+                    "conditions": [{"type": "not_matches", "target": "{{response}}", "pattern": r"(.{20,})\1"}],
+                    "condition_logic": "all", "reward_formula": "0.5", "else_reward": "-0.5",
+                })
+            elif preset_rules == "🐍 Python формула":
+                st.session_state.reward_rules.append({
+                    "id": new_id, "name": "Python формула", "enabled": True, "weight": 1.0,
+                    "extractors": [{"name": "reasoning", "pattern": r"<reasoning>(.*?)</reasoning>", "source": "{{response}}", "flags": "DOTALL"}],
+                    "conditions": [],
+                    "condition_logic": "all", 
+                    "reward_formula": "min(len({{extracted.reasoning}}) / 500.0, 1.0) if {{extracted.reasoning}} else 0.0",
+                    "else_reward": "0.0",
+                })
+            else:
+                st.warning("Выберите шаблон")
+            st.rerun()
+    
+    # =========================================================================
+    # ТЕСТИРОВАНИЕ
+    # =========================================================================
+    st.markdown("---")
+    st.markdown("#### ▶️ Тестирование правил")
+    
+    def evaluate_rules(response: str, reference: str, prompt: str, rules: list) -> list:
+        """Вычисляет reward для каждого правила."""
+        results = []
+        
+        for rule in rules:
+            if not rule.get("enabled", True):
+                continue
+            
+            result = {
+                "name": rule["name"],
+                "weight": rule["weight"],
+                "extracted": {},
+                "conditions_met": [],
+                "all_conditions_true": False,
+                "raw_reward": 0.0,
+                "weighted_reward": 0.0,
+                "details": "",
+            }
+            
+            # 1. Экстракторы
+            for ext in rule.get("extractors", []):
+                source = ext.get("source", "{{response}}")
+                source_text = source.replace("{{response}}", response).replace("{{reference}}", reference).replace("{{prompt}}", prompt)
+                
+                pattern = ext.get("pattern", "")
+                flags = 0
+                if "DOTALL" in ext.get("flags", ""):
+                    flags |= re.DOTALL
+                if "IGNORECASE" in ext.get("flags", ""):
+                    flags |= re.IGNORECASE
+                
+                try:
+                    match = re.search(pattern, source_text, flags)
+                    if match:
+                        # Поддержка именованных групп и обычных
+                        if match.groups():
+                            result["extracted"][ext["name"]] = match.group(1)
+                        elif match.groupdict():
+                            result["extracted"].update(match.groupdict())
+                        else:
+                            result["extracted"][ext["name"]] = match.group(0)
+                    else:
+                        result["extracted"][ext["name"]] = ""
+                except re.error as e:
+                    result["extracted"][ext["name"]] = f"REGEX_ERROR: {e}"
+            
+            # 2. Условия
+            conditions_results = []
+            for cond in rule.get("conditions", []):
+                cond_type = cond.get("type", "contains")
+                
+                # Подставляем переменные
+                def substitute_vars(text):
+                    if not isinstance(text, str):
+                        return text
+                    text = text.replace("{{response}}", response)
+                    text = text.replace("{{reference}}", reference)
+                    text = text.replace("{{prompt}}", prompt)
+                    for k, v in result["extracted"].items():
+                        text = text.replace(f"{{{{extracted.{k}}}}}", str(v) if v else "")
+                    return text
+                
+                target = substitute_vars(cond.get("target") or cond.get("left", ""))
+                
+                cond_met = False
+                cond_detail = ""
+                
+                try:
+                    if cond_type == "contains":
+                        value = substitute_vars(cond.get("value", ""))
+                        cond_met = value in target
+                        cond_detail = f"'{value[:30]}...' {'✓ найдено' if cond_met else '✗ не найдено'}"
+                    
+                    elif cond_type == "not_contains":
+                        value = substitute_vars(cond.get("value", ""))
+                        cond_met = value not in target
+                        cond_detail = f"'{value[:30]}' {'✓ не содержится' if cond_met else '✗ содержится'}"
+                    
+                    elif cond_type == "matches":
+                        pattern = cond.get("pattern", "")
+                        cond_met = bool(re.search(pattern, target))
+                        cond_detail = f"regex {'✓' if cond_met else '✗'}"
+                    
+                    elif cond_type == "not_matches":
+                        pattern = cond.get("pattern", "")
+                        cond_met = not bool(re.search(pattern, target))
+                        cond_detail = f"not regex {'✓' if cond_met else '✗'}"
+                    
+                    elif cond_type == "equals":
+                        value = substitute_vars(cond.get("value", ""))
+                        cond_met = target.strip() == value.strip()
+                        cond_detail = f"{'✓' if cond_met else '✗'} '{target[:20]}' == '{value[:20]}'"
+                    
+                    elif cond_type == "equals_numeric":
+                        right = substitute_vars(cond.get("right", ""))
+                        tolerance = float(cond.get("tolerance", 0.01))
+                        try:
+                            left_num = float(re.sub(r"[^\d.\-]", "", str(target)))
+                            right_num = float(re.sub(r"[^\d.\-]", "", str(right)))
+                            cond_met = abs(left_num - right_num) <= tolerance
+                            cond_detail = f"{left_num} {'=' if cond_met else '≠'} {right_num} (±{tolerance})"
+                        except:
+                            cond_detail = "✗ не числа"
+                    
+                    elif cond_type == "greater":
+                        value = float(cond.get("value", 0))
+                        try:
+                            num = float(re.sub(r"[^\d.\-]", "", str(target)))
+                            cond_met = num > value
+                            cond_detail = f"{num} {'>' if cond_met else '≤'} {value}"
+                        except:
+                            cond_detail = "✗ не число"
+                    
+                    elif cond_type == "less":
+                        value = float(cond.get("value", 0))
+                        try:
+                            num = float(re.sub(r"[^\d.\-]", "", str(target)))
+                            cond_met = num < value
+                            cond_detail = f"{num} {'<' if cond_met else '≥'} {value}"
+                        except:
+                            cond_detail = "✗ не число"
+                    
+                    elif cond_type == "length_between":
+                        length = len(target)
+                        min_len = int(cond.get("min", 0))
+                        max_len = int(cond.get("max", 99999))
+                        cond_met = min_len <= length <= max_len
+                        cond_detail = f"len={length} {'✓' if cond_met else '✗'} [{min_len}, {max_len}]"
+                    
+                    elif cond_type == "length_min":
+                        length = len(target)
+                        min_len = int(cond.get("min", 0))
+                        cond_met = length >= min_len
+                        cond_detail = f"len={length} >= {min_len} {'✓' if cond_met else '✗'}"
+                    
+                    elif cond_type == "length_max":
+                        length = len(target)
+                        max_len = int(cond.get("max", 99999))
+                        cond_met = length <= max_len
+                        cond_detail = f"len={length} <= {max_len} {'✓' if cond_met else '✗'}"
+                    
+                except Exception as e:
+                    cond_detail = f"✗ ошибка: {e}"
+                
+                conditions_results.append({"met": cond_met, "detail": cond_detail})
+            
+            result["conditions_met"] = conditions_results
+            
+            # Логика объединения
+            logic = rule.get("condition_logic", "all")
+            if not conditions_results:
+                result["all_conditions_true"] = True  # Нет условий = всегда true
+            elif logic == "all":
+                result["all_conditions_true"] = all(c["met"] for c in conditions_results)
+            else:  # any
+                result["all_conditions_true"] = any(c["met"] for c in conditions_results)
+            
+            # 3. Вычисление reward
+            formula = rule.get("reward_formula", "1.0") if result["all_conditions_true"] else rule.get("else_reward", "0.0")
+            
+            # Подстановка переменных в формулу
+            formula = formula.replace("{{response}}", f"'''{response}'''")
+            formula = formula.replace("{{reference}}", f"'''{reference}'''")
+            formula = formula.replace("{{prompt}}", f"'''{prompt}'''")
+            for k, v in result["extracted"].items():
+                safe_v = str(v).replace("'", "\\'") if v else ""
+                formula = formula.replace(f"{{{{extracted.{k}}}}}", f"'''{safe_v}'''")
+            
+            try:
+                # Безопасное вычисление
+                safe_globals = {"__builtins__": {"len": len, "min": min, "max": max, "abs": abs, "float": float, "int": int, "str": str, "bool": bool}}
+                result["raw_reward"] = float(eval(formula, safe_globals))
+            except Exception as e:
+                result["raw_reward"] = 0.0
+                result["details"] = f"Ошибка формулы: {e}"
+            
+            result["weighted_reward"] = result["raw_reward"] * result["weight"]
+            results.append(result)
+        
+        return results
+    
+    if st.button("▶️ Рассчитать Reward", type="primary", use_container_width=True):
+        results = evaluate_rules(
+            current_response, 
+            sample_reference, 
+            sample_prompt, 
+            st.session_state.reward_rules
+        )
+        
+        total_reward = sum(r["weighted_reward"] for r in results)
+        
+        # Показываем результаты
+        st.markdown("##### 📊 Результаты")
+        
+        for r in results:
+            status = "✅" if r["all_conditions_true"] else "❌"
+            
+            with st.container():
+                c1, c2, c3 = st.columns([3, 2, 2])
+                with c1:
+                    st.markdown(f"**{status} {r['name']}**")
+                with c2:
+                    st.write(f"Raw: `{r['raw_reward']:.3f}`")
+                with c3:
+                    color = "green" if r["weighted_reward"] > 0 else ("red" if r["weighted_reward"] < 0 else "gray")
+                    st.markdown(f"×{r['weight']} = **:{color}[{r['weighted_reward']:.3f}]**")
+                
+                # Детали
+                if r["extracted"]:
+                    st.caption(f"📦 Извлечено: {r['extracted']}")
+                
+                for ci, cond in enumerate(r["conditions_met"]):
+                    icon = "✓" if cond["met"] else "✗"
+                    st.caption(f"  {icon} {cond['detail']}")
+                
+                if r["details"]:
+                    st.warning(r["details"])
+        
+        st.markdown("---")
+        color = "green" if total_reward > 0 else "red"
+        st.markdown(f"### 🎯 Итоговый Reward: :{color}[**{total_reward:.3f}**]")
+        
+        # График
+        if results:
+            import plotly.graph_objects as go
+            fig = go.Figure(data=[
+                go.Bar(
+                    x=[r["name"] for r in results],
+                    y=[r["weighted_reward"] for r in results],
+                    marker_color=["#22c55e" if r["weighted_reward"] > 0 else "#ef4444" for r in results],
+                    text=[f"{r['weighted_reward']:.2f}" for r in results],
+                    textposition="outside"
+                )
+            ])
+            fig.update_layout(
+                title="Вклад каждого правила",
+                yaxis_title="Weighted Reward",
+                height=350,
+                showlegend=False,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    
+    # =========================================================================
     # Формат reasoning
+    # =========================================================================
     st.markdown("---")
     st.markdown("#### 📝 Формат Reasoning")
     
@@ -1459,11 +2182,29 @@ def render_grpo_main_config(data_path: str = None):
     with st.expander("📋 Пример формата ответа"):
         st.code(format_examples[reasoning_format], language=None)
     
+    # Собираем конфигурацию reward правил (новый универсальный формат)
+    reward_rules = [
+        {
+            "name": rule["name"],
+            "weight": rule["weight"],
+            "enabled": rule.get("enabled", True),
+            "extractors": rule.get("extractors", []),
+            "conditions": rule.get("conditions", []),
+            "condition_logic": rule.get("condition_logic", "all"),
+            "reward_formula": rule.get("reward_formula", "1.0"),
+            "else_reward": rule.get("else_reward", "0.0"),
+        }
+        for rule in st.session_state.get("reward_rules", [])
+        if rule.get("enabled", True)
+    ]
+    
     return {
         "grpo_dataset_source": dataset_source,
+        "grpo_dataset_key": dataset_key,
         "grpo_dataset_path": grpo_dataset_path,
-        "grpo_max_samples": grpo_max_samples,
-        "grpo_reward_configs": reward_configs,
+        "grpo_dataset_language": grpo_dataset_language,
+        "grpo_max_samples": grpo_max_samples if grpo_max_samples > 0 else None,
+        "grpo_reward_rules": reward_rules,
         "grpo_reasoning_format": reasoning_format,
     }
 
@@ -2468,15 +3209,23 @@ def render_metrics_dashboard(metrics: dict):
         st.metric("Прогресс", f"{progress:.1f}%", suffix)
     
     with col2:
-        loss = metrics.get("current_loss", 0)
-        st.metric("Train Loss", f"{loss:.4f}")
+        if metrics.get("stage") == "grpo":
+            reward = metrics.get("reward", metrics.get("batch_reward_mean", 0))
+            st.metric("Reward", f"{reward:.4f}")
+        else:
+            loss = metrics.get("current_loss", 0)
+            st.metric("Train Loss", f"{loss:.4f}")
     
     with col3:
-        vloss = metrics.get("current_val_loss", None)
-        if vloss is None:
-            st.metric("Val Loss", "—")
+        if metrics.get("stage") == "grpo":
+            kl = metrics.get("kl", 0)
+            st.metric("KL Divergence", f"{kl:.4f}")
         else:
-            st.metric("Val Loss", f"{vloss:.4f}")
+            vloss = metrics.get("current_val_loss", None)
+            if vloss is None:
+                st.metric("Val Loss", "—")
+            else:
+                st.metric("Val Loss", f"{vloss:.4f}")
     
     with col4:
         lr = metrics.get("current_lr", 0)
@@ -2512,7 +3261,213 @@ def render_metrics_dashboard(metrics: dict):
     # ВАЖНО: используем стабильный ключ по run_id, чтобы избежать утечки памяти
     rid = st.session_state.get("current_run_id", "active") or "active"
     
-    if metrics.get("loss_history"):
+    # Специальная секция для GRPO
+    if metrics.get("stage") == "grpo":
+        st.markdown("---")
+        st.subheader("🧠 GRPO Мониторинг")
+        
+        # Метрики GRPO
+        col_grpo1, col_grpo2, col_grpo3, col_grpo4 = st.columns(4)
+        with col_grpo1:
+            reward = metrics.get("reward", metrics.get("batch_reward_mean", 0))
+            st.metric("Reward", f"{reward:.4f}")
+        with col_grpo2:
+            kl = metrics.get("kl", 0)
+            st.metric("KL Divergence", f"{kl:.4f}")
+        with col_grpo3:
+            grad_norm = metrics.get("grad_norm", 0)
+            st.metric("Grad Norm", f"{grad_norm:.4f}")
+        with col_grpo4:
+            buffer_size = metrics.get("buffer_size", 0)
+            st.metric("Buffer Size", f"{buffer_size}")
+        
+        # Графики для GRPO
+        if metrics.get("reward_history") and len(metrics["reward_history"]) > 0:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Reward chart
+                fig_reward = go.Figure()
+                steps = metrics.get("steps_history", list(range(len(metrics["reward_history"]))))
+                fig_reward.add_trace(go.Scatter(
+                    x=steps,
+                    y=metrics["reward_history"],
+                    mode='lines',
+                    name='Reward',
+                    line=dict(color='#10b981', width=2)
+                ))
+                # Добавляем скользящее среднее
+                if len(metrics["reward_history"]) > 10:
+                    import pandas as pd
+                    df_reward = pd.DataFrame({"reward": metrics["reward_history"]})
+                    df_reward["reward_smooth"] = df_reward["reward"].rolling(window=min(10, len(df_reward)//4), min_periods=1).mean()
+                    fig_reward.add_trace(go.Scatter(
+                        x=steps,
+                        y=df_reward["reward_smooth"].tolist(),
+                        mode='lines',
+                        name='Reward (smooth)',
+                        line=dict(color='#34d399', width=2, dash='dash')
+                    ))
+                fig_reward.update_layout(
+                    title="Reward Curve",
+                    xaxis_title="Step",
+                    yaxis_title="Reward",
+                    template="plotly_dark",
+                    height=300,
+                    margin=dict(l=0, r=0, t=40, b=0)
+                )
+                st.plotly_chart(fig_reward, key=f"reward_chart_{rid}")
+            
+            with col2:
+                # Loss chart для GRPO
+                if metrics.get("loss_history") and len(metrics["loss_history"]) > 0:
+                    fig_loss = go.Figure()
+                    steps = metrics.get("steps_history", list(range(len(metrics["loss_history"]))))
+                    fig_loss.add_trace(go.Scatter(
+                        x=steps,
+                        y=metrics["loss_history"],
+                        mode='lines',
+                        name='GRPO Loss',
+                        line=dict(color='#e94560', width=2)
+                    ))
+                    if metrics.get("kl_history") and len(metrics["kl_history"]) > 0:
+                        fig_loss.add_trace(go.Scatter(
+                            x=steps,
+                            y=metrics["kl_history"],
+                            mode='lines',
+                            name='KL Divergence',
+                            line=dict(color='#f59e0b', width=2, dash='dash')
+                        ))
+                    fig_loss.update_layout(
+                        title="Loss & KL Divergence",
+                        xaxis_title="Step",
+                        yaxis_title="Loss / KL",
+                        template="plotly_dark",
+                        height=300,
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
+                    st.plotly_chart(fig_loss, key=f"grpo_loss_chart_{rid}")
+                else:
+                    st.info("Ожидание данных о loss...")
+        
+        # Окошко с семплами
+        st.markdown("---")
+        st.subheader("📝 Примеры генераций")
+        
+        # Загружаем семплы из файла если есть
+        run_id = st.session_state.get("current_run_id")
+        if run_id and run_id != "active":
+            run_dir = RUNS_DIR / run_id
+            
+            # Пробуем найти samples.jsonl в run_dir или в output_dir
+            samples_file = None
+            config_path = run_dir / "config.json"
+            if config_path.exists():
+                try:
+                    with open(config_path) as f:
+                        config = json.load(f)
+                        output_dir = config.get("output_dir", "")
+                        if output_dir:
+                            samples_file = Path(output_dir) / "samples.jsonl"
+                except:
+                    pass
+            
+            # Fallback: ищем в run_dir
+            if not samples_file or not samples_file.exists():
+                samples_file = run_dir / "samples.jsonl"
+            
+            samples_data = []
+            if samples_file.exists():
+                try:
+                    with open(samples_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if line.strip():
+                                samples_data.append(json.loads(line))
+                except Exception as e:
+                    st.warning(f"Не удалось загрузить семплы: {e}")
+            
+            if samples_data:
+                # Показываем последние N семплов
+                num_samples = st.slider("Количество семплов", 1, min(10, len(samples_data)), 3)
+                recent_samples = samples_data[-num_samples:]
+                
+                for idx, sample in enumerate(reversed(recent_samples)):
+                    with st.expander(f"Семпл {len(samples_data) - idx} (Step {sample.get('step', '?')})", expanded=(idx == 0)):
+                        prompt = sample.get("prompt", "")
+                        reference = sample.get("reference_answer", "")
+                        completions = sample.get("completions", [])
+                        rewards = sample.get("rewards", [])
+                        
+                        # Показываем полный промпт+ответ для первого семпла (чтобы видеть что модель видит)
+                        if idx == 0 and completions:
+                            st.markdown("**🔍 Полный промпт + ответ модели (что видит модель):**")
+                            st.caption("Это полный текст который модель видит при генерации, включая системный промпт с инструкциями о тегах")
+                            
+                            # Используем full_texts если есть, иначе конкатенируем
+                            full_texts = sample.get("full_texts", [])
+                            if not full_texts:
+                                full_texts = [prompt + comp for comp in completions]
+                            
+                            # Показываем лучший ответ (с максимальным reward)
+                            if rewards:
+                                best_completion_idx = max(range(len(rewards)), key=lambda i: rewards[i])
+                                best_reward = rewards[best_completion_idx]
+                                best_full_text = full_texts[best_completion_idx] if best_completion_idx < len(full_texts) else prompt + completions[best_completion_idx]
+                                
+                                # Выделяем системный промпт если он есть
+                                system_prompt_start = best_full_text.find("system") if "system" in best_full_text.lower() else -1
+                                if system_prompt_start == -1:
+                                    # Ищем начало инструкций
+                                    for marker in ["<|im_start|>", "A conversation", "Отвечай строго"]:
+                                        if marker in best_full_text:
+                                            system_prompt_start = best_full_text.find(marker)
+                                            break
+                                
+                                st.code(best_full_text, language=None)
+                                st.caption(f"✅ Лучший ответ (reward={best_reward:.4f})")
+                                
+                                # Также показываем худший для сравнения
+                                worst_completion_idx = min(range(len(rewards)), key=lambda i: rewards[i])
+                                worst_reward = rewards[worst_completion_idx]
+                                if worst_reward < best_reward:
+                                    with st.expander(f"📉 Худший ответ (reward={worst_reward:.4f})", expanded=False):
+                                        worst_full_text = full_texts[worst_completion_idx] if worst_completion_idx < len(full_texts) else prompt + completions[worst_completion_idx]
+                                        st.code(worst_full_text, language=None)
+                                        st.caption("Сравните с лучшим ответом выше - видно ли инструкции о тегах в промпте?")
+                            else:
+                                # Если нет rewards, показываем первый
+                                st.code(full_texts[0] if full_texts else prompt + completions[0], language=None)
+                            
+                            st.markdown("---")
+                        
+                        # Текущее отображение: промпт и ответы отдельно
+                        col_s1, col_s2 = st.columns([1, 1])
+                        
+                        with col_s1:
+                            st.markdown("**📥 Промпт:**")
+                            st.code(prompt, language=None)
+                        
+                        with col_s2:
+                            st.markdown("**✅ Эталонный ответ:**")
+                            st.code(reference, language=None)
+                        
+                        st.markdown("**🤖 Ответы модели:**")
+                        
+                        if completions:
+                            for i, (completion, reward) in enumerate(zip(completions, rewards)):
+                                reward_color = "🟢" if reward > 0.5 else "🟡" if reward > 0 else "🔴"
+                                with st.container():
+                                    st.markdown(f"{reward_color} **Ответ {i+1}** (Reward: {reward:.4f})")
+                                    st.code(completion[:500] + ("..." if len(completion) > 500 else ""), language=None)
+                        else:
+                            st.info("Ожидание генераций...")
+            else:
+                st.info("Семплы будут отображаться здесь после начала генераций. Проверьте файл `samples.jsonl` в директории run.")
+        
+        st.markdown("---")
+    
+    # Обычные графики для других стадий
+    elif metrics.get("loss_history"):
         col1, col2 = st.columns(2)
         
         with col1:
@@ -2748,12 +3703,21 @@ def render_data_manager():
         st.subheader("🤗 Скачать с HuggingFace")
         # Словарь пресетов: {название: (repo_id, subset, split)}
         presets = {
+            # Pretrain датасеты
             "🟢 Pretrain: FineWeb-2 (Russian)": ("HuggingFaceFW/fineweb-2", "rus_Cyrl", "train"),
             "🟢 Pretrain: FineWeb-Edu (Educational)": ("HuggingFaceFW/fineweb-edu", "default", "train"),
             "🟢 Pretrain: Wikitext-103": ("wikitext", "wikitext-103-v1", "train"),
+            # SFT датасеты
             "🔵 SFT: OpenOrca-ru": ("d0rj/OpenOrca-ru", "default", "train"),
             "🔵 SFT: ru-instruct": ("d0rj/ru-instruct", "default", "train"),
             "🔵 SFT: GrandMaster-PRO-MAX": ("Vikhrmodels/GrandMaster-PRO-MAX", "default", "train"),
+            # Reasoning датасеты (для GRPO)
+            "🧠 Reasoning: GSM8K (English)": ("gsm8k", "main", "train"),
+            "🧠 Reasoning: GSM8K-RU (Русский)": ("d0rj/gsm8k-ru", "default", "train"),
+            "🧠 Reasoning: MATH-RU (олимпиады)": ("d0rj/competition_math_ru", "default", "train"),
+            "🧠 Reasoning: MGSM (многоязычный)": ("juletxara/mgsm", "ru", "train"),
+            "🧠 Reasoning: ARC-Challenge": ("allenai/ai2_arc", "ARC-Challenge", "train"),
+            # Ручной ввод
             "📝 Ввести вручную...": (None, None, None),
         }
         
@@ -2945,7 +3909,43 @@ def render_data_manager():
                 st.info("⚠️ Структура датасета не загружена. Доступны только лимиты по объему.")
 
 
-        save_filename = st.text_input("Имя файла для сохранения", "dataset.jsonl", key="save_filename")
+        # Формируем дефолтное имя файла из repo_id
+        # Например: "HuggingFaceFW/fineweb-2" → "fineweb-2.jsonl"
+        # "d0rj/gsm8k-ru" → "gsm8k-ru.jsonl"
+        def compute_default_filename():
+            """Вычисляет имя файла на основе текущих значений repo_id и subset."""
+            computed_name = "dataset.jsonl"
+            if repo_id:
+                # Берём часть после "/" (или всё если нет "/")
+                name_part = repo_id.split("/")[-1] if "/" in repo_id else repo_id
+                # Добавляем subset если он не default
+                current_subset = st.session_state.get('hf_subset_select') or st.session_state.get('hf_subset_input') or st.session_state.get('hf_subset_default', '')
+                if current_subset and current_subset not in ('default', 'main', ''):
+                    name_part = f"{name_part}-{current_subset}"
+                computed_name = f"{name_part}.jsonl"
+            return computed_name
+        
+        computed_filename = compute_default_filename()
+        
+        # Создаём уникальный ключ на основе repo_id и subset
+        # Используем этот key для виджета, чтобы он пересоздавался при изменении repo_id/subset
+        current_subset = st.session_state.get('hf_subset_select') or st.session_state.get('hf_subset_input') or st.session_state.get('hf_subset_default', '')
+        repo_subset_key = f"{repo_id}::{current_subset}"
+        
+        # Нормализуем ключ для использования в session_state (убираем спецсимволы)
+        normalized_key = repo_subset_key.replace('/', '_').replace(':', '_').replace('-', '_')
+        widget_key = f"save_filename_{normalized_key}"
+        
+        # Если это новый ключ (repo_id/subset изменились), используем вычисленное имя
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = computed_filename
+        
+        save_filename = st.text_input(
+            "Имя файла для сохранения", 
+            value=st.session_state.get(widget_key, computed_filename), 
+            key=widget_key,
+            help="Автоматически формируется из названия репозитория и subset. Можно изменить вручную."
+        )
         
         # Кнопка скачивания с использованием callback
         def on_download_click(active_filters_map):
@@ -2969,7 +3969,12 @@ def render_data_manager():
             l_gb = st.session_state.get('limit_gb', 2.0)
             l_bytes = int(l_gb * 1024**3)
 
-            s_path = st.session_state.get('save_filename')
+            # Получаем имя файла используя тот же динамический key
+            current_subset_for_key = sub or st.session_state.get('hf_subset_default', '')
+            repo_subset_key_for_download = f"{r_id}::{current_subset_for_key}"
+            normalized_key_for_download = repo_subset_key_for_download.replace('/', '_').replace(':', '_').replace('-', '_')
+            widget_key_for_download = f"save_filename_{normalized_key_for_download}"
+            s_path = st.session_state.get(widget_key_for_download, "dataset.jsonl")
             
             # Передаём фильтры как есть (active_filters_map уже содержит нужные ключи)
             filters_to_pass = active_filters_map or None
@@ -3471,6 +4476,8 @@ def render_model_preview(config: dict, distributed_config: dict = None):
         st.info(f"🔄 **Режим SFT** (Fine-Tuning)\nБазовая модель: `{Path(config.get('base_model_path') or 'Unknown').name}`")
     elif stage == "continual_pretrain":
         st.info(f"🔄 **Режим Continual Pretraining** (Продолжение)\nБазовая модель: `{Path(config.get('base_model_path') or 'Unknown').name}`")
+    elif stage == "grpo":
+        st.info(f"🧠 **Режим GRPO** (RL для Reasoning)\nБазовая модель: `{Path(config.get('base_model_path') or 'Unknown').name}`")
     else:
         st.success("🏗️ **Режим Pretraining** (С нуля)")
 
@@ -3747,7 +4754,14 @@ def main():
         grpo_sidebar_config = render_grpo_sidebar_config()
         # Для GRPO не нужна стандартная конфигурация обучения
         training_config = {}
-        distributed_config = {"distributed_mode": "single_gpu", "num_gpus": 1, "config_file": None, "gpu_ids": []}
+        # ВАЖНО: Для GRPO тоже используем distributed config для поддержки multi-GPU
+        # Создаем минимальный training_config для render_distributed_config
+        dummy_training_config = {
+            # показываем честную семантику в GPU табе: microbatch = train_batch_size
+            "batch_size": grpo_sidebar_config.get("grpo_train_batch_size", 2),
+            "gradient_accumulation": grpo_sidebar_config.get("gradient_accumulation", 4),
+        }
+        distributed_config = render_distributed_config(training_config=dummy_training_config)
     else:
         grpo_sidebar_config = {}
         training_config = render_training_config()
@@ -3763,7 +4777,61 @@ def main():
     output_config = render_output_config(st.session_state.current_model_name)
     
     # Merge configs
+    # ВАЖНО: grpo_sidebar_config должен содержать ВСЕ необходимые параметры
+    # Приоритет: grpo_sidebar_config > model_config (для GRPO)
     full_config = {**model_config, **training_config, **dataset_config, **output_config, **grpo_sidebar_config}
+    
+    # Для GRPO: проверяем что все обязательные параметры установлены
+    if current_stage == "grpo":
+        # Проверяем что LoRA параметры установлены (если use_lora=True)
+        # LoRA параметры должны быть в model_config (из render_model_config())
+        # Определяем use_lora из tuning_method (lora/qlora = use_lora=True)
+        tuning_method = model_config.get("tuning_method", "full")
+        use_lora_from_model = tuning_method in ("lora", "qlora")
+        
+        # Если выбран метод lora/qlora, проверяем что параметры установлены
+        if use_lora_from_model:
+            if "lora_r" not in model_config or model_config.get("lora_r") is None:
+                raise ValueError(
+                    "❌ Выбран метод 'lora' или 'qlora', но lora_r не установлен! "
+                    "Убедитесь что в секции '🎯 Метод тюнинга' указан параметр 'LoRA r'."
+                )
+            if "lora_alpha" not in model_config or model_config.get("lora_alpha") is None:
+                raise ValueError(
+                    "❌ Выбран метод 'lora' или 'qlora', но lora_alpha не установлен! "
+                    "Убедитесь что в секции '🎯 Метод тюнинга' указан параметр 'LoRA alpha'."
+                )
+            # Копируем LoRA параметры из model_config в full_config для передачи в train_gsm8k.py
+            full_config["use_lora"] = True
+            full_config["lora_r"] = model_config["lora_r"]
+            full_config["lora_alpha"] = model_config["lora_alpha"]
+            full_config["lora_dropout"] = model_config.get("lora_dropout")
+            full_config["lora_target_modules"] = model_config.get("lora_target_modules")
+            # Квантизация только для qlora
+            if tuning_method == "qlora":
+                full_config["use_4bit"] = True  # QLoRA всегда использует 4-bit
+                full_config["use_8bit"] = model_config.get("use_8bit", False)
+            else:
+                full_config["use_4bit"] = False
+                full_config["use_8bit"] = False
+        else:
+            # Если метод full, use_lora=False
+            full_config["use_lora"] = False
+            full_config["use_4bit"] = False
+            full_config["use_8bit"] = False
+        
+        # Проверяем что обязательные GRPO параметры установлены
+        required_grpo_params = [
+            "grpo_algorithm", "grpo_group_size", "grpo_max_new_tokens",
+            "grpo_temperature", "grpo_learning_rate", "grpo_kl_weight",
+            "grpo_clip_eps_low"
+        ]
+        missing_params = [p for p in required_grpo_params if p not in full_config]
+        if missing_params:
+            raise ValueError(
+                f"❌ Отсутствуют обязательные GRPO параметры: {missing_params}. "
+                f"Убедитесь что render_grpo_sidebar_config() возвращает все параметры."
+            )
     full_config["distributed_mode"] = distributed_config["distributed_mode"]
     full_config["num_gpus"] = distributed_config["num_gpus"]
     full_config["config_file"] = distributed_config["config_file"]

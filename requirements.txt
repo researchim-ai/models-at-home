@@ -10,6 +10,10 @@ accelerate>=0.28.0
 datasets>=2.19.0
 safetensors>=0.4.0
 
+# PEFT для LoRA/QLoRA
+peft>=0.10.0
+bitsandbytes>=0.43.0  # Для QLoRA (4-bit/8-bit quantization), рекомендуется >=0.45.0
+
 # DeepSpeed (для ZeRO optimizer)
 deepspeed>=0.14.0
 ninja

@@ -87,7 +87,7 @@ class GRPOConfig:
     # Размеры батча
     group_size: int = 8
     batch_size: int = 8  # промптов на шаг роллаута
-    train_batch_size: int = 4  # для обучения
+    train_batch_size: int = 2  # для обучения - уменьшено до 2 чтобы избежать OOM при 1200 токенах
     gradient_accumulation_steps: int = 4
     
     # Параметры генерации
@@ -140,11 +140,13 @@ class GRPOConfig:
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj"
     ])
+    # Если lora_target_modules пустой список, будет использован "all-linear" (автоматическое определение)
     
     # Квантизация
     use_4bit: bool = False
     use_8bit: bool = False
-    use_flash_attention: bool = True
+    quantize_reference_model: bool = False  # Квантизировать ли reference модель (по умолчанию False для точности KL)
+    use_flash_attention: bool = True  # По умолчанию True, flash-attn в requirements.txt
     
     # Формат reasoning
     reasoning_format: str = "deepseek"  # "deepseek" (<think>), "simple" (<reasoning>)
