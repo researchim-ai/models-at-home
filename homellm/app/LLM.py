@@ -436,6 +436,7 @@ def format_time(seconds: float) -> str:
 def load_metrics(run_id: str) -> dict:
     """Загрузить метрики из файла."""
     run_dir = RUNS_DIR / run_id
+    run_config = {}
     
     # Для GRPO читаем из metrics.jsonl (может быть в output_dir или run_dir)
     metrics_jsonl_paths = []
@@ -445,8 +446,8 @@ def load_metrics(run_id: str) -> dict:
     if config_path.exists():
         try:
             with open(config_path) as f:
-                config = json.load(f)
-                output_dir = config.get("output_dir", "")
+                run_config = json.load(f) or {}
+                output_dir = run_config.get("output_dir", "")
                 if output_dir:
                     metrics_jsonl_paths.append(Path(output_dir) / "metrics.jsonl")
         except:
@@ -493,6 +494,65 @@ def load_metrics(run_id: str) -> dict:
                     
                     latest["status"] = latest.get("status", "training")
                     latest["stage"] = "grpo"
+
+                    # Фактические счётчики (если есть в jsonl)
+                    try:
+                        if "prompts_generated" in df.columns:
+                            latest["prompts_generated_total"] = int(df["prompts_generated"].fillna(0).sum())
+                        if "prompts_used" in df.columns:
+                            latest["prompts_used_total"] = int(df["prompts_used"].fillna(0).sum())
+                        if "completions_generated" in df.columns:
+                            latest["completions_generated_total"] = int(df["completions_generated"].fillna(0).sum())
+                        if "experiences_tuned" in df.columns:
+                            latest["experiences_tuned_total"] = int(df["experiences_tuned"].fillna(0).sum())
+                    except Exception:
+                        pass
+
+                    # --- Нормализация прогресса/ETA для GRPO ---
+                    # total_steps: берём из метрик (если логируется) или из run_config (config.json)
+                    total_steps = latest.get("total_steps", None)
+                    if total_steps in (None, "", 0):
+                        # legacy: optim-step лимит
+                        total_steps = run_config.get("grpo_max_optim_steps", run_config.get("grpo_max_steps", run_config.get("max_steps", None)))
+                    try:
+                        total_steps_int = int(total_steps) if total_steps is not None else None
+                    except Exception:
+                        total_steps_int = None
+                    # Если лимита нет — оставляем None (UI покажет "без лимита"), а не "1".
+                    latest["total_steps"] = total_steps_int if (total_steps_int is not None and total_steps_int > 0) else None
+
+                    # elapsed/eta: по timestamp, если он есть
+                    elapsed_seconds = 0.0
+                    eta_seconds = 0.0
+                    try:
+                        if "timestamp" in df.columns:
+                            t0 = pd.to_datetime(df["timestamp"].iloc[0], errors="coerce")
+                            t1 = pd.to_datetime(df["timestamp"].iloc[-1], errors="coerce")
+                            if pd.notna(t0) and pd.notna(t1):
+                                # Если пока всего 1 запись, показываем elapsed как now - t0, чтобы не было "0s" в UI.
+                                if len(df) == 1:
+                                    elapsed_seconds = max(0.0, (pd.Timestamp.now(tz=t0.tz) - t0).total_seconds())
+                                else:
+                                    elapsed_seconds = max(0.0, (t1 - t0).total_seconds())
+
+                        if "timestamp" in df.columns and "step" in df.columns and len(df) >= 2:
+                            s0 = float(df["step"].iloc[0])
+                            s1 = float(df["step"].iloc[-1])
+                            # средняя скорость по наблюдаемым step (учитываем что лог может быть не на каждом шаге)
+                            ds = max(0.0, s1 - s0)
+                            if ds > 0 and elapsed_seconds > 0 and latest["total_steps"] is not None:
+                                sec_per_step = elapsed_seconds / ds
+                                remaining = max(0.0, float(latest["total_steps"]) - float(latest.get("current_step", s1)))
+                                eta_seconds = sec_per_step * remaining
+                    except Exception:
+                        pass
+                    latest["elapsed_seconds"] = float(elapsed_seconds)
+                    latest["eta_seconds"] = float(eta_seconds)
+
+                    # rollout_step тоже прокинем (если есть)
+                    if "rollout_step" in latest:
+                        latest["current_rollout_step"] = latest.get("rollout_step", 0)
+
                     return latest
             except Exception as e:
                 # Не показываем ошибку если это не последний путь
@@ -700,6 +760,10 @@ def start_grpo_training(config: dict) -> tuple[str, subprocess.Popen]:
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     run_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Для "железного" мониторинга прокидываем путь до run_dir в worker.
+    # Worker будет дублировать metrics.jsonl/samples.jsonl в эту директорию.
+    config["ui_run_dir"] = str(run_dir)
     
     config_path = run_dir / "config.json"
     metrics_path = run_dir / "metrics.json"
@@ -1305,13 +1369,21 @@ def render_grpo_sidebar_config():
         help="Накопление градиентов (как в PPO/GRPO). Не меняет семантику данных, только эффективный batch на шаг оптимизации."
     )
     
-    max_steps = st.sidebar.number_input(
-        "Max steps",
-        min_value=10,
-        max_value=10000,
-        value=500,
-        step=50,
-    )
+    # Лимит по данным (понятнее пользователю, чем optim-steps).
+    # По умолчанию: весь датасет (с учётом "Макс. примеров" в main-config).
+    effective_ds = st.session_state.get("grpo_effective_dataset_size", None)
+    if isinstance(effective_ds, int) and effective_ds > 0:
+        grpo_max_prompts = st.sidebar.number_input(
+            "Max prompts (по датасету)",
+            min_value=1,
+            max_value=int(effective_ds),
+            value=int(effective_ds),
+            step=max(1, int(effective_ds) // 50),
+            help="Сколько задач (prompts) пройти всего. По умолчанию = весь датасет (с учётом max_samples).",
+        )
+    else:
+        st.sidebar.info("Выберите датасет в GRPO (вкладка Запуск), чтобы лимит считался от его размера.")
+        grpo_max_prompts = None
     
     epochs_per_step = st.sidebar.slider(
         "Epochs per step",
@@ -1369,7 +1441,7 @@ def render_grpo_sidebar_config():
         "grpo_learning_rate": grpo_learning_rate,
         "grpo_train_batch_size": train_batch_size,
         "gradient_accumulation": grpo_grad_accum,
-        "grpo_max_steps": max_steps,
+        "grpo_max_prompts": grpo_max_prompts,
         "grpo_epochs_per_step": epochs_per_step,
         "grpo_kl_weight": kl_weight,
         "grpo_clip_eps_low": clip_eps_low,
@@ -1445,7 +1517,7 @@ def render_grpo_main_config(data_path: str = None):
             "Макс. примеров (0 = все)",
             min_value=0,
             max_value=50000,
-            value=500,
+            value=0,
             step=100,
             help="Ограничить количество примеров для обучения"
         )
@@ -1458,6 +1530,31 @@ def render_grpo_main_config(data_path: str = None):
         )
     
     st.markdown("---")
+
+    # Оценка размера датасета для лимита "Max prompts" в sidebar
+    try:
+        effective_size = None
+        if grpo_max_samples and int(grpo_max_samples) > 0:
+            # Если пользователь уже ограничил max_samples — используем это как "эффективный размер"
+            effective_size = int(grpo_max_samples)
+        elif grpo_dataset_path:
+            p = Path(grpo_dataset_path)
+            if p.exists() and p.suffix == ".jsonl":
+                # Для reasoning датасетов это обычно не гигабайты — считаем честно
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    effective_size = sum(1 for _ in f if _.strip())
+            elif p.exists() and p.suffix == ".json":
+                import json as _json
+                with open(p, "r", encoding="utf-8") as f:
+                    obj = _json.load(f)
+                if isinstance(obj, list):
+                    effective_size = len(obj)
+        if isinstance(effective_size, int) and effective_size > 0:
+            st.session_state["grpo_effective_dataset_size"] = int(effective_size)
+            st.caption(f"Размер датасета для лимита: **{effective_size} prompts**")
+    except Exception:
+        # не мешаем запуску UI, даже если не смогли посчитать
+        pass
     
     # =========================================================================
     # 2. REWARD DESIGNER
@@ -3200,13 +3297,99 @@ def render_metrics_dashboard(metrics: dict):
     
     with col1:
         current_step = metrics.get("current_step", 0)
-        total_steps = metrics.get("total_steps", 1)
-        progress = current_step / total_steps * 100 if total_steps > 0 else 0
+        total_steps = metrics.get("total_steps", None)
+        progress = (current_step / total_steps * 100) if isinstance(total_steps, (int, float)) and total_steps > 0 else 0
+        # защита от "48000%" и прочих артефактов
+        progress = max(0.0, min(float(progress), 100.0))
         planned_total = metrics.get("planned_total_steps", None)
-        suffix = f"Step {current_step}/{total_steps}"
+        suffix = f"Step {current_step}/{total_steps}" if isinstance(total_steps, (int, float)) and total_steps else f"Step {current_step} (без лимита)"
         if planned_total is not None and int(planned_total) != int(total_steps):
             suffix = f"{suffix} (план: {planned_total})"
         st.metric("Прогресс", f"{progress:.1f}%", suffix)
+
+    # Дополнительный прогресс для GRPO: по датасету (сколько промптов прошло)
+    if metrics.get("stage") == "grpo":
+        run_id = st.session_state.get("current_run_id", None)
+        dataset_total = None
+        prompt_bsz = metrics.get("prompt_batch_size", None)
+        group_size = metrics.get("group_size", None)
+        rollout_step = metrics.get("rollout_step", metrics.get("current_rollout_step", 0))
+        num_gpus = 1
+        try:
+            if run_id:
+                run_dir = RUNS_DIR / run_id
+                cfg_path = run_dir / "config.json"
+                if cfg_path.exists():
+                    with open(cfg_path) as f:
+                        rc = json.load(f) or {}
+                    # num_gpus сохраняем в config.json при запуске GRPO
+                    num_gpus = int(rc.get("num_gpus", 1) or 1)
+                    # dataset_size: берём из run-config если было сохранено, иначе попробуем dataset_info.json из output_dir
+                    dataset_total = rc.get("dataset_size", None)
+                    if dataset_total is None:
+                        out_dir = rc.get("output_dir")
+                        if out_dir:
+                            info_path = Path(out_dir) / "dataset_info.json"
+                            if info_path.exists():
+                                with open(info_path) as inf:
+                                    dataset_total = (json.load(inf) or {}).get("dataset_size", None)
+        except Exception:
+            pass
+        try:
+            dataset_total = int(dataset_total) if dataset_total is not None else None
+        except Exception:
+            dataset_total = None
+        try:
+            prompt_bsz = int(prompt_bsz) if prompt_bsz is not None else None
+        except Exception:
+            prompt_bsz = None
+        try:
+            group_size = int(group_size) if group_size is not None else None
+        except Exception:
+            group_size = None
+        try:
+            rollout_step = int(rollout_step)
+        except Exception:
+            rollout_step = 0
+
+        # prompts/completions: предпочитаем ФАКТ из метрик, иначе fallback на оценку
+        prompts_seen = metrics.get("prompts_generated_total", None)
+        prompts_used = metrics.get("prompts_used_total", None)
+        completions_seen = metrics.get("completions_generated_total", None)
+        experiences_tuned = metrics.get("experiences_tuned_total", None)
+
+        if prompts_seen is None and prompt_bsz is not None:
+            # fallback-оценка (без учёта dynamic sampling добора)
+            prompts_seen = rollout_step * prompt_bsz * max(1, num_gpus)
+        if completions_seen is None and prompts_seen is not None and group_size is not None:
+            completions_seen = prompts_seen * group_size
+
+        if prompts_seen is not None:
+            if dataset_total is not None and dataset_total > 0:
+                ds_progress = max(0.0, min(100.0, prompts_seen / dataset_total * 100.0))
+                st.caption(f"Прогресс по датасету (генерация): **{int(prompts_seen):,}/{dataset_total:,} промптов** ({ds_progress:.1f}%)")
+                st.progress(ds_progress / 100.0)
+            else:
+                st.caption(f"Промптов обработано (генерация): **{int(prompts_seen):,}**")
+
+            if prompts_used is not None:
+                st.caption(f"Промптов использовано в обучении (после фильтрации): **{int(prompts_used):,}**")
+            if completions_seen is not None:
+                st.caption(f"Completion'ов сгенерировано: **{int(completions_seen):,}**")
+            if experiences_tuned is not None:
+                st.caption(f"Experience'ов протюнено (батчей в train): **{int(experiences_tuned):,}**")
+
+        # Скорости (prompts/s, completions/s) по истории steps/timestamps
+        try:
+            elapsed = float(metrics.get("elapsed_seconds", 0.0))
+            if elapsed > 0 and prompts_seen is not None:
+                st.caption(f"Скорость: **{(float(prompts_seen)/elapsed):.2f} промптов/с**")
+            if elapsed > 0 and completions_seen is not None:
+                st.caption(f"Скорость: **{(float(completions_seen)/elapsed):.2f} completion/с**")
+            if elapsed > 0 and experiences_tuned is not None:
+                st.caption(f"Скорость: **{(float(experiences_tuned)/elapsed):.2f} tuned exp/с**")
+        except Exception:
+            pass
     
     with col2:
         if metrics.get("stage") == "grpo":

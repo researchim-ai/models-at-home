@@ -143,11 +143,28 @@ class GRPOTrainer:
         
         # Метрики
         self.global_step = 0
+        # Отдельный счётчик для rollout-батчей (prompts/step). Нужен для понятного мониторинга.
+        self.rollout_step = 0
+        # Уникальные ID для групп (нельзя использовать dataset index при dynamic sampling с добором)
+        self._group_uid = 0
+        # Кумулятивные счётчики для мониторинга "сколько примеров реально прошло"
+        self.cum_prompts_generated = 0
+        self.cum_prompts_used = 0
+        self.cum_completions_generated = 0
+        self.cum_experiences_tuned = 0
+
+        # Прочие метрики/статусы
         self.total_rollouts = 0
         self.best_mean_reward = float("-inf")
         
         # W&B
         self.wandb_run = None
+
+    def _next_group_uids(self, n: int) -> List[int]:
+        """Возвращает n уникальных group_id для группировки Experience."""
+        start = self._group_uid
+        self._group_uid += int(n)
+        return list(range(start, start + int(n)))
     
     def setup(self):
         """Инициализирует все компоненты для обучения."""
@@ -780,7 +797,10 @@ class GRPOTrainer:
         
         # Вычисляем количество шагов
         num_prompts = len(dataset)
-        steps_per_epoch = math.ceil(num_prompts / self.config.batch_size)
+        # Оценка rollout-шагов (для логов/шедулера). В multi-gpu глобально за шаг проходит batch_size * num_processes.
+        world = int(self.accelerator.num_processes) if self.accelerator is not None else 1
+        denom = max(int(self.config.batch_size) * max(world, 1), 1)
+        steps_per_epoch = math.ceil(num_prompts / denom)
         total_steps = steps_per_epoch * self.config.num_epochs
         
         if self.config.max_steps:
@@ -800,7 +820,7 @@ class GRPOTrainer:
             list(range(len(dataset))),
             batch_size=self.config.batch_size,
             shuffle=True,
-            drop_last=True,
+            drop_last=False,
         )
         # ВАЖНО (как в re-grpo accelerate): при multi-gpu делим промпты между процессами
         if self.accelerator is not None:
@@ -860,15 +880,50 @@ class GRPOTrainer:
                 for s in batch_samples
             ]
             reference_answers = [s.reference_answer for s in batch_samples]
-            prompt_ids = [int(i) for i in prompt_indices]
+            # group_id должен быть уникальным для каждой группы (особенно при dynamic sampling с добором)
+            desired_groups = len(batch_samples)
+            group_ids = self._next_group_uids(desired_groups)
             
             # Генерация rollout'ов
             self.replay_buffer.clear()
             batch_rewards = self._generate_and_collect(
                 prompts=prompts,
                 reference_answers=reference_answers,
-                prompt_ids=prompt_ids,
+                prompt_ids=group_ids,
             )
+            refill_rounds = 0
+            # DAPO dynamic sampling: добор групп до нужного размера (НЕ уменьшаем batch автоматически)
+            if self.config.dynamic_sampling:
+                import random
+                max_refill_rounds = 8  # защита от бесконечного цикла
+                while self.replay_buffer.get_stats().get("num_groups", 0) < desired_groups and refill_rounds < max_refill_rounds:
+                    missing = desired_groups - int(self.replay_buffer.get_stats().get("num_groups", 0))
+                    if missing <= 0:
+                        break
+                    # добираем новые промпты (с replacement допустимо, но group_id уникальный)
+                    extra_indices = [random.randrange(0, len(dataset)) for _ in range(missing)]
+                    extra_samples = [dataset[i] for i in extra_indices]
+                    extra_prompts = [
+                        build_reasoning_prompt(s.prompt, self.tokenizer, self.config.reasoning_format)
+                        for s in extra_samples
+                    ]
+                    extra_refs = [s.reference_answer for s in extra_samples]
+                    extra_group_ids = self._next_group_uids(len(extra_samples))
+                    extra_rewards = self._generate_and_collect(
+                        prompts=extra_prompts,
+                        reference_answers=extra_refs,
+                        prompt_ids=extra_group_ids,
+                    )
+                    batch_rewards.extend(extra_rewards)
+                    refill_rounds += 1
+
+                if self.replay_buffer.get_stats().get("num_groups", 0) < desired_groups:
+                    logger.warning(
+                        f"⚠️ dynamic_sampling: не удалось добрать группы до {desired_groups}. "
+                        f"Получилось {self.replay_buffer.get_stats().get('num_groups', 0)} после {refill_rounds} доборов. "
+                        f"Возможная причина: модель даёт одинаковый reward на большинстве промптов."
+                    )
+
             epoch_rewards.extend(batch_rewards)
             
             # Обучение на собранном опыте
@@ -884,17 +939,45 @@ class GRPOTrainer:
             
             epoch_losses.append(train_metrics.get("loss", 0))
             
-            # Логирование
-            if self.global_step % self.config.log_steps == 0:
-                batch_reward_mean = sum(batch_rewards) / len(batch_rewards) if batch_rewards else 0.0
-                self._log_metrics({
-                    "step": self.global_step,
-                    "epoch": epoch,
-                    "batch_reward_mean": batch_reward_mean,
-                    "buffer_size": buffer_size,
-                    "rollouts_count": len(batch_rewards),
-                    **train_metrics,
-                })
+            # ---- Мониторинг ----
+            # ВАЖНО: UI должен получать прогресс сразу, иначе он "зависает" на STARTING.
+            # Поэтому пишем heartbeat метрики КАЖДЫЙ rollout, а в консоль/W&B — по log_steps.
+            batch_reward_mean = sum(batch_rewards) / len(batch_rewards) if batch_rewards else 0.0
+            group_size = max(int(self.config.group_size), 1)
+            prompts_generated = int(len(batch_rewards) // group_size) if group_size > 0 else 0
+            num_groups_used = int(self.replay_buffer.get_stats().get("num_groups", 0))
+            completions_generated = int(len(batch_rewards))
+            experiences_tuned = int(len(self.replay_buffer))
+            filtered_groups = max(0, prompts_generated - num_groups_used)
+
+            # Кумулятивные счётчики (на каждый rollout, чтобы UI показывал "по факту")
+            self.cum_prompts_generated += prompts_generated
+            self.cum_prompts_used += num_groups_used
+            self.cum_completions_generated += completions_generated
+            self.cum_experiences_tuned += experiences_tuned
+
+            heartbeat = {
+                "step": self.global_step,
+                "epoch": epoch,
+                "batch_reward_mean": batch_reward_mean,
+                "buffer_size": buffer_size,
+                "rollouts_count": len(batch_rewards),
+                "prompts_generated": prompts_generated,
+                "prompts_used": num_groups_used,
+                "filtered_groups": filtered_groups,
+                "completions_generated": completions_generated,
+                "experiences_tuned": experiences_tuned,
+                "refill_rounds": refill_rounds,
+                "cum_prompts_generated": int(self.cum_prompts_generated),
+                "cum_prompts_used": int(self.cum_prompts_used),
+                "cum_completions_generated": int(self.cum_completions_generated),
+                "cum_experiences_tuned": int(self.cum_experiences_tuned),
+                **train_metrics,
+            }
+
+            # Пишем метрики каждый rollout (для UI), а консоль/W&B — только по log_steps.
+            should_log = (self.global_step % max(int(self.config.log_steps), 1) == 0)
+            self._log_metrics(heartbeat, jsonl_only=(not should_log))
             
             # Обновляем progress bar
             pbar.set_postfix({
@@ -908,10 +991,28 @@ class GRPOTrainer:
                     self._save_checkpoint(
                         Path(self.config.output_dir) / f"step_{self.global_step}"
                     )
+
+            # Rollout-step завершён (1 batch промптов -> сбор rollout -> train on buffer)
+            self.rollout_step += 1
             
             # Проверяем max_steps
             if self.config.max_steps and self.global_step >= self.config.max_steps:
                 break
+
+            # Проверяем лимит по данным (сколько промптов обработать)
+            if getattr(self.config, "max_prompts", None):
+                try:
+                    world = int(self.accelerator.num_processes) if self.accelerator is not None else 1
+                    prompts_seen = int(self.rollout_step) * int(self.config.batch_size) * max(world, 1)
+                    if prompts_seen >= int(self.config.max_prompts):
+                        logger.info(
+                            f"Достигнут max_prompts={int(self.config.max_prompts)} "
+                            f"(оценка prompts_seen={prompts_seen}), останавливаем обучение"
+                        )
+                        break
+                except Exception:
+                    # если что-то не так — не ломаем обучение
+                    pass
         
         # Валидация
         if eval_dataset and self.is_main_process:
@@ -1074,9 +1175,16 @@ class GRPOTrainer:
         epoch_kls = []
         epoch_grad_norms = []
         
+        from contextlib import nullcontext
+
         for epoch_idx in range(self.config.epochs_per_step):
             for batch_idx, exp_batch in enumerate(exp_loader):
                 exp_batch = exp_batch.to(self.device)
+                accumulate_ctx = (
+                    self.accelerator.accumulate(self.model)
+                    if self.accelerator is not None
+                    else nullcontext()
+                )
                 
                 # ВАЖНО: Логирование размеров батча для диагностики OOM
                 batch_size = exp_batch.sequences.size(0)
@@ -1146,100 +1254,106 @@ class GRPOTrainer:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
-                with autocast_context:
-                    # Очистка кэша перед тяжелой операцией вычисления логитов
+                with accumulate_ctx:
+                    with autocast_context:
+                        # Очистка кэша перед тяжелой операцией вычисления логитов
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            
+                        log_probs = compute_log_probs(
+                            self.model,
+                            exp_batch.sequences,
+                            exp_batch.attention_mask,
+                            accelerator=self.accelerator,
+                        )
+                        
+                        loss, metrics = self.loss_fn(
+                            log_probs=log_probs,
+                            experience=exp_batch,
+                        )
+                
+                    # ВАЖНО: Освобождаем промежуточные активации после forward pass
+                    # Это помогает избежать накопления памяти
+                    del log_probs
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    
+                    # КРИТИЧЕСКИЕ ПРОВЕРКИ перед backward
+                    if not loss.isfinite():
+                        logger.warning(f"Loss не finite: {loss.item()}, пропускаем batch")
+                        continue
+                    
+                    if not loss.requires_grad:
+                        # Детальная диагностика
+                        trainable_count = sum(1 for p in self.model.parameters() if p.requires_grad)
+                        total_count = sum(1 for _ in self.model.parameters())
                         
-                    log_probs = compute_log_probs(
-                        self.model,
-                        exp_batch.sequences,
-                        exp_batch.attention_mask,
-                        accelerator=self.accelerator,
-                    )
+                        # Проверяем что происходит с forward pass
+                        test_seq = exp_batch.sequences[:1, :5]
+                        test_mask = exp_batch.attention_mask[:1, :5]
+                        with torch.enable_grad():
+                            test_output = self.model(input_ids=test_seq, attention_mask=test_mask)
+                            test_logits_grad = test_output.logits.requires_grad
+                        
+                        raise RuntimeError(
+                            f"❌ Loss не требует градиентов!\n"
+                            f"  - loss.requires_grad: {loss.requires_grad}\n"
+                            f"  - loss.dtype: {loss.dtype}\n"
+                            f"  - Модель training: {self.model.training}\n"
+                            f"  - Trainable параметры: {trainable_count}/{total_count}\n"
+                            f"  - Test logits requires_grad: {test_logits_grad}\n"
+                            f"  - use_lora: {self.config.use_lora}\n"
+                            f"  - use_4bit: {self.config.use_4bit}\n"
+                            f"  - use_8bit: {self.config.use_8bit}\n"
+                            f"  - use_autocast: {use_autocast}\n"
+                        )
                     
-                    loss, metrics = self.loss_fn(
-                        log_probs=log_probs,
-                        experience=exp_batch,
-                    )
-                
-                # ВАЖНО: Освобождаем промежуточные активации после forward pass
-                # Это помогает избежать накопления памяти
-                del log_probs
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-                # КРИТИЧЕСКИЕ ПРОВЕРКИ перед backward
-                if not loss.isfinite():
-                    logger.warning(f"Loss не finite: {loss.item()}, пропускаем batch")
-                    continue
-                
-                if not loss.requires_grad:
-                    # Детальная диагностика
-                    trainable_count = sum(1 for p in self.model.parameters() if p.requires_grad)
-                    total_count = sum(1 for _ in self.model.parameters())
+                    # Сохраняем loss для метрик ПЕРЕД backward
+                    loss_value = loss.item()
                     
-                    # Проверяем что происходит с forward pass
-                    test_seq = exp_batch.sequences[:1, :5]
-                    test_mask = exp_batch.attention_mask[:1, :5]
-                    with torch.enable_grad():
-                        test_output = self.model(input_ids=test_seq, attention_mask=test_mask)
-                        test_logits_grad = test_output.logits.requires_grad
+                    # Backward
+                    if self.accelerator is not None:
+                        self.accelerator.backward(loss)
+                    else:
+                        loss.backward()
                     
-                    raise RuntimeError(
-                        f"❌ Loss не требует градиентов!\n"
-                        f"  - loss.requires_grad: {loss.requires_grad}\n"
-                        f"  - loss.dtype: {loss.dtype}\n"
-                        f"  - log_probs.requires_grad: {log_probs.requires_grad}\n"
-                        f"  - log_probs.dtype: {log_probs.dtype}\n"
-                        f"  - Модель training: {self.model.training}\n"
-                        f"  - Trainable параметры: {trainable_count}/{total_count}\n"
-                        f"  - Test logits requires_grad: {test_logits_grad}\n"
-                        f"  - use_lora: {self.config.use_lora}\n"
-                        f"  - use_4bit: {self.config.use_4bit}\n"
-                        f"  - use_8bit: {self.config.use_8bit}\n"
-                        f"  - use_autocast: {use_autocast}\n"
-                        f"\n"
-                        f"Решение:\n"
-                        f"  1. Проверьте что use_lora=True (особенно при квантизации)\n"
-                        f"  2. Убедитесь что модель имеет trainable параметры\n"
-                        f"  3. Попробуйте отключить autocast временно"
+                    # ВАЖНО: Освобождаем loss после backward для экономии памяти
+                    del loss
+                    if torch.cuda.is_available() and batch_idx % 5 == 0:
+                        torch.cuda.empty_cache()
+                    
+                    # Optimizer step делаем ТОЛЬКО когда накопили нужное число micro-steps.
+                    do_step = True
+                    if self.accelerator is not None:
+                        do_step = bool(self.accelerator.sync_gradients)
+                    
+                    if do_step:
+                        # Gradient clipping
+                        if self.accelerator is not None:
+                            grad_norm = self.accelerator.clip_grad_norm_(
+                                self.model.parameters(),
+                                self.config.max_grad_norm,
+                            )
+                        else:
+                            grad_norm = clip_grad_norm_(
+                                self.model.parameters(),
+                                self.config.max_grad_norm,
+                            )
+                        
+                        self.optimizer.step()
+                        self.scheduler.step()
+                        self.optimizer.zero_grad()
+                        
+                        self.global_step += 1
+                    else:
+                        grad_norm = 0.0
+                    
+                    # Собираем метрики
+                    epoch_losses.append(loss_value)
+                    epoch_kls.append(metrics.get("kl_mean", 0))
+                    epoch_grad_norms.append(
+                        grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
                     )
-                
-                # Сохраняем loss для метрик ПЕРЕД backward (после backward может быть освобожден)
-                loss_value = loss.item()
-                
-                # Backward
-                if self.accelerator:
-                    self.accelerator.backward(loss)
-                else:
-                    loss.backward()
-                
-                # ВАЖНО: Освобождаем loss после backward для экономии памяти
-                # (градиенты уже вычислены и сохранены в параметрах)
-                del loss
-                if torch.cuda.is_available() and batch_idx % 5 == 0:
-                    torch.cuda.empty_cache()
-                
-                # Gradient clipping
-                grad_norm = clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.max_grad_norm,
-                )
-                
-                # Optimizer step
-                self.optimizer.step()
-                self.scheduler.step()
-                self.optimizer.zero_grad()
-                
-                # Собираем метрики (используем сохраненное значение loss)
-                epoch_losses.append(loss_value)
-                epoch_kls.append(metrics.get("kl_mean", 0))
-                epoch_grad_norms.append(
-                    grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
-                )
-                
-                self.global_step += 1
         
         return {
             "loss": sum(epoch_losses) / max(len(epoch_losses), 1),
@@ -1308,29 +1422,38 @@ class GRPOTrainer:
             "samples": total,
         }
     
-    def _log_metrics(self, metrics: Dict[str, Any]):
-        """Логирует метрики."""
-        if self.config.use_wandb and self.wandb_run:
+    def _log_metrics(self, metrics: Dict[str, Any], *, jsonl_only: bool = False):
+        """Логирует метрики.
+
+        Важно для UI: `metrics.jsonl` должен обновляться регулярно, иначе мониторинг "зависает" на STARTING.
+        Поэтому можно писать JSONL даже часто (каждый rollout), а консоль/W&B — реже.
+        """
+        # В distributed режиме пишем метрики только с main процесса, иначе jsonl будет перемешан.
+        if self.accelerator is not None and not self.accelerator.is_main_process:
+            return
+        if (not jsonl_only) and self.config.use_wandb and self.wandb_run:
             import wandb
             wandb.log(metrics, step=self.global_step)
         
-        # Также логируем в консоль (основные метрики)
-        if self.is_main_process:
-            log_str = " | ".join([
-                f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}"
-                for k, v in metrics.items()
-                if k in ["step", "loss", "kl", "batch_reward_mean", "buffer_size", "rollouts_count"]
-            ])
-            if log_str:
-                logger.info(f"Step {self.global_step}: {log_str}")
-            
-            # Записываем в JSONL для мониторинга из UI
-            metrics_file = Path(self.config.output_dir) / "metrics.jsonl"
-            try:
-                import json
-                from datetime import datetime
-                log_entry = {
+        # Записываем в JSONL для мониторинга из UI (всегда на main process)
+        metrics_file = Path(self.config.output_dir) / "metrics.jsonl"
+        ui_metrics_file = None
+        try:
+            if getattr(self.config, "ui_run_dir", None):
+                ui_metrics_file = Path(str(self.config.ui_run_dir)) / "metrics.jsonl"
+        except Exception:
+            ui_metrics_file = None
+        try:
+            import json
+            from datetime import datetime
+            log_entry = {
+                    # optim_step: шаг оптимизатора (растёт внутри _train_on_buffer)
                     "step": self.global_step,
+                    "optim_step": self.global_step,
+                    # rollout_step: сколько батчей промптов (prompts/step) уже обработано
+                    "rollout_step": getattr(self, "rollout_step", 0),
+                    # max_steps трактуется как лимит optim_step (текущее поведение)
+                    "total_steps": int(self.config.max_steps) if self.config.max_steps else None,
                     "reward": metrics.get("batch_reward_mean", metrics.get("reward", 0)),
                     "loss": metrics.get("loss", 0),
                     "kl": metrics.get("kl", 0),
@@ -1338,25 +1461,54 @@ class GRPOTrainer:
                     "epoch": metrics.get("epoch", 0),
                     "learning_rate": self.scheduler.get_last_lr()[0] if hasattr(self.scheduler, 'get_last_lr') else self.config.learning_rate,
                     "timestamp": datetime.now().isoformat(),
-                }
-                # Добавляем все остальные метрики
-                for k, v in metrics.items():
-                    if k not in log_entry and isinstance(v, (int, float)):
-                        log_entry[k] = v
-                
-                with open(metrics_file, "a", encoding="utf-8") as f:
+                    # Для прогресса по датасету/скорости:
+                    # batch_size здесь = prompts/step на ОДИН процесс; в UI умножаем на num_gpus (из config.json)
+                    "prompt_batch_size": int(self.config.batch_size),
+                    "group_size": int(self.config.group_size),
+                    "train_batch_size": int(self.config.train_batch_size),
+                    "epochs_per_step": int(self.config.epochs_per_step),
+            }
+            # Добавляем все остальные метрики
+            for k, v in metrics.items():
+                if k not in log_entry and isinstance(v, (int, float)):
+                    log_entry[k] = v
+            
+            with open(metrics_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry) + "\n")
+            # Дублируем в run_dir UI (если задан), чтобы мониторинг работал независимо от путей output_dir.
+            if ui_metrics_file is not None:
+                ui_metrics_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(ui_metrics_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(log_entry) + "\n")
-            except Exception as e:
-                logger.debug(f"Не удалось записать метрики в JSONL: {e}")
+        except Exception as e:
+            logger.debug(f"Не удалось записать метрики в JSONL: {e}")
+
+        # Также логируем в консоль (основные метрики) — опционально
+        if (not jsonl_only) and self.is_main_process:
+            log_str = " | ".join([
+                f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}"
+                for k, v in metrics.items()
+                if k in ["step", "loss", "kl", "batch_reward_mean", "buffer_size", "rollouts_count"]
+            ])
+            if log_str:
+                logger.info(f"Step {self.global_step}: {log_str}")
     
     def _log_sample(self, rollout):
         """Логирует семпл (промпт и ответы) для мониторинга в UI."""
+        if self.accelerator is not None and not self.accelerator.is_main_process:
+            return
         try:
             import json
             from pathlib import Path
             
             # Сохраняем в output_dir/samples.jsonl (UI будет читать из run_dir)
             samples_file = Path(self.config.output_dir) / "samples.jsonl"
+            ui_samples_file = None
+            try:
+                if getattr(self.config, "ui_run_dir", None):
+                    ui_samples_file = Path(str(self.config.ui_run_dir)) / "samples.jsonl"
+            except Exception:
+                ui_samples_file = None
             
             # Формируем полные тексты (промпт + completion) для отображения
             full_texts = []
@@ -1376,22 +1528,29 @@ class GRPOTrainer:
             
             with open(samples_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(sample_entry, ensure_ascii=False) + "\n")
+            # Дублируем в run_dir UI (если задан)
+            if ui_samples_file is not None:
+                ui_samples_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(ui_samples_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(sample_entry, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.debug(f"Не удалось записать семпл: {e}")
     
     def _save_checkpoint(self, path: Path, is_final: bool = False):
         """Сохраняет чекпоинт."""
         path.mkdir(parents=True, exist_ok=True)
+
+        # В distributed режиме сохраняем только на main process и только unwrapped модель
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
+            if not self.accelerator.is_main_process:
+                return
+            model_to_save = self.accelerator.unwrap_model(self.model)
+        else:
+            model_to_save = self.model
         
         # Сохраняем модель (с LoRA адаптерами если используются)
-        if self.config.use_lora:
-            self.model.save_pretrained(path)
-        else:
-            if self.accelerator:
-                unwrapped = self.accelerator.unwrap_model(self.model)
-                unwrapped.save_pretrained(path)
-            else:
-                self.model.save_pretrained(path)
+        model_to_save.save_pretrained(path)
         
         # Сохраняем токенизатор
         self.tokenizer.save_pretrained(path)

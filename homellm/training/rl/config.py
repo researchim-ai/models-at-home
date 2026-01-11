@@ -113,6 +113,9 @@ class GRPOConfig:
     epochs_per_step: int = 1
     warmup_steps: int = 100
     max_steps: Optional[int] = None
+    # Лимит по данным (сколько промптов обработать всего). Если None — идём по датасету (с учётом num_epochs).
+    # Это ближе к человеческому ожиданию "сколько примеров прошло".
+    max_prompts: Optional[int] = None
     
     # Dr.GRPO
     use_std_normalization: bool = True  # False для DrGRPO
@@ -153,6 +156,12 @@ class GRPOConfig:
     
     # Seed
     seed: int = 42
+
+    # UI/monitoring plumbing (опционально)
+    # Если обучение запущено из Streamlit, UI создаёт run_dir (RUNS_DIR/<run_id>).
+    # Чтобы мониторинг работал "железно" даже при различиях путей (/app vs host),
+    # можем дублировать metrics.jsonl/samples.jsonl в эту директорию.
+    ui_run_dir: Optional[str] = None
     
     def __post_init__(self):
         """Применяем настройки по умолчанию в зависимости от алгоритма."""
@@ -247,6 +256,8 @@ class GRPOConfig:
             "clip_eps_high": self.clip_eps_high,
             "kl_weight": self.kl_weight,
             "learning_rate": self.learning_rate,
+            "max_steps": self.max_steps,
+            "max_prompts": self.max_prompts,
             "use_std_normalization": self.use_std_normalization,
             "fixed_length_normalizer": self.fixed_length_normalizer,
             "dynamic_sampling": self.dynamic_sampling,

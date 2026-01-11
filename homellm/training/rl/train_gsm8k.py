@@ -312,12 +312,20 @@ def main():
         config.max_new_tokens = ui_config["grpo_max_new_tokens"]
         config.temperature = ui_config["grpo_temperature"]
         config.learning_rate = ui_config["grpo_learning_rate"]
-        config.max_steps = ui_config.get("grpo_max_steps")
+        # Лимиты обучения:
+        # - max_prompts: "сколько примеров пройти" (понятно пользователю)
+        # - max_steps: legacy лимит по optimizer steps (если кто-то ещё передаёт старый ключ)
+        config.max_prompts = ui_config.get("grpo_max_prompts", None)
+        config.max_steps = ui_config.get("grpo_max_optim_steps", ui_config.get("grpo_max_steps", None))
         config.clip_eps_low = ui_config["grpo_clip_eps_low"]
         config.clip_eps_high = ui_config.get("grpo_clip_eps_high", config.clip_eps_low)
         config.kl_weight = ui_config["grpo_kl_weight"]
         config.epochs_per_step = ui_config.get("grpo_epochs_per_step", 1)
         config.reasoning_format = ui_config.get("grpo_reasoning_format", config.reasoning_format)
+
+        # Путь до run_dir, который создал UI (для "железного" мониторинга).
+        # Если задан, trainer будет дублировать metrics/samples в эту директорию.
+        config.ui_run_dir = ui_config.get("ui_run_dir", ui_config.get("run_dir", None))
         
         # LoRA параметры (обязательные из UI, если use_lora=True)
         config.use_lora = ui_config.get("use_lora", config.use_lora)
@@ -465,6 +473,16 @@ def main():
             "Проверьте, что выбран reasoning-датасет (GSM8K/GSM8K-RU/MATH-RU), "
             "и что в JSONL есть поля question/prompt и answer/response."
         )
+
+    # Сохраняем размер датасета в output_dir, чтобы UI мог показывать прогресс по данным
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        _cfg_path = _Path(config.output_dir) / "dataset_info.json"
+        with open(_cfg_path, "w", encoding="utf-8") as f:
+            _json.dump({"dataset_size": int(len(train_dataset))}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
     
     # Создаём reward функцию
     if reward_rules:
