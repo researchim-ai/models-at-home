@@ -13,7 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
     python3-pip \
     python3.10-venv \
+    python3.10-dev \
     python3-distutils \
+    cmake \
     build-essential \
     ninja-build \
     libgl1 \
@@ -31,7 +33,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 
 # Установка основных зависимостей
-RUN python -m pip install --upgrade pip \
+RUN python -m pip install --upgrade pip setuptools wheel \
  && python -m pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 \
  && python -m pip install --no-cache-dir -r /app/requirements.txt \
  && python -m pip install --no-cache-dir deepspeed
@@ -46,8 +48,7 @@ RUN if [ "$INSTALL_FLASH_ATTN" = "true" ]; then \
       export CUDA_HOME=/usr/local/cuda && \
       export PATH=${CUDA_HOME}/bin:${PATH} && \
       export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH} && \
-      (python -m pip install --no-cache-dir flash-attn==2.8.3 --no-build-isolation || \
-       echo "⚠️ flash-attn не установлен (возможны проблемы компиляции), будет использоваться стандартная реализация attention"); \
+      python -m pip install --no-cache-dir flash-attn==2.8.3 --no-build-isolation; \
     else \
       echo "Пропуск установки flash-attn (INSTALL_FLASH_ATTN=false)"; \
     fi
@@ -88,6 +89,7 @@ COPY --from=builder /app /app
 
 # Директории под монтирования (не обязательно, но удобно)
 RUN mkdir -p /app/datasets /app/out /app/.runs
+RUN mkdir -p /root/.triton/autotune
 
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8

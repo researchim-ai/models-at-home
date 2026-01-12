@@ -186,10 +186,14 @@ class GRPOTrainer:
             try:
                 from accelerate import Accelerator
                 
-                # Определяем mixed precision
-                mixed_precision = "bf16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "no"
-                if mixed_precision == "no" and torch.cuda.is_available():
-                    mixed_precision = "fp16"  # Fallback на fp16 если bf16 не поддерживается
+                # Mixed precision должен соответствовать выбору пользователя в UI.
+                mixed_precision = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
+                if mixed_precision not in ("no", "fp16", "bf16"):
+                    logger.warning(f"Неизвестный mixed_precision='{mixed_precision}', fallback -> bf16")
+                    mixed_precision = "bf16"
+                if mixed_precision == "bf16" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+                    logger.warning("bf16 выбран в UI, но GPU не поддерживает bf16. Fallback -> fp16")
+                    mixed_precision = "fp16"
                 
                 logger.info(f"🚀 Инициализация Accelerator...")
                 logger.info(f"  - gradient_accumulation_steps: {self.config.gradient_accumulation_steps}")
@@ -304,6 +308,21 @@ class GRPOTrainer:
         
         if quantization_config:
             model_kwargs["quantization_config"] = quantization_config
+        else:
+            # ВАЖНО:
+            # - bf16: можно грузить веса в bf16 (нет GradScaler).
+            # - fp16: НЕ грузим веса в fp16, иначе градиенты будут fp16 и GradScaler/accelerate упадёт
+            #   ("Attempting to unscale FP16 gradients."). Для fp16 используем autocast/GradScaler поверх fp32 весов.
+            mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
+            if mp == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                model_kwargs["dtype"] = torch.bfloat16
+            elif mp == "fp16":
+                pass
+            elif mp == "no":
+                # Оставляем fp32 (дефолт HF)
+                pass
+            else:
+                pass
         
         # Проверяем наличие flash_attn перед использованием
         # ВАЖНО: Flash Attention может конфликтовать с квантизацией в некоторых случаях
@@ -311,8 +330,12 @@ class GRPOTrainer:
         if self.config.use_flash_attention and not quantization_config:
             try:
                 import flash_attn
-                model_kwargs["attn_implementation"] = "flash_attention_2"
-                logger.info("Используется Flash Attention 2")
+                mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
+                if mp == "no":
+                    logger.info("Flash Attention 2 отключен: mixed_precision='no' (fp32 не поддерживается flash-attn)")
+                else:
+                    model_kwargs["attn_implementation"] = "flash_attention_2"
+                    logger.info("Используется Flash Attention 2")
             except ImportError:
                 logger.warning(
                     "Flash Attention 2 запрошен, но пакет flash_attn не установлен. "
@@ -337,6 +360,14 @@ class GRPOTrainer:
             self.model_name,
             **model_kwargs,
         )
+
+        # Gradient checkpointing (управляется из UI)
+        if getattr(self.config, "grad_checkpoint", False) and hasattr(self.model, "gradient_checkpointing_enable"):
+            try:
+                self.model.gradient_checkpointing_enable()
+                logger.info("✅ Gradient checkpointing включен (из UI)")
+            except Exception as e:
+                logger.warning(f"Не удалось включить gradient checkpointing: {e}")
         
         # Проверяем использование памяти после загрузки модели
         if torch.cuda.is_available():
@@ -416,8 +447,15 @@ class GRPOTrainer:
                 # Не квантизируем reference модель для точности KL
                 # Используем тот же dtype что и основная модель (или bfloat16 по умолчанию)
                 if not quantization_config:
-                    # Если основная модель не квантизирована, используем тот же dtype
-                    ref_model_kwargs["torch_dtype"] = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                    # Reference модель без градиентов: можно грузить в mp dtype для экономии памяти.
+                    mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
+                    if mp == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                        ref_model_kwargs["dtype"] = torch.bfloat16
+                    elif mp == "fp16" and torch.cuda.is_available():
+                        ref_model_kwargs["dtype"] = torch.float16
+                    else:
+                        # fp32
+                        pass
                 logger.info("✅ Референсная модель НЕ квантизирована (точный KL divergence)")
             
             # Flash Attention для reference модели (если не квантизирована)
@@ -522,17 +560,27 @@ class GRPOTrainer:
             )
         
         # Дополнительная проверка: тестовый forward pass должен требовать градиентов
+        # ВАЖНО: при flash_attention_2 и mixed_precision fp16/bf16 делаем forward под autocast,
+        # иначе FlashAttention может ругаться на fp32 dtype.
         self.model.train()  # Убеждаемся что в train режиме
         test_input = torch.randint(0, 1000, (1, 10), device=self.device)
         test_mask = torch.ones_like(test_input)
+        mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
+        use_autocast = torch.cuda.is_available() and mp in ("bf16", "fp16")
+        if use_autocast:
+            autocast_ctx = torch.amp.autocast("cuda", enabled=True)
+        else:
+            from contextlib import nullcontext
+            autocast_ctx = nullcontext()
         with torch.enable_grad():
-            test_output = self.model(input_ids=test_input, attention_mask=test_mask)
-            if not test_output.logits.requires_grad:
-                logger.warning("⚠️ Тестовый forward pass не требует градиентов! Это может быть проблемой.")
-                # Попробуем принудительно включить градиенты для всех параметров
-                for param in self.model.parameters():
-                    param.requires_grad = True
-                logger.info("Принудительно включены градиенты для всех параметров")
+            with autocast_ctx:
+                test_output = self.model(input_ids=test_input, attention_mask=test_mask, use_cache=False)
+        if not test_output.logits.requires_grad:
+            logger.warning("⚠️ Тестовый forward pass не требует градиентов! Это может быть проблемой.")
+            # Попробуем принудительно включить градиенты для всех параметров
+            for param in self.model.parameters():
+                param.requires_grad = True
+            logger.info("Принудительно включены градиенты для всех параметров")
         
         # Финальная проверка использования памяти
         if torch.cuda.is_available():
@@ -769,17 +817,54 @@ class GRPOTrainer:
             logger.info(f"✅ Оптимизатор использует только trainable параметры ({optimizer_param_count:,})")
         
         # Scheduler
-        self.scheduler = get_cosine_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=self.config.warmup_steps,
-            num_training_steps=num_training_steps,
-        )
+        # ВАЖНО: scheduler.step() вызывается на optimizer-step, поэтому num_training_steps должен быть в optim-шагах.
+        min_lr_ratio = float(getattr(self.config, "min_lr_ratio", 0.0) or 0.0)
+        if min_lr_ratio > 0:
+            from torch.optim.lr_scheduler import LambdaLR
+            warmup = int(self.config.warmup_steps or 0)
+            total = max(int(num_training_steps), 1)
+
+            def lr_lambda(step: int):
+                # warmup: 0 -> 1
+                if warmup > 0 and step < warmup:
+                    return float(step) / float(max(1, warmup))
+                # cosine with floor
+                denom = max(1, total - warmup)
+                progress = float(step - warmup) / float(denom)
+                progress = min(max(progress, 0.0), 1.0)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+            self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+        else:
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=self.config.warmup_steps,
+                num_training_steps=num_training_steps,
+            )
         
         # Accelerate prepare
         if self.accelerator:
             self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
                 self.model, self.optimizer, self.scheduler
             )
+            try:
+                def _strip_fp32_convert(m):
+                    if m is None:
+                        return
+                    fwd = getattr(m, "forward", None)
+                    if fwd is not None and hasattr(fwd, "model_forward"):
+                        m.forward = fwd.model_forward  # type: ignore[attr-defined]
+
+                # accelerate может навесить ConvertOutputsToFp32 на разных уровнях обёрток
+                _strip_fp32_convert(self.model)
+                _strip_fp32_convert(getattr(self.model, "module", None))
+                base = self.accelerator.unwrap_model(self.model)
+                _strip_fp32_convert(base)
+                _strip_fp32_convert(getattr(base, "module", None))
+                logger.info("✅ Отключили accelerate convert_to_fp32 для forward() (экономия VRAM)")
+            except Exception as e:
+                logger.warning(f"Не удалось отключить accelerate convert_to_fp32: {e}")
     
     def train(
         self,
@@ -801,15 +886,45 @@ class GRPOTrainer:
         world = int(self.accelerator.num_processes) if self.accelerator is not None else 1
         denom = max(int(self.config.batch_size) * max(world, 1), 1)
         steps_per_epoch = math.ceil(num_prompts / denom)
-        total_steps = steps_per_epoch * self.config.num_epochs
+        total_steps_uncapped = steps_per_epoch * self.config.num_epochs
+        
+        # Лимит "по данным": сколько промптов реально хотим пройти (понятная семантика).
+        planned_prompts = int(num_prompts) * int(self.config.num_epochs)
+        if getattr(self.config, "max_prompts", None):
+            try:
+                planned_prompts = min(planned_prompts, int(self.config.max_prompts))
+            except Exception:
+                pass
+        rollout_total_steps = math.ceil(planned_prompts / denom) if planned_prompts > 0 else 0
         
         if self.config.max_steps:
-            total_steps = min(total_steps, self.config.max_steps)
+            rollout_total_steps = rollout_total_steps  # max_steps — это лимит optim_step, не rollout_step
         
-        logger.info(f"Начало обучения: {num_prompts} промптов, ~{total_steps} шагов")
+        # Для UI/ETA: фиксируем плановые шаги (не "max_steps", а реальный план на датасет/лимит).
+        self.planned_total_steps = int(rollout_total_steps) if rollout_total_steps else 0
+        self.planned_total_steps_uncapped = int(total_steps_uncapped) if total_steps_uncapped else 0
+
+        # Для scheduler: оцениваем число optimizer steps.
+        # 1 rollout (на ОДИН процесс) даёт примерно batch_size * group_size опытов.
+        # exp_loader drop_last=True => число микробатчей = floor(exps / train_batch_size)
+        est_exps = int(self.config.batch_size) * int(self.config.group_size)
+        est_micro_batches = max(1, est_exps // max(1, int(self.config.train_batch_size)))
+        est_optim_steps_per_rollout = math.ceil(est_micro_batches / max(1, int(self.config.gradient_accumulation_steps)))
+        est_optim_steps_per_rollout *= max(1, int(self.config.epochs_per_step))
+
+        planned_optim_steps = int(rollout_total_steps) * int(est_optim_steps_per_rollout)
+        if self.config.max_steps:
+            # max_steps — явный лимит optim_step из UI
+            planned_optim_steps = min(int(planned_optim_steps), int(self.config.max_steps))
+        self.planned_optim_total_steps = max(int(planned_optim_steps), 1)
+        
+        logger.info(
+            f"Начало обучения: {num_prompts} промптов, ~{int(rollout_total_steps)} rollout-шагов, "
+            f"~{int(self.planned_optim_total_steps)} optim-шагов"
+        )
         
         # Настройка оптимизатора
-        self._setup_optimizer(total_steps)
+        self._setup_optimizer(self.planned_optim_total_steps)
         
         # Создаём output директорию
         output_dir = Path(self.config.output_dir)
@@ -987,10 +1102,9 @@ class GRPOTrainer:
             
             # Сохранение чекпоинта
             if self.global_step > 0 and self.global_step % self.config.save_steps == 0:
-                if self.is_main_process:
-                    self._save_checkpoint(
-                        Path(self.config.output_dir) / f"step_{self.global_step}"
-                    )
+                # ВАЖНО: в distributed режиме сохранение должно вызываться ВСЕМИ процессами,
+                # иначе возможны рассинхронизации/таймауты на collectives.
+                self._save_checkpoint(Path(self.config.output_dir) / f"step_{self.global_step}")
 
             # Rollout-step завершён (1 batch промптов -> сбор rollout -> train on buffer)
             self.rollout_step += 1
@@ -1238,7 +1352,8 @@ class GRPOTrainer:
                 # Forward pass для текущей политики
                 # Используем новый API для autocast (исправляем deprecated warning)
                 # ВАЖНО: autocast должен быть включен только на CUDA
-                use_autocast = (self.accelerator is not None and torch.cuda.is_available())
+                mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
+                use_autocast = (self.accelerator is not None and torch.cuda.is_available() and mp != "no")
                 
                 if use_autocast:
                     autocast_context = torch.amp.autocast('cuda', enabled=True)
@@ -1452,8 +1567,12 @@ class GRPOTrainer:
                     "optim_step": self.global_step,
                     # rollout_step: сколько батчей промптов (prompts/step) уже обработано
                     "rollout_step": getattr(self, "rollout_step", 0),
-                    # max_steps трактуется как лимит optim_step (текущее поведение)
-                    "total_steps": int(self.config.max_steps) if self.config.max_steps else None,
+                    # current_step для UI: по умолчанию прогресс в GRPO считаем по rollout_step (покрытие датасета)
+                    "current_step": int(getattr(self, "rollout_step", 0)),
+                    # total_steps для UI/ETA: план на обучение (на датасет/лимиты), а не только max_steps.
+                    "total_steps": int(getattr(self, "planned_total_steps", 0)) or None,
+                    # planned_total_steps: "план на эпоху" без лимитов по max_prompts/max_steps (полезно для сравнения)
+                    "planned_total_steps": int(getattr(self, "planned_total_steps_uncapped", 0)) or None,
                     "reward": metrics.get("batch_reward_mean", metrics.get("reward", 0)),
                     "loss": metrics.get("loss", 0),
                     "kl": metrics.get("kl", 0),
@@ -1538,29 +1657,84 @@ class GRPOTrainer:
     
     def _save_checkpoint(self, path: Path, is_final: bool = False):
         """Сохраняет чекпоинт."""
-        path.mkdir(parents=True, exist_ok=True)
-
-        # В distributed режиме сохраняем только на main process и только unwrapped модель
+        # DDP-safe сохранение:
+        # 1) все ранки синхронизируются до сохранения
+        # 2) сохраняет только main process
+        # 3) сохранение атомарное: пишем в tmp-dir и делаем rename
+        # 4) все ранки синхронизируются после сохранения
         if self.accelerator is not None:
             self.accelerator.wait_for_everyone()
-            if not self.accelerator.is_main_process:
-                return
-            model_to_save = self.accelerator.unwrap_model(self.model)
-        else:
-            model_to_save = self.model
-        
-        # Сохраняем модель (с LoRA адаптерами если используются)
-        model_to_save.save_pretrained(path)
-        
-        # Сохраняем токенизатор
-        self.tokenizer.save_pretrained(path)
-        
-        # Сохраняем конфиг
-        import json
-        with open(path / "grpo_config.json", "w") as f:
-            json.dump(self.config.to_dict(), f, indent=2)
-        
-        logger.info(f"Чекпоинт сохранён: {path}")
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(path.name + "_tmp")
+
+            # чистим старый tmp (если остался от падения) — только на main
+            if self.accelerator is None or self.is_main_process:
+                if tmp_path.exists():
+                    import shutil
+                    shutil.rmtree(tmp_path, ignore_errors=True)
+            # создаём tmp-dir на всех процессах
+            tmp_path.mkdir(parents=True, exist_ok=True)
+
+            if self.accelerator is None:
+                # Single-process: сохраняем state модели в HF формате.
+                self.model.save_pretrained(tmp_path)
+            else:
+                # Distributed (DDP/FSDP/DeepSpeed): чекпоинт для resume.
+                self.accelerator.save_state(tmp_path)
+
+            # Сохраняем несшардированные артефакты только на main
+            if self.accelerator is None or self.is_main_process:
+                self.tokenizer.save_pretrained(tmp_path)
+                import json
+                with open(tmp_path / "grpo_config.json", "w", encoding="utf-8") as f:
+                    json.dump(self.config.to_dict(), f, indent=2, ensure_ascii=False)
+
+            # Все дождались записи файлов, затем main делает финализацию
+            if self.accelerator is not None:
+                self.accelerator.wait_for_everyone()
+
+            if self.accelerator is None or self.is_main_process:
+                if path.exists():
+                    import shutil
+                    shutil.rmtree(path, ignore_errors=True)
+                tmp_path.rename(path)
+                logger.info(f"Чекпоинт сохранён: {path}")
+
+            # Обновляем "usable" модель для инференса (перезаписываем final_model), если включено.
+            if bool(getattr(self.config, "export_on_checkpoint", False)):
+                final_dir = Path(self.config.output_dir) / "final_model"
+                final_tmp = final_dir.with_name(final_dir.name + "_tmp")
+
+                # чистим tmp на main
+                if self.accelerator is None or self.is_main_process:
+                    if final_tmp.exists():
+                        import shutil
+                        shutil.rmtree(final_tmp, ignore_errors=True)
+                final_tmp.mkdir(parents=True, exist_ok=True)
+
+                if self.accelerator is None:
+                    # single-process
+                    self.model.save_pretrained(final_tmp, safe_serialization=True)
+                else:
+                    # distributed: собранный state_dict через accelerate (корректно для FSDP/ZeRO)
+                    self.accelerator.save_model(self.model, final_tmp, safe_serialization=True)
+
+                if self.accelerator is None or self.is_main_process:
+                    self.tokenizer.save_pretrained(final_tmp)
+                if self.accelerator is not None:
+                    self.accelerator.wait_for_everyone()
+
+                if self.accelerator is None or self.is_main_process:
+                    if final_dir.exists():
+                        import shutil
+                        shutil.rmtree(final_dir, ignore_errors=True)
+                    final_tmp.rename(final_dir)
+                    logger.info(f"final_model обновлён: {final_dir}")
+        finally:
+            if self.accelerator is not None:
+                self.accelerator.wait_for_everyone()
     
     def generate(
         self,

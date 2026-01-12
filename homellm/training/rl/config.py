@@ -73,6 +73,7 @@ class GRPOConfig:
         wandb_project: Название проекта в W&B
         
         # Система
+        mixed_precision: Mixed precision режим ("no" | "fp16" | "bf16"). Должен совпадать с UI.
         use_lora: Использовать LoRA адаптеры
         lora_r: Ранг LoRA
         lora_alpha: Alpha для LoRA
@@ -105,6 +106,8 @@ class GRPOConfig:
     
     # Оптимизатор
     learning_rate: float = 5e-6
+    # Нижний предел LR: lr = base_lr * min_lr_ratio в конце cosine (0.0 = до нуля)
+    min_lr_ratio: float = 0.1
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     
@@ -131,6 +134,8 @@ class GRPOConfig:
     output_dir: str = "./output/grpo"
     save_steps: int = 100
     log_steps: int = 10
+    # Если True — обновляем `final_model/` при каждом сохранении чекпоинта, чтобы модель можно было сразу использовать.
+    export_on_checkpoint: bool = True
     use_wandb: bool = False
     wandb_project: str = "homellm-grpo"
     
@@ -149,13 +154,19 @@ class GRPOConfig:
     use_4bit: bool = False
     use_8bit: bool = False
     quantize_reference_model: bool = False  # Квантизировать ли reference модель (по умолчанию False для точности KL)
-    use_flash_attention: bool = True  # По умолчанию True, flash-attn в requirements.txt
+    use_flash_attention: bool = True  # По умолчанию True; flash-attn опционален (в Docker ставится отдельно)
     
     # Формат reasoning
     reasoning_format: str = "deepseek"  # "deepseek" (<think>), "simple" (<reasoning>)
     
     # Seed
     seed: int = 42
+
+    # Precision (должно приходить из UI/distributed_config)
+    mixed_precision: str = "bf16"  # "no" | "fp16" | "bf16"
+    
+    # Memory
+    grad_checkpoint: bool = False
 
     # UI/monitoring plumbing (опционально)
     # Если обучение запущено из Streamlit, UI создаёт run_dir (RUNS_DIR/<run_id>).
@@ -256,8 +267,14 @@ class GRPOConfig:
             "clip_eps_high": self.clip_eps_high,
             "kl_weight": self.kl_weight,
             "learning_rate": self.learning_rate,
+            "min_lr_ratio": self.min_lr_ratio,
             "max_steps": self.max_steps,
             "max_prompts": self.max_prompts,
+            "mixed_precision": self.mixed_precision,
+            "grad_checkpoint": self.grad_checkpoint,
+            "save_steps": self.save_steps,
+            "log_steps": self.log_steps,
+            "export_on_checkpoint": self.export_on_checkpoint,
             "use_std_normalization": self.use_std_normalization,
             "fixed_length_normalizer": self.fixed_length_normalizer,
             "dynamic_sampling": self.dynamic_sampling,

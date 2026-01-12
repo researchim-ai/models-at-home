@@ -483,7 +483,8 @@ def load_metrics(run_id: str) -> dict:
                     latest["lr_history"] = df["learning_rate"].tolist() if "learning_rate" in df.columns else (df["lr"].tolist() if "lr" in df.columns else [])
                     
                     # Добавляем текущие значения для метрик
-                    latest["current_step"] = latest.get("step", len(lines) - 1)
+                    # Для GRPO прогресс в UI считаем по rollout_step (покрытие датасета), а optim_step показываем отдельно.
+                    latest["current_step"] = latest.get("current_step", latest.get("rollout_step", latest.get("step", len(lines) - 1)))
                     latest["current_loss"] = latest.get("loss", 0)
                     latest["current_lr"] = latest.get("learning_rate", latest.get("lr", 0))
                     latest["reward"] = latest.get("reward", latest.get("batch_reward_mean", 0))
@@ -497,13 +498,21 @@ def load_metrics(run_id: str) -> dict:
 
                     # Фактические счётчики (если есть в jsonl)
                     try:
-                        if "prompts_generated" in df.columns:
+                        if "prompts_generated_total" in df.columns:
+                            latest["prompts_generated_total"] = int(df["prompts_generated_total"].fillna(0).iloc[-1])
+                        elif "prompts_generated" in df.columns:
                             latest["prompts_generated_total"] = int(df["prompts_generated"].fillna(0).sum())
-                        if "prompts_used" in df.columns:
+                        if "prompts_used_total" in df.columns:
+                            latest["prompts_used_total"] = int(df["prompts_used_total"].fillna(0).iloc[-1])
+                        elif "prompts_used" in df.columns:
                             latest["prompts_used_total"] = int(df["prompts_used"].fillna(0).sum())
-                        if "completions_generated" in df.columns:
+                        if "completions_generated_total" in df.columns:
+                            latest["completions_generated_total"] = int(df["completions_generated_total"].fillna(0).iloc[-1])
+                        elif "completions_generated" in df.columns:
                             latest["completions_generated_total"] = int(df["completions_generated"].fillna(0).sum())
-                        if "experiences_tuned" in df.columns:
+                        if "experiences_tuned_total" in df.columns:
+                            latest["experiences_tuned_total"] = int(df["experiences_tuned_total"].fillna(0).iloc[-1])
+                        elif "experiences_tuned" in df.columns:
                             latest["experiences_tuned_total"] = int(df["experiences_tuned"].fillna(0).sum())
                     except Exception:
                         pass
@@ -535,9 +544,11 @@ def load_metrics(run_id: str) -> dict:
                                 else:
                                     elapsed_seconds = max(0.0, (t1 - t0).total_seconds())
 
-                        if "timestamp" in df.columns and "step" in df.columns and len(df) >= 2:
-                            s0 = float(df["step"].iloc[0])
-                            s1 = float(df["step"].iloc[-1])
+                        # ETA считаем по current_step (rollout_step), а не по optim_step,
+                        # иначе прогресс/ETA будут "убегать" из-за multiple optimizer updates per rollout.
+                        if "timestamp" in df.columns and "current_step" in df.columns and len(df) >= 2:
+                            s0 = float(df["current_step"].iloc[0])
+                            s1 = float(df["current_step"].iloc[-1])
                             # средняя скорость по наблюдаемым step (учитываем что лог может быть не на каждом шаге)
                             ds = max(0.0, s1 - s0)
                             if ds > 0 and elapsed_seconds > 0 and latest["total_steps"] is not None:
@@ -1425,6 +1436,14 @@ def render_grpo_sidebar_config():
             value=algorithm == "dapo",
             help="Агрегировать loss по токенам, а не по сэмплам"
         )
+
+        min_lr_ratio = st.slider(
+            "Min LR ratio (floor)",
+            0.0, 0.5,
+            0.1,
+            0.01,
+            help="Нижний предел LR: lr = base_lr * ratio в конце cosine. 0.0 = до нуля."
+        )
     
     # ВАЖНО: LoRA параметры и квантизация берутся из render_model_config() (секция "🎯 Метод тюнинга")
     # Здесь мы НЕ дублируем их, чтобы избежать повторения в UI
@@ -1448,6 +1467,7 @@ def render_grpo_sidebar_config():
         "grpo_clip_eps_high": clip_eps_high,
         "grpo_dynamic_sampling": dynamic_sampling,
         "grpo_token_level_loss": token_level_loss,
+        "grpo_min_lr_ratio": min_lr_ratio,
     }
 
 
@@ -2399,7 +2419,7 @@ def render_model_config():
                     "Для начала нового continual pretraining лучше использовать final_model или 🤗 HF модель."
                 )
             elif selected_model["type"] == "hf":
-                st.sidebar.success("✅ HuggingFace модель — отлично подходит для Continual Pretrain / SFT!")
+                st.sidebar.success("✅ HuggingFace модель")
             
             st.sidebar.caption(f"Путь: `{base_model_path}`")
     
@@ -3177,6 +3197,26 @@ def render_distributed_config(training_config: dict | None = None):
     
     st.sidebar.info(launch_info)
 
+    # Compute / precision (нужно и для GRPO, потому что training_config для GRPO пустой)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🧠 Precision & Memory")
+
+    # Если training_config передан (SFT/Pretrain) — берём дефолт из него, иначе bf16 (GRPO дефолт)
+    default_mp = (training_config.get("mixed_precision") if training_config else None) or "bf16"
+    mixed_precision = st.sidebar.selectbox(
+        "Mixed Precision",
+        ["no", "fp16", "bf16"],
+        index=["no", "fp16", "bf16"].index(default_mp) if default_mp in ("no", "fp16", "bf16") else 2,
+        help="bf16 рекомендуется для Ampere+ GPU. Для FlashAttention нужен fp16/bf16.",
+    )
+
+    default_gc = bool(training_config.get("grad_checkpoint", False)) if training_config else False
+    grad_checkpoint = st.sidebar.checkbox(
+        "Gradient Checkpointing",
+        value=default_gc,
+        help="Экономит VRAM, но медленнее. Для GRPO (особенно full+длинные ответы) часто must-have.",
+    )
+
     # Пояснение про batch semantics (частая причина "почему так много VRAM в DDP")
     if training_config:
         try:
@@ -3199,6 +3239,8 @@ def render_distributed_config(training_config: dict | None = None):
         "gpu_ids": gpu_ids,
         "config_file": config_file,
         "parallel_type": mode_info['type'],
+        "mixed_precision": mixed_precision,
+        "grad_checkpoint": grad_checkpoint,
     }
 
 
@@ -3358,9 +3400,13 @@ def render_metrics_dashboard(metrics: dict):
         completions_seen = metrics.get("completions_generated_total", None)
         experiences_tuned = metrics.get("experiences_tuned_total", None)
 
-        if prompts_seen is None and prompt_bsz is not None:
-            # fallback-оценка (без учёта dynamic sampling добора)
-            prompts_seen = rollout_step * prompt_bsz * max(1, num_gpus)
+        # Оценка "сколько промптов прошло по датасету" из rollout_step (глобально, с учётом num_gpus).
+        # Это соответствует пользовательской семантике "prompts/step".
+        prompts_seen_est = None
+        if prompt_bsz is not None:
+            prompts_seen_est = rollout_step * prompt_bsz * max(1, num_gpus)
+            if prompts_seen is None or (isinstance(prompts_seen, (int, float)) and float(prompts_seen) < float(prompts_seen_est)):
+                prompts_seen = prompts_seen_est
         if completions_seen is None and prompts_seen is not None and group_size is not None:
             completions_seen = prompts_seen * group_size
 
@@ -5019,6 +5065,12 @@ def main():
     full_config["num_gpus"] = distributed_config["num_gpus"]
     full_config["config_file"] = distributed_config["config_file"]
     full_config["gpu_ids"] = distributed_config.get("gpu_ids", [])
+    # ВАЖНО: для GRPO training_config пустой, поэтому mixed_precision/grad_checkpoint берём из distributed_config.
+    # Для остальных стадий эти параметры уже приходят из training_config — не перетираем их.
+    if "mixed_precision" not in full_config:
+        full_config["mixed_precision"] = distributed_config.get("mixed_precision", "bf16")
+    if "grad_checkpoint" not in full_config:
+        full_config["grad_checkpoint"] = distributed_config.get("grad_checkpoint", False)
     
     # Для SFT, Continual Pretrain и GRPO используем токенизатор базовой модели
     if model_config.get("stage") in ("sft", "continual_pretrain", "grpo") and model_config.get("base_model_path"):
