@@ -325,6 +325,7 @@ def main():
         config.reasoning_format = ui_config.get("grpo_reasoning_format", config.reasoning_format)
         # Precision должен приходить из UI (render_distributed_config -> full_config -> config_json)
         config.mixed_precision = (ui_config.get("mixed_precision") or config.mixed_precision)
+        config.fp16_pure = bool(ui_config.get("fp16_pure", getattr(config, "fp16_pure", False)))
         # Memory: gradient checkpointing должен приходить из UI
         config.grad_checkpoint = bool(ui_config.get("grad_checkpoint", False))
 

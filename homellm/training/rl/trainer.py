@@ -194,14 +194,22 @@ class GRPOTrainer:
                 if mixed_precision == "bf16" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
                     logger.warning("bf16 выбран в UI, но GPU не поддерживает bf16. Fallback -> fp16")
                     mixed_precision = "fp16"
+
+                # "Pure fp16" (веса fp16, без GradScaler): для accelerate нужно mixed_precision='no',
+                # иначе он включит GradScaler и упадёт при fp16 градиентах.
+                accel_mp = mixed_precision
+                if mixed_precision == "fp16" and bool(getattr(self.config, "fp16_pure", False)):
+                    accel_mp = "no"
+                    logger.info("🧪 FP16 Pure режим: Accelerator(mixed_precision='no'), веса модели будут torch.float16")
                 
                 logger.info(f"🚀 Инициализация Accelerator...")
                 logger.info(f"  - gradient_accumulation_steps: {self.config.gradient_accumulation_steps}")
-                logger.info(f"  - mixed_precision: {mixed_precision}")
+                logger.info(f"  - mixed_precision (UI): {mixed_precision}")
+                logger.info(f"  - mixed_precision (accelerate): {accel_mp}")
                 
                 self.accelerator = Accelerator(
                     gradient_accumulation_steps=self.config.gradient_accumulation_steps,
-                    mixed_precision=mixed_precision,
+                    mixed_precision=accel_mp,
                 )
                 
                 # Устройство берем из accelerator (поддерживает multi-GPU)
@@ -311,13 +319,17 @@ class GRPOTrainer:
         else:
             # ВАЖНО:
             # - bf16: можно грузить веса в bf16 (нет GradScaler).
-            # - fp16: НЕ грузим веса в fp16, иначе градиенты будут fp16 и GradScaler/accelerate упадёт
-            #   ("Attempting to unscale FP16 gradients."). Для fp16 используем autocast/GradScaler поверх fp32 весов.
+            # - fp16: по умолчанию это AMP fp16 (fp32 master-веса + GradScaler) => веса оставляем fp32.
+            #   Для экономии VRAM можно включить "pure fp16" (веса fp16, без GradScaler) через config.fp16_pure.
             mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
             if mp == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
                 model_kwargs["dtype"] = torch.bfloat16
             elif mp == "fp16":
-                pass
+                if bool(getattr(self.config, "fp16_pure", False)):
+                    model_kwargs["dtype"] = torch.float16
+                else:
+                    # AMP fp16: оставляем fp32 веса (GradScaler требует fp32 master weights)
+                    pass
             elif mp == "no":
                 # Оставляем fp32 (дефолт HF)
                 pass
@@ -360,6 +372,14 @@ class GRPOTrainer:
             self.model_name,
             **model_kwargs,
         )
+
+        # Диагностика dtype модели (помогает понять, почему fp16 может потреблять больше памяти чем bf16)
+        try:
+            first_param = next(self.model.parameters(), None)
+            if first_param is not None:
+                logger.info(f"🔎 DType весов модели (пример): {first_param.dtype}")
+        except Exception:
+            pass
 
         # Gradient checkpointing (управляется из UI)
         if getattr(self.config, "grad_checkpoint", False) and hasattr(self.model, "gradient_checkpointing_enable"):
@@ -525,8 +545,24 @@ class GRPOTrainer:
                     model_memory_mb = (total_params * bytes_per_param) / (1024 ** 2)
                 else:
                     # Предполагаем bfloat16/fp16
-                    bytes_per_param = 2.0
-                    quant_type = "fp16"
+                    try:
+                        first_param = next(self.model.parameters(), None)
+                        dt = getattr(first_param, "dtype", None)
+                        if dt == torch.float32:
+                            bytes_per_param = 4.0
+                            quant_type = "fp32"
+                        elif dt == torch.bfloat16:
+                            bytes_per_param = 2.0
+                            quant_type = "bf16"
+                        elif dt == torch.float16:
+                            bytes_per_param = 2.0
+                            quant_type = "fp16"
+                        else:
+                            bytes_per_param = 2.0
+                            quant_type = "fp16/bf16"
+                    except Exception:
+                        bytes_per_param = 2.0
+                        quant_type = "fp16/bf16"
                     model_memory_mb = (total_params * bytes_per_param) / (1024 ** 2)
                 
                 logger.info(
@@ -568,10 +604,22 @@ class GRPOTrainer:
         mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
         use_autocast = torch.cuda.is_available() and mp in ("bf16", "fp16")
         if use_autocast:
-            autocast_ctx = torch.amp.autocast("cuda", enabled=True)
+            amp_dtype = torch.bfloat16 if mp == "bf16" else torch.float16
+            autocast_ctx = torch.amp.autocast("cuda", enabled=True, dtype=amp_dtype)
         else:
             from contextlib import nullcontext
             autocast_ctx = nullcontext()
+        if self.accelerator is not None:
+            try:
+                logger.info(
+                    "🔎 AMP/Precision: "
+                    f"mixed_precision={mp}, "
+                    f"autocast={'on' if use_autocast else 'off'}, "
+                    f"autocast_dtype={('bf16' if mp=='bf16' else 'fp16') if use_autocast else 'n/a'}, "
+                    f"grad_scaler={'on' if getattr(self.accelerator, 'scaler', None) is not None else 'off'}"
+                )
+            except Exception:
+                pass
         with torch.enable_grad():
             with autocast_ctx:
                 test_output = self.model(input_ids=test_input, attention_mask=test_mask, use_cache=False)
@@ -862,7 +910,6 @@ class GRPOTrainer:
                 base = self.accelerator.unwrap_model(self.model)
                 _strip_fp32_convert(base)
                 _strip_fp32_convert(getattr(base, "module", None))
-                logger.info("✅ Отключили accelerate convert_to_fp32 для forward() (экономия VRAM)")
             except Exception as e:
                 logger.warning(f"Не удалось отключить accelerate convert_to_fp32: {e}")
     
@@ -1356,7 +1403,8 @@ class GRPOTrainer:
                 use_autocast = (self.accelerator is not None and torch.cuda.is_available() and mp != "no")
                 
                 if use_autocast:
-                    autocast_context = torch.amp.autocast('cuda', enabled=True)
+                    amp_dtype = torch.bfloat16 if mp == "bf16" else torch.float16
+                    autocast_context = torch.amp.autocast("cuda", enabled=True, dtype=amp_dtype)
                 else:
                     from contextlib import nullcontext
                     autocast_context = nullcontext()

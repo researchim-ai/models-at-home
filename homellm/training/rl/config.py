@@ -164,6 +164,9 @@ class GRPOConfig:
 
     # Precision (должно приходить из UI/distributed_config)
     mixed_precision: str = "bf16"  # "no" | "fp16" | "bf16"
+    # Если True и mixed_precision="fp16": "pure fp16" (веса fp16, без GradScaler).
+    # Это снижает VRAM (сравнимо с bf16), но может быть менее стабильным, чем AMP fp16.
+    fp16_pure: bool = False
     
     # Memory
     grad_checkpoint: bool = False

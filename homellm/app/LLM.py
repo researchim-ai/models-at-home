@@ -3207,8 +3207,26 @@ def render_distributed_config(training_config: dict | None = None):
         "Mixed Precision",
         ["no", "fp16", "bf16"],
         index=["no", "fp16", "bf16"].index(default_mp) if default_mp in ("no", "fp16", "bf16") else 2,
-        help="bf16 рекомендуется для Ampere+ GPU. Для FlashAttention нужен fp16/bf16.",
+        help=(
+            "bf16 рекомендуется для Ampere+ GPU (обычно меньше VRAM и стабильнее). "
+            "fp16 в AMP режиме часто держит fp32-\"master\" веса + GradScaler и может занимать больше VRAM, чем bf16. "
+            "Для FlashAttention нужен fp16/bf16."
+        ),
     )
+
+    # FP16: два режима
+    # - AMP fp16 (дефолт): fp32 master-веса + GradScaler => может стартовать с большим VRAM, чем bf16
+    # - Pure fp16: веса fp16, без GradScaler => VRAM ближе к bf16, но может быть менее стабильным
+    fp16_pure = False
+    if mixed_precision == "fp16":
+        fp16_pure = st.sidebar.checkbox(
+            "FP16 Pure (веса fp16, без GradScaler)",
+            value=False,
+            help=(
+                "Снижает VRAM на старте (веса fp16, как у bf16), но может быть менее стабильным, чем AMP fp16. "
+                "Используйте, если fp16 OOM'ится из-за fp32 master-весов."
+            ),
+        )
 
     default_gc = bool(training_config.get("grad_checkpoint", False)) if training_config else False
     grad_checkpoint = st.sidebar.checkbox(
@@ -3240,6 +3258,7 @@ def render_distributed_config(training_config: dict | None = None):
         "config_file": config_file,
         "parallel_type": mode_info['type'],
         "mixed_precision": mixed_precision,
+        "fp16_pure": fp16_pure,
         "grad_checkpoint": grad_checkpoint,
     }
 
@@ -5069,6 +5088,8 @@ def main():
     # Для остальных стадий эти параметры уже приходят из training_config — не перетираем их.
     if "mixed_precision" not in full_config:
         full_config["mixed_precision"] = distributed_config.get("mixed_precision", "bf16")
+    if "fp16_pure" not in full_config:
+        full_config["fp16_pure"] = distributed_config.get("fp16_pure", False)
     if "grad_checkpoint" not in full_config:
         full_config["grad_checkpoint"] = distributed_config.get("grad_checkpoint", False)
     
