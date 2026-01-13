@@ -230,6 +230,29 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
     # Mixed precision
     mixed_precision = config.get("mixed_precision", "no")
     stage = config.get("stage", "pretrain") # pretrain | continual_pretrain | sft
+    fp16_pure = bool(config.get("fp16_pure", False))
+    use_flash_attention = bool(config.get("use_flash_attention", True))
+    
+    # ВАЖНО: некоторые accelerate/deepspeed config-и используют `gradient_accumulation_steps: auto`,
+    # но Accelerator ожидает int и упадёт на int("auto"). В нашем приложении источник истины — config.json из UI.
+    # Поэтому нормализуем значение и принудительно перезаписываем env для accelerate.
+    raw_ga = config.get("gradient_accumulation", 1)
+    try:
+        ga_steps = int(raw_ga)
+    except Exception:
+        if isinstance(raw_ga, str) and raw_ga.strip().lower() == "auto":
+            ga_steps = 1
+            logger.warning("gradient_accumulation='auto' не поддерживается в runtime; использую 1. Настройте значение в UI.")
+        else:
+            raise
+    config["gradient_accumulation"] = ga_steps
+    os.environ["ACCELERATE_GRADIENT_ACCUMULATION_STEPS"] = str(ga_steps)
+
+    # "Pure fp16" (веса fp16 без GradScaler) — для accelerate нужно mixed_precision='no'
+    # иначе он включит GradScaler и упадёт при fp16 градиентах.
+    if str(mixed_precision).lower() == "fp16" and fp16_pure:
+        mixed_precision = "no"
+        logger.info("🧪 FP16 Pure режим: Accelerator(mixed_precision='no') (без GradScaler)")
     
     # ВАЖНО: Убираем dispatch_batches=True, так как это вызывает проблемы с NoneType при broadcast
     # Вместо этого будем использовать явное шардирование внутри StreamingTextDataset (shard=True)
@@ -239,10 +262,51 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
     )
     
     accelerator = Accelerator(
-        gradient_accumulation_steps=config["gradient_accumulation"],
+        gradient_accumulation_steps=ga_steps,
         mixed_precision=mixed_precision,
         dataloader_config=dataloader_config,
     )
+
+    # DeepSpeed: нужно явно задать train_micro_batch_size_per_gpu
+    # если мы не передаём DataLoader в accelerator.prepare() (dataset-level sharding).
+    # Без этого DeepSpeed падает с "requires you to pass at least one dataloader with batch_size".
+    if accelerator.state.deepspeed_plugin is not None:
+        batch_size = int(config.get("batch_size", 1))
+        ds_cfg = accelerator.state.deepspeed_plugin.deepspeed_config
+        current_mbs = ds_cfg.get("train_micro_batch_size_per_gpu")
+        if current_mbs in (None, "auto"):
+            ds_cfg["train_micro_batch_size_per_gpu"] = batch_size
+            logger.info(f"DeepSpeed: set train_micro_batch_size_per_gpu={batch_size}")
+        # Также зададим train_batch_size если auto
+        current_tbs = ds_cfg.get("train_batch_size")
+        if current_tbs in (None, "auto"):
+            # train_batch_size = micro_batch * grad_accum * world_size
+            world_size = accelerator.num_processes
+            ds_cfg["train_batch_size"] = batch_size * ga_steps * world_size
+            logger.info(f"DeepSpeed: set train_batch_size={ds_cfg['train_batch_size']}")
+
+    # HomeModel FlashAttention: используем PyTorch SDPA (scaled_dot_product_attention).
+    # Чтобы реально задействовать flash kernels, включаем CUDA SDPA backends (если доступны).
+    if torch.cuda.is_available():
+        try:
+            if use_flash_attention:
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+                torch.backends.cuda.enable_math_sdp(True)
+            else:
+                # Явно запрещаем flash/mem_efficient kernels, оставляя только math (eager/математический)
+                torch.backends.cuda.enable_flash_sdp(False)
+                torch.backends.cuda.enable_mem_efficient_sdp(False)
+                torch.backends.cuda.enable_math_sdp(True)
+            logger.info(
+                "SDPA kernels: flash=%s mem_efficient=%s math=%s (use_flash_attention=%s)",
+                getattr(torch.backends.cuda, "flash_sdp_enabled", lambda: "N/A")(),
+                getattr(torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: "N/A")(),
+                getattr(torch.backends.cuda, "math_sdp_enabled", lambda: "N/A")(),
+                use_flash_attention,
+            )
+        except Exception as e:
+            logger.warning(f"Could not configure CUDA SDPA kernels: {e}")
     
     # ВАЖНО: MetricsLogger только на main process для избежания гонок при Multi-GPU
     metrics = MetricsLogger(metrics_path, enabled=accelerator.is_main_process)
@@ -507,6 +571,20 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         
         # Подготавливаем модель для обучения (resize, LoRA, use_cache, etc.)
         model = adapter.prepare_for_training(model, tokenizer, config)
+
+        # Диагностика: dtype весов и включён ли SDPA/flash path у HomeModel
+        try:
+            first = next(model.parameters())
+            logger.info(f"🔎 Model weights dtype (first param): {first.dtype}")
+        except Exception:
+            pass
+        try:
+            flash_mods = [m for m in model.modules() if hasattr(m, "flash")]
+            if flash_mods:
+                enabled = sum(1 for m in flash_mods if bool(getattr(m, "flash", False)))
+                logger.info(f"🔎 SDPA/flash modules: {enabled}/{len(flash_mods)} enabled")
+        except Exception:
+            pass
         
         # Подсчёт параметров
         num_params = sum(p.numel() for p in model.parameters())
@@ -770,7 +848,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     # Если DataLoader не был подготовлен accelerate'ом — вручную кладём батч на устройство
                     if is_streaming_sharded:
                         batch = {k: (v.to(accelerator.device) if hasattr(v, "to") else v) for k, v in batch.items()}
-                    out = model(**batch)
+                    with accelerator.autocast():
+                        out = model(**batch)
                     loss = out.loss.detach()
                     # Усредняем loss по всем процессам (каждый процесс видит свою часть val данных)
                     loss = accelerator.reduce(loss, reduction="mean")
@@ -894,7 +973,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 with accelerator.accumulate(model):
                     if is_streaming_sharded:
                         batch = {k: (v.to(accelerator.device) if hasattr(v, "to") else v) for k, v in batch.items()}
-                    outputs = model(**batch)
+                    with accelerator.autocast():
+                        outputs = model(**batch)
                     loss = outputs.loss
                     
                     loss_val = loss.detach().float().item()

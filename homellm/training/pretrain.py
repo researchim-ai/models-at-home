@@ -388,6 +388,16 @@ def parse_args():
     parser.add_argument("--fp16", action="store_true", help="Использовать fp16")
     parser.add_argument("--bf16", action="store_true", help="Использовать bf16 (Ampere+)")
     parser.add_argument("--grad_checkpoint", action="store_true", help="Включить torch.gradient_checkpointing для экономии VRAM")
+    parser.add_argument(
+        "--flash_attention",
+        action="store_true",
+        help="Включить SDPA (scaled_dot_product_attention), чтобы PyTorch мог использовать flash-attention kernels при fp16/bf16",
+    )
+    parser.add_argument(
+        "--no_flash_attention",
+        action="store_true",
+        help="Отключить SDPA/flash attention (использовать обычный attention)",
+    )
     parser.add_argument("--save_every", type=int, default=10000, help="Сохранять чекпойнт каждые N шагов")
     parser.add_argument("--log_every", type=int, default=500, help="Логировать каждый N шаг")
 
@@ -403,6 +413,8 @@ def main():
 
     if args.fp16 and args.bf16:
         raise ValueError("Нельзя одновременно задавать --fp16 и --bf16")
+    if args.flash_attention and args.no_flash_attention:
+        raise ValueError("Нельзя одновременно задавать --flash_attention и --no_flash_attention")
 
     # Настройка увеличить mixed_precision согласно accelerate>=0.20
     mixed_precision = (
@@ -413,6 +425,34 @@ def main():
         mixed_precision=mixed_precision,
     )
     is_main = accelerator.is_main_process
+
+    # Настройка CUDA SDPA kernels (влияет на HomeModel, т.к. он использует scaled_dot_product_attention)
+    use_flash_attention = True
+    if args.no_flash_attention:
+        use_flash_attention = False
+    elif args.flash_attention:
+        use_flash_attention = True
+    if torch.cuda.is_available():
+        try:
+            if use_flash_attention:
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+                torch.backends.cuda.enable_math_sdp(True)
+            else:
+                torch.backends.cuda.enable_flash_sdp(False)
+                torch.backends.cuda.enable_mem_efficient_sdp(False)
+                torch.backends.cuda.enable_math_sdp(True)
+            if is_main:
+                logger.info(
+                    "SDPA kernels: flash=%s mem_efficient=%s math=%s (use_flash_attention=%s)",
+                    getattr(torch.backends.cuda, "flash_sdp_enabled", lambda: "N/A")(),
+                    getattr(torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: "N/A")(),
+                    getattr(torch.backends.cuda, "math_sdp_enabled", lambda: "N/A")(),
+                    use_flash_attention,
+                )
+        except Exception as e:
+            if is_main:
+                logger.warning(f"Could not configure CUDA SDPA kernels: {e}")
 
     if is_main:
         logger.info("Arguments: %s", vars(args))
@@ -441,6 +481,7 @@ def main():
             num_hidden_layers=args.num_layers,
             num_attention_heads=args.n_heads,
             max_position_embeddings=args.seq_len,
+            use_sdpa=use_flash_attention,
         )
         model = HomeForCausalLM(config)
     else:
@@ -492,7 +533,8 @@ def main():
             pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{args.epochs}")
         for step, batch in enumerate(train_loader):
             with accelerator.accumulate(model):
-                outputs = model(**batch)
+                with accelerator.autocast():
+                    outputs = model(**batch)
                 loss = outputs.loss
                 accelerator.backward(loss)
                 optimizer.step()

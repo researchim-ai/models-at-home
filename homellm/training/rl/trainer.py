@@ -653,14 +653,23 @@ class GRPOTrainer:
         try:
             from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
             
-            # Включаем gradient checkpointing и подготовку для всех LoRA режимов (как в re-grpo)
-            # Это включает: casting layernorm to fp32, enabling gradient checkpointing, input_require_grads
-            logger.info("📦 Подготовка модели для LoRA training (prepare_model_for_kbit_training)...")
-            self.model.gradient_checkpointing_enable()
-            self.model = prepare_model_for_kbit_training(
-                self.model,
-                use_gradient_checkpointing=True,
-            )
+            # ВАЖНО:
+            # `prepare_model_for_kbit_training` нужно ТОЛЬКО для QLoRA (4/8bit).
+            # Для обычной LoRA на fp16/bf16 оно может кастить LayerNorm в fp32 => FlashAttention падает.
+            if self.config.use_4bit or self.config.use_8bit:
+                logger.info("📦 Подготовка модели для QLoRA (prepare_model_for_kbit_training)...")
+                self.model = prepare_model_for_kbit_training(
+                    self.model,
+                    use_gradient_checkpointing=bool(getattr(self.config, "grad_checkpoint", False)),
+                )
+            else:
+                # Обычная LoRA: gradient checkpointing — только если включено в UI
+                if bool(getattr(self.config, "grad_checkpoint", False)) and hasattr(self.model, "gradient_checkpointing_enable"):
+                    try:
+                        self.model.gradient_checkpointing_enable()
+                        logger.info("✅ Gradient checkpointing включен для LoRA (из UI)")
+                    except Exception as e:
+                        logger.warning(f"Не удалось включить gradient checkpointing для LoRA: {e}")
             
             # Проверяем что модель действительно квантизирована (если запрашивалось)
             if self.config.use_4bit or self.config.use_8bit:
@@ -746,6 +755,24 @@ class GRPOTrainer:
             logger.info("📦 Применение LoRA адаптеров к модели...")
             self.model = get_peft_model(self.model, lora_config)
             logger.info("✅ LoRA адаптеры применены!")
+
+            # Для FlashAttention важно, чтобы hidden_states были fp16/bf16.
+            # После LoRA некоторые модули/веса могут оказаться в fp32 и промоутить dtype в forward.
+            # Для НЕ-квантизированных моделей приводим LoRA-параметры к AMP dtype (bf16/fp16).
+            if not (self.config.use_4bit or self.config.use_8bit):
+                mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
+                if mp in ("bf16", "fp16") and torch.cuda.is_available():
+                    target_dtype = torch.bfloat16 if mp == "bf16" else torch.float16
+                    try:
+                        casted = 0
+                        for name, p in self.model.named_parameters():
+                            if "lora" in name.lower() and getattr(p, "dtype", None) != target_dtype:
+                                p.data = p.data.to(target_dtype)
+                                casted += 1
+                        if casted > 0:
+                            logger.info(f"✅ Привели {casted} LoRA параметров к dtype={target_dtype} (для совместимости с flash-attn)")
+                    except Exception as e:
+                        logger.warning(f"Не удалось привести LoRA параметры к AMP dtype: {e}")
             
             # Проверяем использование памяти после применения LoRA
             if torch.cuda.is_available():

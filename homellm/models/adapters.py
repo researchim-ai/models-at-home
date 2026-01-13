@@ -449,11 +449,41 @@ class HomeAdapter(ModelAdapter):
         trust_remote_code: bool = True,
     ) -> Tuple[PreTrainedModel, Any]:
         """Загружает Home модель для обучения."""
+        def _set_home_sdpa_enabled(m: PreTrainedModel, enabled: bool) -> None:
+            # home_model.Attention хранит флаг self.flash, который нужно обновить после загрузки.
+            try:
+                import torch.nn.functional as F
+                can_sdpa = bool(enabled) and hasattr(F, "scaled_dot_product_attention")
+                for mod in m.modules():
+                    if hasattr(mod, "flash"):
+                        try:
+                            mod.flash = bool(can_sdpa)
+                        except Exception:
+                            pass
+                if hasattr(m, "config"):
+                    try:
+                        m.config.use_sdpa = bool(enabled)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         # QLoRA не поддерживается для Home моделей (bitsandbytes не применим)
         tuning_method = config.get("tuning_method", "full")
         if tuning_method == "qlora":
             logger.warning("QLoRA is not supported for Home models. Falling back to LoRA.")
             config["tuning_method"] = "lora"  # Понижаем до LoRA
+
+        # Mixed precision / dtype для Home модели
+        mp = str(config.get("mixed_precision", "no")).lower()
+        fp16_pure = bool(config.get("fp16_pure", False))
+        if mp == "bf16":
+            torch_dtype = torch.bfloat16
+        elif mp == "fp16":
+            # AMP fp16: веса обычно fp32; pure fp16: веса fp16 (без GradScaler)
+            torch_dtype = torch.float16 if fp16_pure else torch.float32
+        else:
+            torch_dtype = torch.float32
 
         # Blueprint режим (сборка с нуля по схеме)
         if config.get("model_blueprint") or config.get("blueprint_path"):
@@ -517,6 +547,9 @@ class HomeAdapter(ModelAdapter):
                     raise ValueError(f"Cannot find config.json in {base_model_path}")
             
             model = HomeForCausalLM(model_config)
+            if torch_dtype != torch.float32:
+                model = model.to(dtype=torch_dtype)
+            _set_home_sdpa_enabled(model, bool(config.get("use_flash_attention", True)))
             logger.info(f"Home model initialized for resume from accelerate checkpoint")
             logger.warning(
                 "Model initialized with random weights. "
@@ -537,10 +570,11 @@ class HomeAdapter(ModelAdapter):
                 logger.info(f"Loading Home model from {base_model_path} using from_pretrained...")
                 model = HomeForCausalLM.from_pretrained(
                     str(base_model_path),
-                    torch_dtype=torch.float32,
+                    torch_dtype=torch_dtype,
                     trust_remote_code=trust_remote_code,
                 )
                 model_config = model.config
+                _set_home_sdpa_enabled(model, bool(config.get("use_flash_attention", True)))
                 logger.info(f"✅ Successfully loaded Home model from {base_model_path}")
                 return model, model_config
             except Exception as e:
@@ -549,6 +583,9 @@ class HomeAdapter(ModelAdapter):
                 logger.warning("Falling back to manual weight loading...")
                 model_config = HomeConfig.from_pretrained(str(base_model_path))
                 model = HomeForCausalLM(model_config)
+                if torch_dtype != torch.float32:
+                    model = model.to(dtype=torch_dtype)
+                _set_home_sdpa_enabled(model, bool(config.get("use_flash_attention", True)))
                 
                 from safetensors.torch import load_file
                 if (base_model_path / "model.safetensors").exists():
@@ -575,6 +612,16 @@ class HomeAdapter(ModelAdapter):
         trust_remote_code: bool = True,
     ) -> Tuple[PreTrainedModel, Any]:
         """Инициализирует Home модель или blueprint-модель с нуля."""
+        mp = str(config.get("mixed_precision", "no")).lower()
+        fp16_pure = bool(config.get("fp16_pure", False))
+        if mp == "bf16":
+            torch_dtype = torch.bfloat16
+        elif mp == "fp16":
+            torch_dtype = torch.float16 if fp16_pure else torch.float32
+        else:
+            torch_dtype = torch.float32
+
+        use_flash_attention = bool(config.get("use_flash_attention", True))
         blueprint_path = config.get("model_blueprint")
         if blueprint_path:
             bp = Blueprint.load(blueprint_path)
@@ -599,8 +646,11 @@ class HomeAdapter(ModelAdapter):
             num_attention_heads=config["n_heads"],
             max_position_embeddings=config["seq_len"],
             dropout=config.get("dropout", 0.0),
+            use_sdpa=use_flash_attention,
         )
         model = HomeForCausalLM(model_config)
+        if torch_dtype != torch.float32:
+            model = model.to(dtype=torch_dtype)
         return model, model_config
 
 
@@ -634,13 +684,19 @@ class HFAdapter(ModelAdapter):
         """Загружает HF модель для обучения."""
         # Определяем параметры для QLoRA и mixed precision
         tuning_method = config.get("tuning_method", "full")
-        mp = config.get("mixed_precision", "no")
+        mp = str(config.get("mixed_precision", "no")).lower()
+        fp16_pure = bool(config.get("fp16_pure", False))
+        use_flash_attention = bool(config.get("use_flash_attention", True))
         
         # Определяем torch_dtype
+        # ВАЖНО:
+        # - bf16: можно грузить веса в bf16 (нет GradScaler)
+        # - fp16: по умолчанию это AMP fp16 (GradScaler) -> веса держим fp32
+        # - fp16_pure=True: веса грузим в fp16, а Accelerator должен быть mixed_precision='no'
         if mp == "bf16":
             torch_dtype = torch.bfloat16
         elif mp == "fp16":
-            torch_dtype = torch.float16
+            torch_dtype = torch.float16 if fp16_pure else torch.float32
         else:
             torch_dtype = torch.float32
         
@@ -677,12 +733,32 @@ class HFAdapter(ModelAdapter):
             
             try:
                 logger.info(f"Loading HF model from {base_model_path} using from_pretrained...")
+                # FlashAttention 2: включаем только если веса в fp16/bf16 и модель не квантизирована (QLoRA).
+                extra_kwargs: Dict[str, Any] = {}
+                try:
+                    use_flash = (
+                        use_flash_attention
+                        and (torch_dtype in (torch.float16, torch.bfloat16))
+                        and tuning_method != "qlora"
+                    )
+                    if use_flash:
+                        import flash_attn  # noqa: F401
+                        extra_kwargs["attn_implementation"] = "flash_attention_2"
+                        logger.info(f"✅ FlashAttention2 включен (attn_implementation=flash_attention_2, dtype={torch_dtype})")
+                    elif not use_flash_attention:
+                        # Явно отключаем SDPA/flash для HF моделей
+                        extra_kwargs["attn_implementation"] = "eager"
+                except Exception:
+                    # Если flash_attn не установлен или недоступен — молча остаёмся на стандартном attention
+                    pass
+
                 model = AutoModelForCausalLM.from_pretrained(
                     str(base_model_path),
                     torch_dtype=torch_dtype if tuning_method != "qlora" else None,  # dtype в qlora контролируется bnb
                     trust_remote_code=trust_remote_code,
                     quantization_config=quantization_config,
                     device_map=device_map,
+                    **extra_kwargs,
                 )
                 model_config = model.config
                 logger.info(f"✅ Successfully loaded HF model from {base_model_path}")

@@ -18,9 +18,17 @@ services:
       - ./.runs:/app/.runs
       - ./blueprints:/app/blueprints
       - ./models:/app/models
+      - ./configs:/app/configs
     environment:
       - PYTHONUNBUFFERED=1
       - MKL_THREADING_LAYER=GNU
+      # NCCL: улучшенная диагностика при ошибках multi-GPU
+      - NCCL_DEBUG=WARN
+    # ВАЖНО: shared memory для NCCL (multi-GPU / DeepSpeed / DDP).
+    # По умолчанию Docker даёт 64MB, а NCCL нужно гораздо больше.
+    shm_size: "8gb"
+    # Альтернатива: ipc: host (использует /dev/shm хоста, но менее изолировано)
+    # ipc: host
     deploy:
       resources:
         reservations:

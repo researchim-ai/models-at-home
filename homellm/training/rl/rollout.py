@@ -293,13 +293,25 @@ def generate_rollouts(
         
         # Генерация всех group_size completions параллельно одним батчем
         # ВАЖНО: Используем unwrapped_model для generate() (DDP не поддерживает generate напрямую)
-        outputs = unwrapped_model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            generation_config=generation_config,
-            return_dict_in_generate=True,
-            output_scores=False,
-        )
+        # ВАЖНО: для FlashAttention generation должен идти под autocast fp16/bf16.
+        # Иначе dtype может промоутиться в fp32 (особенно при LoRA) и flash-attn упадёт.
+        mp = (getattr(config, "mixed_precision", None) or "bf16").lower()
+        use_autocast = torch.cuda.is_available() and mp in ("bf16", "fp16")
+        if use_autocast:
+            amp_dtype = torch.bfloat16 if mp == "bf16" else torch.float16
+            autocast_ctx = torch.amp.autocast("cuda", enabled=True, dtype=amp_dtype)
+        else:
+            from contextlib import nullcontext
+            autocast_ctx = nullcontext()
+
+        with autocast_ctx:
+            outputs = unwrapped_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                generation_config=generation_config,
+                return_dict_in_generate=True,
+                output_scores=False,
+            )
         
         generated_ids = outputs.sequences
         

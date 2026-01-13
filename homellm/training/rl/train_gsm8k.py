@@ -326,6 +326,7 @@ def main():
         # Precision должен приходить из UI (render_distributed_config -> full_config -> config_json)
         config.mixed_precision = (ui_config.get("mixed_precision") or config.mixed_precision)
         config.fp16_pure = bool(ui_config.get("fp16_pure", getattr(config, "fp16_pure", False)))
+        config.use_flash_attention = bool(ui_config.get("use_flash_attention", getattr(config, "use_flash_attention", True)))
         # Memory: gradient checkpointing должен приходить из UI
         config.grad_checkpoint = bool(ui_config.get("grad_checkpoint", False))
 

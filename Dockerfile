@@ -74,9 +74,14 @@ LABEL com.modelsathome.image="models-at-home-studio"
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
+    python3.10-dev \
     python3-distutils \
     libgl1 \
     libgomp1 \
+    # Для JIT компиляции DeepSpeed ops (cpu_adam и др.)
+    build-essential \
+    ninja-build \
+    libaio-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # Подхватываем venv из builder

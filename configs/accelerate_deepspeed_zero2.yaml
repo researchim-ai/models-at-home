@@ -1,47 +1,15 @@
 # HomeLLM - DeepSpeed ZeRO Stage 2
-# =================================
-# Шардирование оптимизатора и градиентов
-# Рекомендуется для моделей 100M-1B параметров
-#
-# Использование:
-#   accelerate launch --config_file configs/accelerate_deepspeed_zero2.yaml \
-#       -m homellm.training.pretrain --data_path ...
-
 compute_environment: LOCAL_MACHINE
 distributed_type: DEEPSPEED
-mixed_precision: "bf16"
-num_processes: 2  # Измените на количество ваших GPU
+mixed_precision: bf16
+num_processes: 2
 num_machines: 1
 main_training_function: main
 
 deepspeed_config:
-  # ZeRO Stage 2: шардирование оптимизатора и градиентов
-  zero_optimization:
-    stage: 2
-    offload_optimizer:
-      device: none  # "cpu" для offload на CPU
-    offload_param:
-      device: none
-    allgather_partitions: true
-    allgather_bucket_size: 500000000
-    reduce_scatter: true
-    reduce_bucket_size: 500000000
-    overlap_comm: true
-    contiguous_gradients: true
-  
-  # Градиентный клиппинг
+  zero_stage: 2
+  offload_optimizer_device: none
+  offload_param_device: none
   gradient_clipping: 1.0
-  
-  # Инициализация весов
-  zero_allow_untested_optimizer: true
-  
-  # FP16/BF16
-  bf16:
-    enabled: true
-  
-  # Размер батча - accelerate подставит значения
-  train_batch_size: auto
-  train_micro_batch_size_per_gpu: auto
-  gradient_accumulation_steps: auto
 
-dynamo_backend: "no"
+dynamo_config: {}

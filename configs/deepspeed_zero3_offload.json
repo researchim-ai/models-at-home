@@ -1,0 +1,35 @@
+{
+  "zero_optimization": {
+    "stage": 3,
+    "offload_optimizer": {
+      "device": "cpu",
+      "pin_memory": true,
+      "buffer_count": 4,
+      "fast_init": false
+    },
+    "offload_param": {
+      "device": "cpu",
+      "pin_memory": true,
+      "buffer_count": 5,
+      "buffer_size": 100000000,
+      "max_in_cpu": 1000000000
+    },
+    "stage3_prefetch_bucket_size": 10000000,
+    "stage3_param_persistence_threshold": 10000,
+    "stage3_max_live_parameters": 30000000,
+    "stage3_max_reuse_distance": 30000000,
+    "stage3_gather_16bit_weights_on_model_save": true,
+    "sub_group_size": 10000000,
+    "reduce_bucket_size": 10000000,
+    "contiguous_gradients": true,
+    "overlap_comm": false
+  },
+  "gradient_clipping": 1.0,
+  "bf16": {
+    "enabled": true
+  },
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "zero_allow_untested_optimizer": true
+}

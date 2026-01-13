@@ -596,6 +596,19 @@ def start_training(config: dict) -> tuple[str, subprocess.Popen]:
     """Запустить тренировку в фоне."""
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     
+    # Явно логируем ключевые UI-параметры, чтобы не было “тихих” перетираний пресетами
+    try:
+        logger.info(
+            "Start training with: stage=%s mixed_precision=%s fp16_pure=%s grad_checkpoint=%s use_flash_attention=%s",
+            config.get("stage"),
+            config.get("mixed_precision"),
+            config.get("fp16_pure"),
+            config.get("grad_checkpoint"),
+            config.get("use_flash_attention"),
+        )
+    except Exception:
+        pass
+    
     # ЛОГИКА ПУТЕЙ
     # config["output_dir"] - это корень эксперимента (например out/my_model)
     # Мы хотим сохранять чекпоинты в out/my_model/run_2023.../checkpoint_...
@@ -2763,8 +2776,8 @@ def render_model_config():
 
 
 def render_training_config():
-    """Конфигуратор обучения в сайдбаре."""
-    st.sidebar.header("⚙️ Параметры обучения")
+    """Конфигуратор гиперпараметров обучения."""
+    st.sidebar.header("📈 Гиперпараметры")
     
     batch_size = st.sidebar.slider(
         "Batch Size",
@@ -2864,16 +2877,47 @@ def render_training_config():
             help="Максимальное количество шагов обучения"
         )
     
-    mixed_precision = st.sidebar.selectbox(
-        "Mixed Precision",
-        ["no", "fp16", "bf16"],
-        index=2,
-        help="bf16 рекомендуется для Ampere+ GPU"
+    max_grad_norm = st.sidebar.number_input(
+        "Max Gradient Norm",
+        min_value=0.0,
+        max_value=10.0,
+        value=1.0,
+        step=0.1,
+        help="Gradient clipping для стабильности (0 = отключить)"
     )
+    
+    return {
+        "batch_size": batch_size,
+        "gradient_accumulation": grad_accum,
+        "learning_rate": learning_rate,
+        "lr_schedule": lr_schedule,
+        "min_lr_ratio": min_lr_ratio,
+        "warmup_steps": warmup_steps,
+        "scheduler_resync_on_resume": scheduler_resync_on_resume,
+        "epochs": epochs,
+        "max_steps": max_steps,
+        "max_grad_norm": max_grad_norm,
+    }
 
+
+def render_dataset_config(stage="pretrain"):
+    """Выбор датасета и настройки валидации."""
+    st.sidebar.header("📁 Данные")
+    
+    datasets = get_available_datasets()
+    
+    if datasets:
+        dataset_options = [f"{name} ({size})" for name, size in datasets]
+        selected = st.sidebar.selectbox("Выберите датасет", dataset_options)
+        selected_name = selected.split(" (")[0]
+        data_path = str(DATASET_DIR / selected_name)
+    else:
+        st.sidebar.warning("Датасеты не найдены в datasets/")
+        data_path = st.sidebar.text_input("Путь к датасету", "datasets/data.jsonl")
+    
     # Sharding mode: гарантирует отсутствие двойного шардинга и корректную семантику resume
     st.sidebar.divider()
-    st.sidebar.subheader("🧩 Шардирование данных")
+    st.sidebar.subheader("🧩 Шардирование")
     sharding_mode = st.sidebar.selectbox(
         "Sharding mode",
         options=["auto", "dataset", "accelerate"],
@@ -2883,21 +2927,6 @@ def render_training_config():
             "dataset: шардинг делает сам датасет (shard=True), DataLoader НЕ готовим через accelerate.\n"
             "accelerate: шардинг делает accelerate.prepare(DataLoader); строгий resume для streaming отключается."
         ),
-    )
-    
-    grad_checkpoint = st.sidebar.checkbox(
-        "Gradient Checkpointing",
-        value=False,
-        help="Экономит VRAM, но медленнее"
-    )
-    
-    max_grad_norm = st.sidebar.number_input(
-        "Max Gradient Norm",
-        min_value=0.0,
-        max_value=10.0,
-        value=1.0,
-        step=0.1,
-        help="Gradient clipping для стабильности (0 = отключить)"
     )
     
     # Validation / Eval
@@ -2932,41 +2961,12 @@ def render_training_config():
     )
     
     return {
-        "batch_size": batch_size,
-        "gradient_accumulation": grad_accum,
-        "learning_rate": learning_rate,
-        "lr_schedule": lr_schedule,
-        "min_lr_ratio": min_lr_ratio,
-        "warmup_steps": warmup_steps,
-        "scheduler_resync_on_resume": scheduler_resync_on_resume,
-        "epochs": epochs,
-        "max_steps": max_steps,
-        "mixed_precision": mixed_precision,
-        "grad_checkpoint": grad_checkpoint,
-        "max_grad_norm": max_grad_norm,
+        "data_path": data_path,
         "sharding_mode": sharding_mode,
         "val_ratio": val_ratio,
         "eval_every": eval_every,
         "eval_batches": eval_batches,
     }
-
-
-def render_dataset_config(stage="pretrain"):
-    """Выбор датасета (только выбор файла)."""
-    st.sidebar.header("📁 Датасет")
-    
-    datasets = get_available_datasets()
-    
-    if datasets:
-        dataset_options = [f"{name} ({size})" for name, size in datasets]
-        selected = st.sidebar.selectbox("Выберите датасет", dataset_options)
-        selected_name = selected.split(" (")[0]
-        data_path = str(DATASET_DIR / selected_name)
-    else:
-        st.sidebar.warning("Датасеты не найдены в datasets/")
-        data_path = st.sidebar.text_input("Путь к датасету", "datasets/data.jsonl")
-    
-    return {"data_path": data_path}
 
 
 def render_output_config(model_name="training_run"):
@@ -3090,8 +3090,8 @@ def get_available_models():
 
 
 def render_distributed_config(training_config: dict | None = None):
-    """Конфигурация distributed training."""
-    st.sidebar.header("🖥️ GPU и параллелизм")
+    """Конфигурация GPU, параллелизма и памяти."""
+    st.sidebar.header("🖥️ GPU и Память")
     
     # Информация о GPU
     gpus = get_gpu_info()
@@ -3113,7 +3113,8 @@ def render_distributed_config(training_config: dict | None = None):
                 "Выберите GPU",
                 options=gpu_options,
                 default=gpu_options,
-                help="Выберите GPU для обучения"
+                help="Выберите GPU для обучения",
+                key="gpu_select_multiselect"
             )
             num_gpus = len(selected_gpus)
             gpu_ids = [gpu_options.index(g) for g in selected_gpus]
@@ -3235,6 +3236,20 @@ def render_distributed_config(training_config: dict | None = None):
         help="Экономит VRAM, но медленнее. Для GRPO (особенно full+длинные ответы) часто must-have.",
     )
 
+    # FlashAttention toggle (для всех стадий).
+    # - HF модели: attn_implementation=flash_attention_2 (требует flash_attn + fp16/bf16)
+    # - Home модели: SDPA (scaled_dot_product_attention) может использовать flash kernel автоматически при fp16/bf16
+    default_fa = bool(training_config.get("use_flash_attention", True)) if training_config else True
+    flash_attention = st.sidebar.checkbox(
+        "FlashAttention (ускорение attention)",
+        value=default_fa,
+        help=(
+            "Включает быстрый attention где возможно. "
+            "Для HF-моделей использует FlashAttention2 (если установлен flash-attn и включен fp16/bf16). "
+            "Для Home-моделей управляет использованием SDPA."
+        ),
+    )
+
     # Пояснение про batch semantics (частая причина "почему так много VRAM в DDP")
     if training_config:
         try:
@@ -3260,6 +3275,7 @@ def render_distributed_config(training_config: dict | None = None):
         "mixed_precision": mixed_precision,
         "fp16_pure": fp16_pure,
         "grad_checkpoint": grad_checkpoint,
+        "use_flash_attention": flash_attention,
     }
 
 
@@ -5084,14 +5100,12 @@ def main():
     full_config["num_gpus"] = distributed_config["num_gpus"]
     full_config["config_file"] = distributed_config["config_file"]
     full_config["gpu_ids"] = distributed_config.get("gpu_ids", [])
-    # ВАЖНО: для GRPO training_config пустой, поэтому mixed_precision/grad_checkpoint берём из distributed_config.
-    # Для остальных стадий эти параметры уже приходят из training_config — не перетираем их.
-    if "mixed_precision" not in full_config:
-        full_config["mixed_precision"] = distributed_config.get("mixed_precision", "bf16")
-    if "fp16_pure" not in full_config:
-        full_config["fp16_pure"] = distributed_config.get("fp16_pure", False)
-    if "grad_checkpoint" not in full_config:
-        full_config["grad_checkpoint"] = distributed_config.get("grad_checkpoint", False)
+    # ВАЖНО: значения из UI (sidebar) должны иметь приоритет над пресетами training_config.
+    # Иначе пользователь выбирает одно, а в ран уезжает другое (как было с mixed_precision=no -> bf16).
+    full_config["mixed_precision"] = distributed_config.get("mixed_precision", "bf16")
+    full_config["fp16_pure"] = distributed_config.get("fp16_pure", False)
+    full_config["grad_checkpoint"] = distributed_config.get("grad_checkpoint", False)
+    full_config["use_flash_attention"] = distributed_config.get("use_flash_attention", True)
     
     # Для SFT, Continual Pretrain и GRPO используем токенизатор базовой модели
     if model_config.get("stage") in ("sft", "continual_pretrain", "grpo") and model_config.get("base_model_path"):
@@ -5137,7 +5151,7 @@ def main():
                     time.sleep(1)
                     st.rerun()
             else:
-                # Для GRPO другая кнопка и логика
+                # Для GRPO отдельная кнопка и запуск
                 if model_config.get("stage") == "grpo":
                     if st.button("🧠 Начать GRPO обучение", type="primary"):
                         with st.spinner("Запуск GRPO..."):
@@ -5145,12 +5159,10 @@ def main():
                             st.session_state.current_run_id = run_id
                             st.session_state.training_process = process
                             st.session_state.training_active = True
-                            
                             save_active_run(run_id, full_config)
-                            
                             st.success(f"GRPO обучение запущено! Run ID: {run_id}")
-                            time.sleep(1)
-                            st.rerun()
+                        time.sleep(1)
+                        st.rerun()
                 else:
                     if st.button("▶️ Начать тренировку", type="primary"):
                         with st.spinner("Запуск..."):
@@ -5158,13 +5170,11 @@ def main():
                             st.session_state.current_run_id = run_id
                             st.session_state.training_process = process
                             st.session_state.training_active = True
-                            
                             # Сохраняем активный run для persistence
                             save_active_run(run_id, full_config)
-                            
                             st.success(f"Тренировка запущена! Run ID: {run_id}")
-                            time.sleep(1)
-                            st.rerun()
+                        time.sleep(1)
+                        st.rerun()
     
     with tab2:
         # Используем fragment для автоматического обновления без перезагрузки страницы

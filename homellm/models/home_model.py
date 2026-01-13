@@ -44,6 +44,7 @@ class HomeConfig(PretrainedConfig):
         eos_token_id: int = 50256,
         max_position_embeddings: int = 4096,
         rope_theta: float = 1e4,
+        use_sdpa: bool = True,
         **kwargs,
     ):
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -57,6 +58,7 @@ class HomeConfig(PretrainedConfig):
         self.dropout = dropout
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
+        self.use_sdpa = bool(use_sdpa)
 
 
 # -----------------------------------------------------------------------------
@@ -113,7 +115,7 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
-        self.flash = hasattr(F, "scaled_dot_product_attention")
+        self.flash = bool(getattr(config, "use_sdpa", True)) and hasattr(F, "scaled_dot_product_attention")
 
     def forward(
         self,
@@ -144,9 +146,33 @@ class Attention(nn.Module):
 
         kv_len = k.size(2)  # Полная длина KV (с учётом past_key_value)
         
-        if self.flash and seq_len > 1 and past_key_value is None:
-            # Flash attention с is_causal=True работает только без KV-кэша
-            output = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout.p if self.training else 0.0, is_causal=True)
+        if self.flash:
+            # PyTorch SDPA сам выберет лучший backend (flash/mem_efficient/math) при fp16/bf16.
+            # Важно: для генерации с KV-кэшем обычно seq_len=1, и мы можем безопасно считать attention без causal-маски:
+            # в k/v уже только "прошлое", будущих токенов там нет.
+            if past_key_value is None:
+                output = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=True,
+                )
+            elif seq_len == 1:
+                output = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )
+            else:
+                # Редкий случай: past_key_value есть, но seq_len > 1 (chunked decode) — оставляем безопасный путь ниже.
+                attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+                causal_mask = torch.triu(
+                    torch.ones(seq_len, kv_len, device=x.device, dtype=torch.bool),
+                    diagonal=kv_len - seq_len + 1
+                )
+                attn_weights = attn_weights.masked_fill(causal_mask, -1e4)
+                attn_probs = F.softmax(attn_weights, dim=-1)
+                attn_probs = self.dropout(attn_probs)
+                output = torch.matmul(attn_probs, v)
         else:
             attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
             # Создаём каузальную маску правильного размера (seq_len × kv_len)
