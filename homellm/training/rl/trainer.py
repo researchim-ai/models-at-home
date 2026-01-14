@@ -226,6 +226,9 @@ class GRPOTrainer:
                 
                 logger.info(f"📱 Устройство: {self.device}")
                 
+                # Логируем и настраиваем DeepSpeed конфигурацию
+                self._log_and_setup_deepspeed_config()
+                
             except ImportError:
                 logger.warning("⚠️  accelerate не установлен, используем single GPU")
                 self.accelerator = None
@@ -263,6 +266,75 @@ class GRPOTrainer:
         logger.info(f"GRPOTrainer инициализирован на {self.device}")
         logger.info(f"Алгоритм: {self.config.algorithm.value}")
     
+    def _log_and_setup_deepspeed_config(self):
+        """Логирует и настраивает DeepSpeed конфигурацию."""
+        if self.accelerator is None:
+            return
+        
+        ds_plugin = getattr(self.accelerator.state, 'deepspeed_plugin', None)
+        if ds_plugin is None:
+            logger.info("📋 DeepSpeed: не используется (DDP/FSDP режим)")
+            return
+        
+        logger.info("=" * 60)
+        logger.info("📋 КОНФИГУРАЦИЯ DEEPSPEED:")
+        logger.info("=" * 60)
+        
+        # Основные параметры
+        zero_stage = getattr(ds_plugin, 'zero_stage', 'N/A')
+        logger.info(f"  - ZeRO Stage: {zero_stage}")
+        
+        # Offload настройки
+        offload_optimizer = getattr(ds_plugin, 'offload_optimizer_device', None)
+        offload_param = getattr(ds_plugin, 'offload_param_device', None)
+        logger.info(f"  - Offload Optimizer: {offload_optimizer or 'none'}")
+        logger.info(f"  - Offload Param: {offload_param or 'none'}")
+        
+        # Полный конфиг
+        ds_config = getattr(ds_plugin, 'deepspeed_config', {})
+        if ds_config:
+            logger.info("  - Полный DeepSpeed конфиг:")
+            for key, value in ds_config.items():
+                if isinstance(value, dict):
+                    logger.info(f"    {key}:")
+                    for k, v in value.items():
+                        logger.info(f"      {k}: {v}")
+                else:
+                    logger.info(f"    {key}: {value}")
+        
+        # ВАЖНО: Устанавливаем train_micro_batch_size_per_gpu для DeepSpeed
+        # DeepSpeed требует это значение при accelerator.prepare() без dataloader
+        # Для GRPO используем train_batch_size из конфига
+        micro_batch_size = getattr(self.config, 'train_batch_size', None)
+        if micro_batch_size is None:
+            micro_batch_size = getattr(self.config, 'batch_size', 1) or 1
+        micro_batch_size = max(1, int(micro_batch_size))
+        
+        logger.info(f"  - Устанавливаем train_micro_batch_size_per_gpu: {micro_batch_size}")
+        logger.info(f"  - gradient_accumulation_steps: {self.config.gradient_accumulation_steps}")
+        
+        # Устанавливаем значения в DeepSpeed конфиг
+        try:
+            from accelerate.state import AcceleratorState
+            state = AcceleratorState()
+            if hasattr(state, 'deepspeed_plugin') and state.deepspeed_plugin is not None:
+                ds_cfg = state.deepspeed_plugin.deepspeed_config
+                if ds_cfg is not None:
+                    # Устанавливаем batch sizes
+                    ds_cfg['train_micro_batch_size_per_gpu'] = micro_batch_size
+                    ds_cfg['gradient_accumulation_steps'] = self.config.gradient_accumulation_steps
+                    # train_batch_size = micro_batch_size * gradient_accumulation * num_gpus
+                    num_gpus = self.accelerator.num_processes
+                    ds_cfg['train_batch_size'] = micro_batch_size * self.config.gradient_accumulation_steps * num_gpus
+                    logger.info(f"  ✅ DeepSpeed batch sizes установлены:")
+                    logger.info(f"    - train_micro_batch_size_per_gpu: {ds_cfg['train_micro_batch_size_per_gpu']}")
+                    logger.info(f"    - gradient_accumulation_steps: {ds_cfg['gradient_accumulation_steps']}")
+                    logger.info(f"    - train_batch_size: {ds_cfg['train_batch_size']}")
+        except Exception as e:
+            logger.warning(f"⚠️  Не удалось установить DeepSpeed batch sizes: {e}")
+        
+        logger.info("=" * 60)
+    
     def _load_model(self):
         """Загружает модель с опциональной квантизацией и LoRA."""
         logger.info(f"Загрузка модели {self.model_name}...")
@@ -276,6 +348,20 @@ class GRPOTrainer:
             logger.info(f"  - lora_r: {self.config.lora_r}")
             logger.info(f"  - lora_alpha: {self.config.lora_alpha}")
             logger.info(f"  - lora_target_modules: {self.config.lora_target_modules}")
+        
+        # Определяем используется ли DeepSpeed ZeRO-3 в начале функции
+        # При ZeRO-3 параметры sharded между процессами и нельзя делать .to(device)
+        # Сохраняем как атрибут класса для использования в других методах
+        self.is_deepspeed_zero3 = False
+        if self.accelerator is not None:
+            ds_plugin = getattr(self.accelerator.state, 'deepspeed_plugin', None)
+            if ds_plugin is not None:
+                zero_stage = getattr(ds_plugin, 'zero_stage', 0)
+                self.is_deepspeed_zero3 = zero_stage == 3
+                logger.info(f"🔧 DeepSpeed ZeRO stage: {zero_stage}")
+                if self.is_deepspeed_zero3:
+                    logger.info("⚡ ZeRO-3 режим: параметры будут sharded, пропускаем .to(device)")
+        is_deepspeed_zero3 = self.is_deepspeed_zero3  # локальная переменная для совместимости
         
         # Проверяем использование памяти до загрузки
         memory_before = 0.0
@@ -494,40 +580,73 @@ class GRPOTrainer:
             for param in self.reference_model.parameters():
                 param.requires_grad = False
             
-            # Перемещаем на устройство если не device_map
-            if not (self.config.quantize_reference_model and quantization_config):
+            # Перемещаем reference модель на устройство если не device_map и не ZeRO-3
+            if not (self.config.quantize_reference_model and quantization_config) and not is_deepspeed_zero3:
                 self.reference_model = self.reference_model.to(self.device)
         else:
             logger.info("KL weight = 0, референсная модель не загружается (экономия памяти)")
         
-        # Перемещаем на устройство (если не device_map)
-        if not quantization_config:
+        # Перемещаем основную модель на устройство (если не device_map и не ZeRO-3)
+        # При ZeRO-3 DeepSpeed сам управляет размещением параметров
+        # Reference модель уже перемещена выше
+        if not quantization_config and not is_deepspeed_zero3:
             self.model = self.model.to(self.device)
-            if self.reference_model:
-                self.reference_model = self.reference_model.to(self.device)
         
         # ВАЖНО: После перемещения на устройство или применения LoRA,
         # убеждаемся что trainable параметры всё ещё требуют градиентов
-        if self.config.use_lora:
-            # Для LoRA проверяем что LoRA параметры требуют градиентов
-            # PEFT должен это делать автоматически, но проверим
-            try:
-                from peft import PeftModel
-                if isinstance(self.model, PeftModel):
-                    # PEFT модель - проверяем что есть trainable параметры
-                    pass  # PEFT должен автоматически настроить requires_grad
-            except:
-                pass
+        # Для ZeRO-3 пропускаем эту проверку - DeepSpeed сам управляет градиентами
+        if not is_deepspeed_zero3:
+            if self.config.use_lora:
+                # Для LoRA проверяем что LoRA параметры требуют градиентов
+                # PEFT должен это делать автоматически, но проверим
+                try:
+                    from peft import PeftModel
+                    if isinstance(self.model, PeftModel):
+                        # PEFT модель - проверяем что есть trainable параметры
+                        pass  # PEFT должен автоматически настроить requires_grad
+                except:
+                    pass
+            else:
+                # Для full fine-tuning убеждаемся что все параметры требуют градиентов
+                for param in self.model.parameters():
+                    if not param.requires_grad:
+                        logger.warning(f"Параметр не требует градиентов, включаем: {param.shape}")
+                        param.requires_grad = True
         else:
-            # Для full fine-tuning убеждаемся что все параметры требуют градиентов
-            for param in self.model.parameters():
-                if not param.requires_grad:
-                    logger.warning(f"Параметр не требует градиентов, включаем: {param.shape}")
-                    param.requires_grad = True
+            logger.info("⚡ ZeRO-3: пропускаем ручную настройку requires_grad")
         
         # Подсчёт параметров и проверка
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        # При ZeRO-3 параметры sharded, нужен специальный подход
+        if is_deepspeed_zero3:
+            # Для ZeRO-3: используем num_parameters() если доступен, или конфиг модели
+            try:
+                # DeepSpeed модели могут иметь метод для полного подсчёта
+                if hasattr(self.model, 'num_parameters'):
+                    total_params = self.model.num_parameters()
+                    trainable_params = self.model.num_parameters(only_trainable=True)
+                else:
+                    # Альтернатива: подсчёт из конфигурации модели (HuggingFace)
+                    from transformers import AutoConfig
+                    model_config = AutoConfig.from_pretrained(self.model_name)
+                    # Примерная оценка для трансформеров: 
+                    # vocab_size * hidden_size + num_layers * (4 * hidden_size^2 + ...)
+                    hidden = getattr(model_config, 'hidden_size', 768)
+                    layers = getattr(model_config, 'num_hidden_layers', 12)
+                    vocab = getattr(model_config, 'vocab_size', 32000)
+                    # Грубая оценка: embedding + transformer layers
+                    total_params = vocab * hidden + layers * 12 * hidden * hidden
+                    trainable_params = total_params  # full fine-tuning = все trainable
+                    logger.info(f"⚡ ZeRO-3: приблизительная оценка параметров из конфига")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось оценить параметры для ZeRO-3: {e}")
+                # Fallback: используем sharded размеры * world_size
+                world_size = self.accelerator.num_processes if self.accelerator else 1
+                total_params = sum(p.numel() for p in self.model.parameters()) * world_size
+                trainable_params = total_params  # при full fine-tuning все trainable
+                logger.info(f"⚡ ZeRO-3: оценка параметров = sharded * world_size ({world_size})")
+        else:
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         
         # Оценка использования памяти
         if torch.cuda.is_available():
@@ -588,7 +707,8 @@ class GRPOTrainer:
             logger.info(f"Параметры модели: {total_params:,} всего, {trainable_params:,} обучаемых")
         
         # КРИТИЧЕСКАЯ ПРОВЕРКА: должны быть trainable параметры
-        if trainable_params == 0:
+        # Для ZeRO-3 пропускаем эту проверку - параметры sharded и требуют специальной обработки
+        if trainable_params == 0 and not is_deepspeed_zero3:
             raise RuntimeError(
                 "❌ Нет trainable параметров в модели! "
                 "Проверьте конфигурацию: use_lora, use_4bit, use_8bit. "
@@ -598,6 +718,12 @@ class GRPOTrainer:
         # Дополнительная проверка: тестовый forward pass должен требовать градиентов
         # ВАЖНО: при flash_attention_2 и mixed_precision fp16/bf16 делаем forward под autocast,
         # иначе FlashAttention может ругаться на fp32 dtype.
+        # Для ZeRO-3 пропускаем тестовый forward - параметры ещё не материализованы
+        if is_deepspeed_zero3:
+            logger.info("⚡ ZeRO-3: пропускаем тестовый forward pass (параметры sharded)")
+            self.model.train()
+            return  # Выходим из _load_model для ZeRO-3
+        
         self.model.train()  # Убеждаемся что в train режиме
         test_input = torch.randint(0, 1000, (1, 10), device=self.device)
         test_mask = torch.ones_like(test_input)
@@ -847,34 +973,74 @@ class GRPOTrainer:
     
     def _setup_optimizer(self, num_training_steps: int):
         """Настраивает оптимизатор и scheduler."""
-        # Оптимизатор (только для обучаемых параметров)
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        num_trainable = sum(p.numel() for p in trainable_params)
-        total_params = sum(p.numel() for p in self.model.parameters())
-        
         logger.info(f"🔧 Настройка оптимизатора:")
-        logger.info(f"  - Trainable параметров: {num_trainable:,} / {total_params:,} ({100*num_trainable/total_params:.2f}%)")
-        logger.info(f"  - Групп параметров: {len(trainable_params)}")
         
-        # Проверяем что оптимизатор использует только trainable параметры
-        if len(trainable_params) == 0:
+        # При ZeRO-3 параметры sharded - нужен специальный подсчёт
+        if getattr(self, 'is_deepspeed_zero3', False):
+            # Для ZeRO-3: все параметры trainable при full fine-tuning
+            # Используем оценку из конфига модели
+            try:
+                from transformers import AutoConfig
+                model_config = AutoConfig.from_pretrained(self.model_name)
+                hidden = getattr(model_config, 'hidden_size', 768)
+                layers = getattr(model_config, 'num_hidden_layers', 12)
+                vocab = getattr(model_config, 'vocab_size', 32000)
+                total_params = vocab * hidden + layers * 12 * hidden * hidden
+                num_trainable = total_params  # full fine-tuning
+                logger.info(f"  ⚡ ZeRO-3: приблизительная оценка параметров из конфига")
+                logger.info(f"  - Trainable параметров: ~{num_trainable:,} (оценка)")
+            except Exception as e:
+                logger.warning(f"  ⚠️ Не удалось оценить параметры для ZeRO-3: {e}")
+                num_trainable = 1  # placeholder для избежания division by zero
+                total_params = 1
+            trainable_params = list(self.model.parameters())  # все параметры для ZeRO-3
+        else:
+            # Стандартный подсчёт для не-ZeRO-3
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            num_trainable = sum(p.numel() for p in trainable_params)
+            total_params = sum(p.numel() for p in self.model.parameters())
+            
+            if total_params > 0:
+                logger.info(f"  - Trainable параметров: {num_trainable:,} / {total_params:,} ({100*num_trainable/total_params:.2f}%)")
+            else:
+                logger.info(f"  - Trainable параметров: {num_trainable:,}")
+            logger.info(f"  - Групп параметров: {len(trainable_params)}")
+        
+        # Проверяем что есть параметры для оптимизатора
+        # Для ZeRO-3 пропускаем эту проверку - DeepSpeed сам управляет параметрами
+        if len(trainable_params) == 0 and not getattr(self, 'is_deepspeed_zero3', False):
             raise RuntimeError("❌ Нет trainable параметров для оптимизатора! Проверьте LoRA конфигурацию.")
         
-        try:
-            from bitsandbytes.optim import AdamW8bit
-            logger.info("✅ Используется AdamW8bit (8-bit оптимизатор для экономии памяти)")
-            self.optimizer = AdamW8bit(
-                trainable_params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-            )
-        except ImportError:
-            logger.info("ℹ️  Используется стандартный AdamW (bitsandbytes не установлен)")
+        # Определяем используется ли DeepSpeed (для выбора оптимизатора)
+        uses_deepspeed = (
+            self.accelerator is not None and 
+            getattr(self.accelerator.state, 'deepspeed_plugin', None) is not None
+        )
+        
+        # При DeepSpeed используем стандартный AdamW - bitsandbytes может конфликтовать с CPU offload
+        if uses_deepspeed:
+            logger.info("⚡ DeepSpeed режим: используется стандартный AdamW (совместимо с ZeRO offload)")
             self.optimizer = torch.optim.AdamW(
                 trainable_params,
                 lr=self.config.learning_rate,
                 weight_decay=self.config.weight_decay,
             )
+        else:
+            try:
+                from bitsandbytes.optim import AdamW8bit
+                logger.info("✅ Используется AdamW8bit (8-bit оптимизатор для экономии памяти)")
+                self.optimizer = AdamW8bit(
+                    trainable_params,
+                    lr=self.config.learning_rate,
+                    weight_decay=self.config.weight_decay,
+                )
+            except ImportError:
+                logger.info("ℹ️  Используется стандартный AdamW (bitsandbytes не установлен)")
+                self.optimizer = torch.optim.AdamW(
+                    trainable_params,
+                    lr=self.config.learning_rate,
+                    weight_decay=self.config.weight_decay,
+                )
         
         # Оцениваем память оптимизатора
         # AdamW хранит: градиенты (fp16), momentum (fp16), variance (fp16) = 3x trainable_params
@@ -882,14 +1048,18 @@ class GRPOTrainer:
         logger.info(f"💾 Примерная память оптимизатора: ~{optimizer_memory_mb:.1f} MB")
         
         # Проверяем что оптимизатор действительно использует только trainable параметры
-        optimizer_param_count = sum(p.numel() for group in self.optimizer.param_groups for p in group['params'])
-        if optimizer_param_count != num_trainable:
-            logger.warning(
-                f"⚠️  Несоответствие: оптимизатор использует {optimizer_param_count:,} параметров, "
-                f"а trainable параметров {num_trainable:,}"
-            )
+        # Для ZeRO-3 пропускаем - параметры sharded
+        if not getattr(self, 'is_deepspeed_zero3', False):
+            optimizer_param_count = sum(p.numel() for group in self.optimizer.param_groups for p in group['params'])
+            if optimizer_param_count != num_trainable:
+                logger.warning(
+                    f"⚠️  Несоответствие: оптимизатор использует {optimizer_param_count:,} параметров, "
+                    f"а trainable параметров {num_trainable:,}"
+                )
+            else:
+                logger.info(f"✅ Оптимизатор использует только trainable параметры ({optimizer_param_count:,})")
         else:
-            logger.info(f"✅ Оптимизатор использует только trainable параметры ({optimizer_param_count:,})")
+            logger.info(f"⚡ ZeRO-3: пропускаем проверку параметров оптимизатора (sharded)")
         
         # Scheduler
         # ВАЖНО: scheduler.step() вызывается на optimizer-step, поэтому num_training_steps должен быть в optim-шагах.
@@ -1004,6 +1174,19 @@ class GRPOTrainer:
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
+        # ВАЖНО: Записываем начальный heartbeat в metrics.jsonl
+        # Это сигнализирует UI что обучение стартовало
+        if self.is_main_process:
+            initial_metrics = {
+                "step": 0,
+                "status": "training_started",
+                "epoch": 0,
+                "total_prompts": num_prompts,
+                "planned_optim_steps": self.planned_optim_total_steps,
+            }
+            self._log_metrics(initial_metrics, jsonl_only=True)
+            logger.info("📝 Записан начальный heartbeat в metrics.jsonl")
+        
         # DataLoader для промптов
         prompt_loader = DataLoader(
             list(range(len(dataset))),
@@ -1074,12 +1257,14 @@ class GRPOTrainer:
             group_ids = self._next_group_uids(desired_groups)
             
             # Генерация rollout'ов
+            logger.info(f"🎲 Batch {batch_idx}: начинаем генерацию {len(prompts)} промптов...")
             self.replay_buffer.clear()
             batch_rewards = self._generate_and_collect(
                 prompts=prompts,
                 reference_answers=reference_answers,
                 prompt_ids=group_ids,
             )
+            logger.info(f"✅ Batch {batch_idx}: генерация завершена, rewards={len(batch_rewards)}")
             refill_rounds = 0
             # DAPO dynamic sampling: добор групп до нужного размера (НЕ уменьшаем batch автоматически)
             if self.config.dynamic_sampling:
@@ -1225,6 +1410,13 @@ class GRPOTrainer:
         Returns:
             Список всех rewards
         """
+        # ВАЖНО: При ZeRO-3 все процессы должны войти в generate() синхронно
+        # Иначе будет deadlock при сборке параметров
+        if getattr(self, 'is_deepspeed_zero3', False) and self.accelerator is not None:
+            logger.info("⚡ ZeRO-3: синхронизация процессов перед генерацией...")
+            self.accelerator.wait_for_everyone()
+            logger.info("⚡ ZeRO-3: синхронизация завершена, начинаем генерацию")
+        
         self.model.eval()
         all_rewards = []
         
@@ -1251,6 +1443,11 @@ class GRPOTrainer:
             device=self.device,
             prompt_ids=prompt_ids,
         )
+        
+        # ВАЖНО: Синхронизация после генерации для ZeRO-3
+        if getattr(self, 'is_deepspeed_zero3', False) and self.accelerator is not None:
+            logger.debug("⚡ ZeRO-3: синхронизация после генерации")
+            self.accelerator.wait_for_everyone()
         
         # Конвертируем в Experience и добавляем в буфер
         # ВАЖНО: Обрабатываем и сразу удаляем, чтобы не копить память

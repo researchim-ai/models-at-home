@@ -535,7 +535,7 @@ def main():
             with accelerator.accumulate(model):
                 with accelerator.autocast():
                     outputs = model(**batch)
-                loss = outputs.loss
+                    loss = outputs.loss
                 accelerator.backward(loss)
                 optimizer.step()
                 lr_scheduler.step()

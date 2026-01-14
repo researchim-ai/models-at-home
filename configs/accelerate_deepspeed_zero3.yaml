@@ -1,4 +1,4 @@
-# HomeLLM - DeepSpeed ZeRO Stage 3
+# HomeLLM - DeepSpeed ZeRO Stage 3 (без CPU offload)
 compute_environment: LOCAL_MACHINE
 distributed_type: DEEPSPEED
 mixed_precision: bf16
@@ -8,8 +8,8 @@ main_training_function: main
 
 deepspeed_config:
   zero_stage: 3
-  offload_optimizer_device: cpu
-  offload_param_device: cpu
+  offload_optimizer_device: none
+  offload_param_device: none
   gradient_clipping: 1.0
   zero3_save_16bit_model: true
   zero3_init_flag: true

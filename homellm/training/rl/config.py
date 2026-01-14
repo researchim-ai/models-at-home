@@ -130,6 +130,23 @@ class GRPOConfig:
     overlong_penalty: float = -1.0
     overlong_buffer: int = 0  # 4000 в DAPO для длинных контекстов
     
+    # ============================================================
+    # ОПТИМИЗАЦИИ ГЕНЕРАЦИИ
+    # ============================================================
+    
+    # Prefix Grouper: shared KV-cache для G completions одного промпта
+    # Даёт 2-3x ускорение генерации (не работает с ZeRO-3)
+    use_prefix_grouper: bool = True
+    
+    # Multi-prompt batching: сколько промптов генерировать одним батчем
+    # 1 = отключено (по умолчанию). 2-4 = хороший выбор для GPU с запасом памяти.
+    # Не совместимо с Prefix Grouper (взаимоисключающие).
+    rollout_batch_size: int = 1
+    
+    # ds3_gather_for_generation: сбор параметров ZeRO-3 перед генерацией
+    # Даёт 10-100x ускорение для ZeRO-3 (автоматически включается при ZeRO-3)
+    ds3_gather_for_generation: bool = True
+    
     # Логирование
     output_dir: str = "./output/grpo"
     save_steps: int = 100

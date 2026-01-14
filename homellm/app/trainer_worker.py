@@ -849,7 +849,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     if is_streaming_sharded:
                         batch = {k: (v.to(accelerator.device) if hasattr(v, "to") else v) for k, v in batch.items()}
                     with accelerator.autocast():
-                        out = model(**batch)
+                    out = model(**batch)
                     loss = out.loss.detach()
                     # Усредняем loss по всем процессам (каждый процесс видит свою часть val данных)
                     loss = accelerator.reduce(loss, reduction="mean")
@@ -974,7 +974,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     if is_streaming_sharded:
                         batch = {k: (v.to(accelerator.device) if hasattr(v, "to") else v) for k, v in batch.items()}
                     with accelerator.autocast():
-                        outputs = model(**batch)
+                    outputs = model(**batch)
                     loss = outputs.loss
                     
                     loss_val = loss.detach().float().item()

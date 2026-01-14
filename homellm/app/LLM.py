@@ -2914,7 +2914,7 @@ def render_dataset_config(stage="pretrain"):
     else:
         st.sidebar.warning("Датасеты не найдены в datasets/")
         data_path = st.sidebar.text_input("Путь к датасету", "datasets/data.jsonl")
-    
+
     # Sharding mode: гарантирует отсутствие двойного шардинга и корректную семантику resume
     st.sidebar.divider()
     st.sidebar.subheader("🧩 Шардирование")
@@ -5161,8 +5161,8 @@ def main():
                             st.session_state.training_active = True
                             save_active_run(run_id, full_config)
                             st.success(f"GRPO обучение запущено! Run ID: {run_id}")
-                        time.sleep(1)
-                        st.rerun()
+                            time.sleep(1)
+                            st.rerun()
                 else:
                     if st.button("▶️ Начать тренировку", type="primary"):
                         with st.spinner("Запуск..."):
@@ -5173,8 +5173,8 @@ def main():
                             # Сохраняем активный run для persistence
                             save_active_run(run_id, full_config)
                             st.success(f"Тренировка запущена! Run ID: {run_id}")
-                        time.sleep(1)
-                        st.rerun()
+                            time.sleep(1)
+                            st.rerun()
     
     with tab2:
         # Используем fragment для автоматического обновления без перезагрузки страницы

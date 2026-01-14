@@ -3,16 +3,88 @@
 
 Rollout = генерация нескольких ответов на один промпт с вычислением rewards.
 """
+import logging
 import re
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Callable, Any, Dict
 import torch
+
+logger = logging.getLogger(__name__)
 import torch.nn.functional as F
 from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
     GenerationConfig,
 )
+
+
+@contextmanager
+def ds3_gather_for_generation(model, accelerator):
+    """
+    Context manager для сбора параметров ZeRO-3 перед генерацией.
+    
+    КРИТИЧНО ДЛЯ ПРОИЗВОДИТЕЛЬНОСТИ:
+    При ZeRO-3 параметры sharded между GPU. Без GatheredParameters 
+    каждый forward (для каждого токена!) делает all-gather = ОЧЕНЬ медленно.
+    
+    GatheredParameters собирает все параметры ОДИН раз перед генерацией.
+    Это работает и для ZeRO-3 с offload, и без offload.
+    
+    Источник: grpo_optimizations.md, TRL docs (ds3_gather_for_generation)
+    """
+    if accelerator is None:
+        yield
+        return
+    
+    # Проверяем что используется ZeRO-3
+    ds_plugin = getattr(accelerator.state, 'deepspeed_plugin', None)
+    if ds_plugin is None:
+        yield
+        return
+    
+    zero_stage = getattr(ds_plugin, 'zero_stage', 0)
+    if zero_stage != 3:
+        yield
+        return
+    
+    # ZeRO-3: ВСЕГДА используем GatheredParameters для генерации
+    # Без этого каждый токен = all-gather = зависание
+    try:
+        from deepspeed.runtime.zero.partition_parameters import GatheredParameters
+        
+        # model уже должен быть unwrapped (передаётся из generate_rollouts)
+        params_to_gather = list(model.parameters())
+        if not params_to_gather:
+            logger.warning("  ⚠️ ds3_gather: нет параметров для сбора")
+            yield
+            return
+        
+        # Проверяем есть ли CPU offload (для логирования)
+        has_cpu_offload = False
+        try:
+            ds_config = ds_plugin.deepspeed_config
+            offload_param = ds_config.get('zero_optimization', {}).get('offload_param', {})
+            param_device = offload_param.get('device', 'none') if isinstance(offload_param, dict) else 'none'
+            has_cpu_offload = param_device == 'cpu'
+        except Exception:
+            pass
+        
+        offload_str = " (с CPU offload)" if has_cpu_offload else ""
+        logger.info(f"  🔄 ds3_gather: собираем {len(params_to_gather)} параметров{offload_str}...")
+        
+        # modifier_rank=None означает что все ранки могут читать собранные параметры
+        with GatheredParameters(params_to_gather, modifier_rank=None):
+            logger.info("  ✅ Параметры собраны, начинаем генерацию")
+            yield
+            logger.info("  ✅ Генерация завершена, освобождаем параметры")
+    
+    except ImportError:
+        logger.warning("  ⚠️ DeepSpeed не найден, продолжаем без ds3_gather (может быть медленно)")
+        yield
+    except Exception as e:
+        logger.warning(f"  ⚠️ ds3_gather ошибка: {e}, продолжаем без оптимизации (может быть медленно)")
+        yield
 
 from .experience import Experience
 from .config import GRPOConfig
@@ -212,6 +284,76 @@ def compute_log_probs(
     return log_probs
 
 
+def _batch_generate_multi_prompt(
+    generate_model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    prompt_batch: List[str],
+    config: GRPOConfig,
+    generation_config: GenerationConfig,
+    device: torch.device,
+    autocast_ctx,
+) -> Tuple[List[torch.Tensor], List[int]]:
+    """
+    ОПТИМИЗАЦИЯ: Батчевая генерация для нескольких промптов одновременно.
+    
+    Вместо генерации по одному промпту, объединяем несколько промптов в батч,
+    что даёт лучшую утилизацию GPU (особенно при коротких промптах).
+    
+    Args:
+        generate_model: Модель для генерации
+        tokenizer: Токенизатор
+        prompt_batch: Список промптов для батча
+        config: Конфигурация GRPO
+        generation_config: Конфигурация генерации
+        device: Устройство
+        autocast_ctx: Контекст mixed precision
+        
+    Returns:
+        Tuple[List[generated_ids], List[prompt_lengths]]
+    """
+    batch_size = len(prompt_batch)
+    group_size = config.group_size
+    
+    # Токенизируем все промпты в батч с padding
+    prompt_inputs = tokenizer(
+        prompt_batch,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=config.max_prompt_length,
+    ).to(device)
+    
+    prompt_lengths = [
+        (prompt_inputs["attention_mask"][i] == 1).sum().item()
+        for i in range(batch_size)
+    ]
+    
+    # Расширяем для group_size: каждый промпт дублируется G раз
+    # [prompt0, prompt0, ..., prompt1, prompt1, ...]
+    expanded_input_ids = prompt_inputs["input_ids"].repeat_interleave(group_size, dim=0)
+    expanded_attention_mask = prompt_inputs["attention_mask"].repeat_interleave(group_size, dim=0)
+    
+    # Генерация всех completions одним батчем
+    with autocast_ctx:
+        outputs = generate_model.generate(
+            input_ids=expanded_input_ids,
+            attention_mask=expanded_attention_mask,
+            generation_config=generation_config,
+            return_dict_in_generate=True,
+            output_scores=False,
+        )
+    
+    # Разделяем результаты обратно по промптам
+    all_generated = outputs.sequences  # [batch_size * group_size, seq_len]
+    generated_per_prompt = []
+    for i in range(batch_size):
+        start_idx = i * group_size
+        end_idx = start_idx + group_size
+        generated_per_prompt.append(all_generated[start_idx:end_idx])
+    
+    return generated_per_prompt, prompt_lengths
+
+
 @torch.no_grad()
 def generate_rollouts(
     model: PreTrainedModel,
@@ -227,6 +369,11 @@ def generate_rollouts(
 ) -> List[Rollout]:
     """
     Генерирует rollout'ы для списка промптов.
+    
+    ОПТИМИЗАЦИИ:
+    - Prefix Grouper: shared KV-cache для G completions (2-3x ускорение)
+    - ds3_gather_for_generation: сбор параметров ZeRO-3 перед генерацией (10-100x)
+    - Multi-prompt batching: несколько промптов генерируются одним батчем (1.5-2x)
     
     Args:
         model: Языковая модель (политика) - может быть обернута в DDP
@@ -256,7 +403,17 @@ def generate_rollouts(
     
     unwrapped_model.eval()
     if device is None:
-        device = next(unwrapped_model.parameters()).device
+        # ВАЖНО: При ZeRO-3 с CPU offload параметры могут быть на CPU
+        # Используем accelerator.device если доступен
+        if accelerator is not None:
+            device = accelerator.device
+        else:
+            try:
+                device = next(unwrapped_model.parameters()).device
+            except StopIteration:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    logger.info(f"🎲 Начинаем генерацию {len(prompts)} rollouts на устройстве {device}")
     
     rollouts = []
     
@@ -270,105 +427,334 @@ def generate_rollouts(
         eos_token_id=tokenizer.eos_token_id,
     )
     
-    for prompt_idx, (prompt, ref_answer) in enumerate(zip(prompts, reference_answers)):
-        # Токенизация промпта.
-        # ВАЖНО: build_reasoning_prompt(...) применяется на уровне датасета/тренера
-        # (см. GRPOTrainer._train_epoch), поэтому здесь prompt уже может быть
-        # "полным" (system+user). Не добавляем system второй раз.
-        prompt_inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=config.max_prompt_length,
-        ).to(device)
-        
-        prompt_length = prompt_inputs["input_ids"].size(1)
-        
-        # ВАЖНО: Параллельная генерация для группы (как в re-grpo)
-        # Дублируем промпт group_size раз и генерируем все completions одним батчем
-        # Это эффективнее чем последовательная генерация
-        input_ids = prompt_inputs["input_ids"].repeat(config.group_size, 1)
-        attention_mask = prompt_inputs["attention_mask"].repeat(config.group_size, 1)
-        
-        # Генерация всех group_size completions параллельно одним батчем
-        # ВАЖНО: Используем unwrapped_model для generate() (DDP не поддерживает generate напрямую)
-        # ВАЖНО: для FlashAttention generation должен идти под autocast fp16/bf16.
-        # Иначе dtype может промоутиться в fp32 (особенно при LoRA) и flash-attn упадёт.
-        mp = (getattr(config, "mixed_precision", None) or "bf16").lower()
-        use_autocast = torch.cuda.is_available() and mp in ("bf16", "fp16")
-        if use_autocast:
-            amp_dtype = torch.bfloat16 if mp == "bf16" else torch.float16
-            autocast_ctx = torch.amp.autocast("cuda", enabled=True, dtype=amp_dtype)
-        else:
-            from contextlib import nullcontext
-            autocast_ctx = nullcontext()
-
-        with autocast_ctx:
-            outputs = unwrapped_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                generation_config=generation_config,
-                return_dict_in_generate=True,
-                output_scores=False,
-            )
-        
-        generated_ids = outputs.sequences
-        
-        # Декодирование completions
-        completions = tokenizer.batch_decode(
-            generated_ids[:, prompt_length:],
-            skip_special_tokens=True,
-        )
-        
-        # Определяем truncated ответы
-        is_truncated = []
-        for i in range(config.group_size):
-            completion_length = (generated_ids[i, prompt_length:] != tokenizer.pad_token_id).sum().item()
-            is_truncated.append(completion_length >= config.max_new_tokens)
-        
-        # Вычисляем rewards
-        rewards = torch.zeros(config.group_size, dtype=torch.float32, device=device)
-        for i, completion in enumerate(completions):
-            try:
-                reward = reward_fn(
-                    completion=completion,
-                    reference_answer=ref_answer,
-                    reasoning_format=config.reasoning_format,
-                    is_truncated=is_truncated[i],
+    # Определяем используется ли ZeRO-3 (для DeepSpeed inference)
+    is_zero3 = False
+    if accelerator is not None:
+        ds_plugin = getattr(accelerator.state, 'deepspeed_plugin', None)
+        if ds_plugin is not None:
+            zero_stage = getattr(ds_plugin, 'zero_stage', 0)
+            is_zero3 = zero_stage == 3
+    
+    # Mixed precision настройка
+    mp = (getattr(config, "mixed_precision", None) or "bf16").lower()
+    use_autocast = torch.cuda.is_available() and mp in ("bf16", "fp16")
+    if use_autocast:
+        amp_dtype = torch.bfloat16 if mp == "bf16" else torch.float16
+        autocast_ctx = torch.amp.autocast("cuda", enabled=True, dtype=amp_dtype)
+    else:
+        autocast_ctx = nullcontext()
+    
+    # ВАЖНО: для генерации всегда используем unwrapped модель
+    # - DDP: generate() не работает через DDP wrapper
+    # - ZeRO-3 + GatheredParameters: параметры собраны, используем напрямую
+    generate_model = unwrapped_model
+    
+    # Определяем использовать ли Prefix Grouper (shared KV-cache)
+    # Включаем только для не-ZeRO-3 режимов (ZeRO-3 плохо работает с KV-cache)
+    use_prefix_grouper = getattr(config, 'use_prefix_grouper', True) and not is_zero3
+    
+    # ОПТИМИЗАЦИЯ: Multi-prompt batching
+    # Сколько промптов генерировать одним батчем (1 = отключено)
+    # Не совместимо с Prefix Grouper (они взаимоисключающие)
+    rollout_batch_size = getattr(config, 'rollout_batch_size', 1)
+    use_multi_prompt_batch = rollout_batch_size > 1 and not use_prefix_grouper
+    
+    # ОПТИМИЗАЦИЯ: ds3_gather_for_generation
+    # При ZeRO-3 собираем параметры один раз перед всеми генерациями
+    # Передаём unwrapped модель — там берутся параметры для gather
+    use_ds3_gather = getattr(config, 'ds3_gather_for_generation', True) and is_zero3
+    ds3_gather_ctx = ds3_gather_for_generation(unwrapped_model, accelerator) if use_ds3_gather else nullcontext()
+    
+    with ds3_gather_ctx:
+        # ============================================================
+        # MULTI-PROMPT BATCHING: генерируем несколько промптов за раз
+        # ============================================================
+        if use_multi_prompt_batch:
+            logger.info(f"  🚀 Multi-prompt batching: rollout_batch_size={rollout_batch_size}")
+            
+            for batch_start in range(0, len(prompts), rollout_batch_size):
+                batch_end = min(batch_start + rollout_batch_size, len(prompts))
+                prompt_batch = prompts[batch_start:batch_end]
+                ref_batch = reference_answers[batch_start:batch_end]
+                
+                if batch_start == 0:
+                    logger.info(f"  📊 First batch: {len(prompt_batch)} prompts, group_size={config.group_size}")
+                    logger.info(f"  📊 Total generations per batch: {len(prompt_batch) * config.group_size}")
+                
+                # Генерируем батч
+                generated_per_prompt, prompt_lengths = _batch_generate_multi_prompt(
+                    generate_model=generate_model,
+                    tokenizer=tokenizer,
+                    prompt_batch=prompt_batch,
+                    config=config,
+                    generation_config=generation_config,
+                    device=device,
+                    autocast_ctx=autocast_ctx,
                 )
-                # Проверяем что reward - число
-                if not isinstance(reward, (int, float)):
-                    import logging
-                    logging.warning(
-                        f"Reward не число: {type(reward)} = {reward} для completion: {completion[:100]}..."
+                
+                # Обрабатываем результаты для каждого промпта в батче
+                for i, (prompt, ref_answer, generated_ids, prompt_length) in enumerate(
+                    zip(prompt_batch, ref_batch, generated_per_prompt, prompt_lengths)
+                ):
+                    prompt_idx = batch_start + i
+                    
+                    # Декодирование completions
+                    completions = tokenizer.batch_decode(
+                        generated_ids[:, prompt_length:],
+                        skip_special_tokens=True,
                     )
-                    reward = 0.0
-                rewards[i] = float(reward)
-            except Exception as e:
-                import logging
-                logging.error(
-                    f"Ошибка при вычислении reward для completion {i}: {e}\n"
-                    f"Completion: {completion[:200]}...\n"
-                    f"Reference: {ref_answer[:100]}..."
-                )
-                rewards[i] = 0.0
+                    
+                    # Определяем truncated ответы
+                    is_truncated = []
+                    for j in range(config.group_size):
+                        completion_length = (generated_ids[j, prompt_length:] != tokenizer.pad_token_id).sum().item()
+                        is_truncated.append(completion_length >= config.max_new_tokens)
+                    
+                    # Вычисляем rewards
+                    rewards = torch.zeros(config.group_size, dtype=torch.float32, device=device)
+                    for j, completion in enumerate(completions):
+                        try:
+                            reward = reward_fn(
+                                completion=completion,
+                                reference_answer=ref_answer,
+                                reasoning_format=config.reasoning_format,
+                                is_truncated=is_truncated[j],
+                            )
+                            if not isinstance(reward, (int, float)):
+                                reward = 0.0
+                            rewards[j] = float(reward)
+                        except Exception as e:
+                            logger.error(f"Ошибка reward для completion {j}: {e}")
+                            rewards[j] = 0.0
+                    
+                    # Создаём Rollout
+                    # Нужно получить prompt_ids для этого промпта
+                    prompt_inputs_single = tokenizer(
+                        prompt,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=config.max_prompt_length,
+                    ).to(device)
+                    
+                    rollout = Rollout(
+                        prompt=prompt,
+                        prompt_ids=prompt_inputs_single["input_ids"][0],
+                        completions=completions,
+                        completion_ids=[generated_ids[j, prompt_length:] for j in range(config.group_size)],
+                        rewards=rewards,
+                        is_truncated=is_truncated,
+                        metadata={
+                            "reference_answer": ref_answer,
+                            "prompt_idx": prompt_idx,
+                            "prompt_id": (prompt_ids[prompt_idx] if prompt_ids is not None and prompt_idx < len(prompt_ids) else prompt_idx),
+                        }
+                    )
+                    rollouts.append(rollout)
+                
+                if batch_start == 0:
+                    logger.info(f"  ✅ First batch completed")
+            
+            return rollouts
         
-        # Создаём Rollout
-        rollout = Rollout(
-            prompt=prompt,
-            prompt_ids=prompt_inputs["input_ids"][0],
-            completions=completions,
-            completion_ids=[generated_ids[i, prompt_length:] for i in range(config.group_size)],
-            rewards=rewards,
-            is_truncated=is_truncated,
-            metadata={
-                "reference_answer": ref_answer,
-                "prompt_idx": prompt_idx,
-                "prompt_id": (prompt_ids[prompt_idx] if prompt_ids is not None and prompt_idx < len(prompt_ids) else prompt_idx),
-            }
-        )
-        rollouts.append(rollout)
+        # ============================================================
+        # SINGLE-PROMPT: генерируем по одному промпту (с Prefix Grouper)
+        # ============================================================
+        for prompt_idx, (prompt, ref_answer) in enumerate(zip(prompts, reference_answers)):
+            # Токенизация промпта.
+            prompt_inputs = tokenizer(
+                prompt,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=config.max_prompt_length,
+            ).to(device)
+            
+            prompt_length = prompt_inputs["input_ids"].size(1)
+            
+            if prompt_idx == 0:
+                logger.info(f"  🔄 Первая генерация: is_zero3={is_zero3}, device={device}, group_size={config.group_size}")
+                logger.info(f"  📊 Prompt length: {prompt_length}, max_new_tokens={config.max_new_tokens}")
+                logger.info(f"  🚀 Prefix Grouper (shared KV-cache): {'ON' if use_prefix_grouper else 'OFF'}")
+                logger.info(f"  🔧 ds3_gather_for_generation: {'ON' if use_ds3_gather else 'OFF'}")
+                if is_zero3 and not use_ds3_gather:
+                    logger.warning("  ⚠️ ZeRO-3 генерация может быть ОЧЕНЬ медленной! Включите ds3_gather_for_generation")
+            
+            with autocast_ctx:
+                if use_prefix_grouper:
+                    # ============================================================
+                    # ОПТИМИЗАЦИЯ: Prefix Grouper - shared KV-cache
+                    # ============================================================
+                    # Идея: prompt прогоняем только ОДИН раз, получаем KV-cache,
+                    # затем генерируем G completions с этим кэшем.
+                    # Экономия: prompt_length * (G-1) forward passes
+                    # ============================================================
+                    
+                    try:
+                        from transformers.cache_utils import DynamicCache
+                        
+                        # Шаг 1: Прогнать prompt (кроме последнего токена) один раз, получить KV-cache
+                        # Оставляем последний токен для начала генерации
+                        with torch.no_grad():
+                            past_key_values = DynamicCache()
+                            
+                            # Прогоняем prompt[:-1] чтобы получить кэш
+                            # Последний токен будет передан в generate() как начальный
+                            if prompt_length > 1:
+                                prefix_ids = prompt_inputs["input_ids"][:, :-1]
+                                prefix_mask = prompt_inputs["attention_mask"][:, :-1]
+                                cached_seq_len = prefix_ids.size(1)
+                                
+                                # ВАЖНО: передаём cache_position для корректной работы с новым Cache API
+                                cache_position = torch.arange(cached_seq_len, device=device)
+                                
+                                prefix_outputs = generate_model(
+                                    input_ids=prefix_ids,
+                                    attention_mask=prefix_mask,
+                                    past_key_values=past_key_values,
+                                    cache_position=cache_position,
+                                    use_cache=True,
+                                    return_dict=True,
+                                )
+                                # past_key_values теперь заполнен для prefix
+                            else:
+                                # Если prompt всего 1 токен, нет смысла в prefix grouper
+                                raise ValueError("Prompt too short for prefix grouper")
+                        
+                        # Шаг 2: Расширить KV-cache для G генераций
+                        legacy_cache = past_key_values.to_legacy_cache()
+                        
+                        expanded_legacy = []
+                        for layer_kv in legacy_cache:
+                            expanded_key = layer_kv[0].expand(config.group_size, -1, -1, -1).contiguous()
+                            expanded_value = layer_kv[1].expand(config.group_size, -1, -1, -1).contiguous()
+                            expanded_legacy.append((expanded_key, expanded_value))
+                        expanded_legacy = tuple(expanded_legacy)
+                        
+                        expanded_cache = DynamicCache.from_legacy_cache(expanded_legacy)
+                        
+                        # Шаг 3: Генерация с shared KV-cache
+                        # input_ids = только последний токен prompt'а (G раз)
+                        last_token = prompt_inputs["input_ids"][:, -1:].repeat(config.group_size, 1)
+                        
+                        # attention_mask должен покрывать весь prefix + новые токены
+                        gen_attention_mask = torch.ones(
+                            config.group_size, cached_seq_len + 1,
+                            dtype=prompt_inputs["attention_mask"].dtype,
+                            device=device
+                        )
+                        
+                        # ВАЖНО: cache_position для generate() должен начинаться с позиции после кэша
+                        gen_cache_position = torch.tensor([cached_seq_len], device=device)
+                        
+                        outputs = generate_model.generate(
+                            input_ids=last_token,
+                            attention_mask=gen_attention_mask,
+                            past_key_values=expanded_cache,
+                            cache_position=gen_cache_position,
+                            generation_config=generation_config,
+                            return_dict_in_generate=True,
+                            output_scores=False,
+                        )
+                        
+                        # Результат: sequences начинается с last_token, затем сгенерированное
+                        # Восстанавливаем полную последовательность: prefix + generated
+                        prefix_expanded = prompt_inputs["input_ids"][:, :-1].repeat(config.group_size, 1)
+                        generated_ids = torch.cat([prefix_expanded, outputs.sequences], dim=1)
+                        
+                        if prompt_idx == 0:
+                            logger.info(f"  ✅ Prefix Grouper: cached {cached_seq_len} tokens, generated {outputs.sequences.size(1)} tokens")
+                    
+                    except Exception as e:
+                        # Fallback к стандартной генерации при ошибке
+                        if prompt_idx == 0:
+                            logger.warning(f"  ⚠️ Prefix Grouper failed: {e}, using standard generation")
+                        
+                        input_ids = prompt_inputs["input_ids"].repeat(config.group_size, 1)
+                        attention_mask = prompt_inputs["attention_mask"].repeat(config.group_size, 1)
+                        
+                        outputs = generate_model.generate(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            generation_config=generation_config,
+                            return_dict_in_generate=True,
+                            output_scores=False,
+                        )
+                        generated_ids = outputs.sequences
+                
+                else:
+                    # ============================================================
+                    # Стандартная генерация (без Prefix Grouper)
+                    # ============================================================
+                    input_ids = prompt_inputs["input_ids"].repeat(config.group_size, 1)
+                    attention_mask = prompt_inputs["attention_mask"].repeat(config.group_size, 1)
+                    
+                    outputs = generate_model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        generation_config=generation_config,
+                        return_dict_in_generate=True,
+                        output_scores=False,
+                    )
+                    generated_ids = outputs.sequences
+            
+            if prompt_idx == 0:
+                logger.info(f"  ✅ Первая генерация завершена, tokens: {generated_ids.shape}")
+            
+            # Декодирование completions
+            completions = tokenizer.batch_decode(
+                generated_ids[:, prompt_length:],
+                skip_special_tokens=True,
+            )
+            
+            # Определяем truncated ответы
+            is_truncated = []
+            for i in range(config.group_size):
+                completion_length = (generated_ids[i, prompt_length:] != tokenizer.pad_token_id).sum().item()
+                is_truncated.append(completion_length >= config.max_new_tokens)
+            
+            # Вычисляем rewards
+            rewards = torch.zeros(config.group_size, dtype=torch.float32, device=device)
+            for i, completion in enumerate(completions):
+                try:
+                    reward = reward_fn(
+                        completion=completion,
+                        reference_answer=ref_answer,
+                        reasoning_format=config.reasoning_format,
+                        is_truncated=is_truncated[i],
+                    )
+                    # Проверяем что reward - число
+                    if not isinstance(reward, (int, float)):
+                        import logging
+                        logging.warning(
+                            f"Reward не число: {type(reward)} = {reward} для completion: {completion[:100]}..."
+                        )
+                        reward = 0.0
+                    rewards[i] = float(reward)
+                except Exception as e:
+                    import logging
+                    logging.error(
+                        f"Ошибка при вычислении reward для completion {i}: {e}\n"
+                        f"Completion: {completion[:200]}...\n"
+                        f"Reference: {ref_answer[:100]}..."
+                    )
+                    rewards[i] = 0.0
+            
+            # Создаём Rollout
+            rollout = Rollout(
+                prompt=prompt,
+                prompt_ids=prompt_inputs["input_ids"][0],
+                completions=completions,
+                completion_ids=[generated_ids[i, prompt_length:] for i in range(config.group_size)],
+                rewards=rewards,
+                is_truncated=is_truncated,
+                metadata={
+                    "reference_answer": ref_answer,
+                    "prompt_idx": prompt_idx,
+                    "prompt_id": (prompt_ids[prompt_idx] if prompt_ids is not None and prompt_idx < len(prompt_ids) else prompt_idx),
+                }
+            )
+            rollouts.append(rollout)
     
     return rollouts
 
