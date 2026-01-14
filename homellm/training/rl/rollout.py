@@ -759,6 +759,103 @@ def generate_rollouts(
     return rollouts
 
 
+@torch.no_grad()
+def generate_rollouts_vllm(
+    *,
+    vllm_engine,
+    tokenizer: PreTrainedTokenizer,
+    prompts: List[str],
+    reference_answers: List[str],
+    reward_fn: Callable,
+    config: GRPOConfig,
+    prompt_ids: Optional[List[int]] = None,
+) -> List[Rollout]:
+    """
+    Генерация rollouts через vLLM.
+
+    Мы возвращаем тот же формат Rollout, что и generate_rollouts (HF).
+    old_logprobs/ref_logprobs считаются позже на training-модели (teacher-forcing),
+    поэтому здесь нужны только токены и текст completions.
+    """
+    if len(prompts) != len(reference_answers):
+        raise ValueError("prompts и reference_answers должны быть одинаковой длины")
+
+    eos_id = tokenizer.eos_token_id
+    stop_ids = [int(eos_id)] if eos_id is not None else None
+    sampling_params = vllm_engine.make_sampling_params(
+        n=int(config.group_size),
+        temperature=float(config.temperature),
+        top_p=float(config.top_p),
+        max_tokens=int(config.max_new_tokens),
+        stop_token_ids=stop_ids,
+    )
+
+    # vLLM batched generation: один вызов на batch prompts
+    outputs = vllm_engine.generate(prompts, sampling_params)
+    if len(outputs) != len(prompts):
+        raise RuntimeError(f"vLLM вернул {len(outputs)} outputs на {len(prompts)} prompts")
+
+    rollouts: List[Rollout] = []
+    for prompt_idx, (prompt, ref_answer, out) in enumerate(zip(prompts, reference_answers, outputs)):
+        # prompt token ids (для дальнейшего склеивания)
+        prompt_tok = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        prompt_ids_tensor = prompt_tok["input_ids"][0]
+        prompt_len = int(prompt_ids_tensor.size(0))
+
+        completions: List[str] = []
+        completion_ids: List[torch.Tensor] = []
+        is_truncated: List[bool] = []
+
+        # out.outputs: list of candidates (n == group_size)
+        cand_list = getattr(out, "outputs", None)
+        if cand_list is None:
+            raise RuntimeError("vLLM output missing .outputs")
+
+        for cand in cand_list:
+            text = getattr(cand, "text", "")
+            tok_ids = getattr(cand, "token_ids", None)
+            if tok_ids is None:
+                # fallback: tokenize text (менее точно при несовпадении токенизаторов)
+                tok_ids = tokenizer(text, add_special_tokens=False).input_ids
+            completions.append(text)
+            completion_ids.append(torch.tensor(tok_ids, dtype=torch.long))
+            finish_reason = getattr(cand, "finish_reason", None)
+            is_truncated.append(finish_reason == "length")
+
+        # Rewards
+        rewards = torch.zeros(len(completions), dtype=torch.float)
+        for i, comp in enumerate(completions):
+            try:
+                r = reward_fn(
+                    completion=comp,
+                    reference_answer=ref_answer,
+                    reasoning_format=config.reasoning_format,
+                    is_truncated=is_truncated[i],
+                )
+                rewards[i] = float(r) if isinstance(r, (int, float)) else 0.0
+            except Exception as e:
+                logger.error(f"Ошибка reward_fn: {e}")
+                rewards[i] = 0.0
+
+        rollouts.append(
+            Rollout(
+                prompt=prompt,
+                prompt_ids=prompt_ids_tensor,
+                completions=completions,
+                completion_ids=completion_ids,
+                rewards=rewards,
+                is_truncated=is_truncated,
+                metadata={
+                    "reference_answer": ref_answer,
+                    "prompt_idx": prompt_idx,
+                    "prompt_id": (prompt_ids[prompt_idx] if prompt_ids is not None and prompt_idx < len(prompt_ids) else prompt_idx),
+                },
+            )
+        )
+
+    return rollouts
+
+
 def rollout_to_experiences(
     rollout: Rollout,
     model: PreTrainedModel,
@@ -783,7 +880,14 @@ def rollout_to_experiences(
         Список Experience для каждого completion в группе
     """
     if device is None:
-        device = next(model.parameters()).device
+        # ВАЖНО: при ZeRO-3 параметры могут быть sharded/offloaded, device параметров не надёжен
+        if accelerator is not None:
+            device = accelerator.device
+        else:
+            try:
+                device = next(model.parameters()).device
+            except StopIteration:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     experiences = []
     prompt_length = rollout.prompt_ids.size(0)
@@ -796,8 +900,14 @@ def rollout_to_experiences(
         use_std_normalization=config.use_std_normalization,
     )
     
+    # ============================================================
+    # ОПТИМИЗАЦИЯ: batched logprobs для всей группы (G completions)
+    # Вместо G отдельных forward pass делаем 1 forward на батч.
+    # ============================================================
+    seq_tensors: List[torch.Tensor] = []
+    seq_lens: List[int] = []
+    cleaned_completion_ids: List[torch.Tensor] = []
     for i in range(len(rollout.completions)):
-        # Полная последовательность: prompt + completion
         completion_ids = rollout.completion_ids[i]
         
         # ВАЖНО: Убираем только реальный padding, НЕ EOS!
@@ -822,46 +932,65 @@ def rollout_to_experiences(
                 non_pad_mask[first_eos] = True
         
         completion_ids = completion_ids[non_pad_mask]
-        
+        cleaned_completion_ids.append(completion_ids)
+
         sequence_ids = torch.cat([rollout.prompt_ids.to(device), completion_ids.to(device)])
-        
-        # Attention mask
-        attention_mask = torch.ones_like(sequence_ids)
+        seq_tensors.append(sequence_ids)
+        seq_lens.append(int(sequence_ids.numel()))
+    
+    # padding справа: prompt всегда в начале, проще строить action_mask
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+    if pad_token_id is None:
+        pad_token_id = 0
+
+    max_len = max(seq_lens) if seq_lens else 0
+    batch_size = len(seq_tensors)
+    if batch_size == 0 or max_len < 2:
+        return []
+
+    batch_ids = torch.full((batch_size, max_len), int(pad_token_id), dtype=torch.long, device=device)
+    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+    for i, seq in enumerate(seq_tensors):
+        L = int(seq.numel())
+        batch_ids[i, :L] = seq
+        attention_mask[i, :L] = 1
+
+    # Log probs текущей политики (old_logprobs) — без градиентов
+    with torch.no_grad():
+        batch_log_probs = compute_log_probs(
+            model,
+            batch_ids,
+            attention_mask,
+            accelerator=accelerator,
+        )  # [B, max_len-1]
+
+    # Log probs референсной модели (для KL) — тоже батчево и без градиентов
+    batch_log_probs_ref = None
+    if reference_model is not None and config.kl_weight > 0:
+        with torch.no_grad():
+            batch_log_probs_ref = compute_log_probs(
+                reference_model,
+                batch_ids,
+                attention_mask,
+                accelerator=accelerator,
+            )
+
+    # Теперь собираем Experience по каждому completion
+    for i in range(batch_size):
+        sequence_ids = seq_tensors[i]
+        L = seq_lens[i]
+        # attention_mask для конкретного семпла (без паддинга)
+        attn = torch.ones(L, dtype=torch.long, device=device)
         
         # Action mask (только для completion токенов, включая EOS)
         # ВАЖНО: EOS токены НЕ маскируются - это действия модели
-        action_mask = torch.zeros(sequence_ids.size(0) - 1, dtype=torch.bool, device=device)
-        action_mask[prompt_length - 1:] = True  # Начинаем с позиции после prompt
-        
-        # Маскируем только реальный padding в action_mask
-        # (padding уже убран из completion_ids, но на всякий случай)
-        if pad_token_id is not None:
-            # Если в sequence_ids есть pad_token_id, маскируем их
-            pad_positions = (sequence_ids == pad_token_id).nonzero(as_tuple=True)[0]
-            for pos in pad_positions:
-                if pos > 0:  # Не маскируем первый токен
-                    action_mask[pos - 1] = False
-        
-        # Log probs текущей политики (старые, для сохранения в Experience)
-        # Используем no_grad т.к. это старые log_probs, не нужны градиенты
-        with torch.no_grad():
-            log_probs = compute_log_probs(
-                model,
-                sequence_ids.unsqueeze(0),
-                attention_mask.unsqueeze(0),
-                accelerator=accelerator,
-            ).squeeze(0)
-        
-        # Log probs референсной модели (для KL) - всегда без градиентов
-        log_probs_ref = None
-        if reference_model is not None and config.kl_weight > 0:
-            with torch.no_grad():
-                log_probs_ref = compute_log_probs(
-                    reference_model,
-                    sequence_ids.unsqueeze(0),
-                    attention_mask.unsqueeze(0),
-                    accelerator=accelerator,
-                ).squeeze(0)
+        action_mask = torch.zeros(L - 1, dtype=torch.bool, device=device)
+        action_mask[prompt_length - 1 :] = True
+
+        log_probs = batch_log_probs[i, : L - 1]
+        log_probs_ref = batch_log_probs_ref[i, : L - 1] if batch_log_probs_ref is not None else None
         
         exp = Experience(
             sequences=sequence_ids,
@@ -870,7 +999,7 @@ def rollout_to_experiences(
             log_probs_ref=log_probs_ref,
             returns=rollout.rewards[i].unsqueeze(0),
             advantages=advantages[i].unsqueeze(0),
-            attention_mask=attention_mask,
+            attention_mask=attn,
             action_mask=action_mask,
             completion_text=rollout.completions[i],
         )

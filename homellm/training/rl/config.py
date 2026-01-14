@@ -146,6 +146,34 @@ class GRPOConfig:
     # ds3_gather_for_generation: сбор параметров ZeRO-3 перед генерацией
     # Даёт 10-100x ускорение для ZeRO-3 (автоматически включается при ZeRO-3)
     ds3_gather_for_generation: bool = True
+
+    # ============================================================
+    # ROLLOUT ENGINE (отдельная модель для генерации, как в verl)
+    # ============================================================
+    # Если True — генерация (rollout) будет делаться отдельной моделью (HF / vLLM),
+    # а training-модель (DDP/ZeRO/FSDP) будет использоваться только для teacher-forcing logprobs + backprop.
+    use_rollout_engine: bool = False
+
+    # Backend для rollout engine:
+    # - "hf": отдельная HF-модель (быстро для DDP, совместимо с ZeRO-3 через редкий sync весов)
+    # - "vllm": (экспериментально) vLLM rollout (лучший throughput, но требует отдельной интеграции)
+    rollout_engine_backend: Literal["hf", "vllm"] = "hf"
+
+    # Как часто синхронизировать веса training->rollout (в единицах rollout_step).
+    # 1 = каждый rollout-step (самое on-policy), 2-10 = быстрее (меньше overhead), но слегка "stale".
+    rollout_sync_interval: int = 1
+
+    # Если True — синхронизируем только trainable параметры (например LoRA), а не весь base model.
+    # Это критично для ZeRO-3/FSDP, т.к. полный state_dict дорогой.
+    rollout_sync_trainable_only: bool = True
+
+    # Управление памятью: можно держать rollout модель на CPU между генерациями, чтобы освобождать VRAM.
+    rollout_offload_to_cpu: bool = False
+
+    # Устройство для rollout-модели:
+    # - "auto": local accelerator.device (cuda:local_rank)
+    # - "cpu": всегда CPU (медленно, но стабильно)
+    rollout_device: str = "auto"
     
     # Логирование
     output_dir: str = "./output/grpo"

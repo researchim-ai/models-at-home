@@ -1457,6 +1457,58 @@ def render_grpo_sidebar_config():
             0.01,
             help="Нижний предел LR: lr = base_lr * ratio в конце cosine. 0.0 = до нуля."
         )
+
+        st.markdown("---")
+        st.markdown("**🚀 Rollout engine (отдельная модель для генерации)**")
+        grpo_use_rollout_engine = st.checkbox(
+            "Использовать отдельную модель для генерации (как в verl)",
+            value=False,
+            help=(
+                "Если включено, генерация (rollout) будет выполняться отдельной моделью, "
+                "а DDP/ZeRO-3/FSDP модель будет использоваться только для teacher-forcing logprobs и backprop. "
+                "Это радикально ускоряет GRPO при ZeRO-3/FSDP."
+            ),
+        )
+        grpo_rollout_backend = st.selectbox(
+            "Rollout backend",
+            options=["hf", "vllm"],
+            index=0,
+            help=(
+                "**hf** = HuggingFace модель. Универсальный, работает везде.\n\n"
+                "**vllm** = vLLM (PagedAttention, continuous batching). Максимальная скорость генерации!\n"
+                "- Для LoRA: быстрая синхронизация (~секунды)\n"
+                "- Для full fine-tuning: перезагрузка vLLM (~5-15 сек), увеличьте sync interval"
+            ),
+            disabled=not grpo_use_rollout_engine,
+        )
+        grpo_rollout_sync_interval = st.slider(
+            "Синхронизация весов (каждые N rollout-step)",
+            min_value=1,
+            max_value=20,
+            value=1,
+            step=1,
+            help=(
+                "1 = максимально on-policy (чаще синхронизация = больше overhead). "
+                "2-10 = быстрее, но rollout модель будет чуть 'stale'."
+            ),
+            disabled=not grpo_use_rollout_engine,
+        )
+        grpo_rollout_trainable_only = st.checkbox(
+            "Синхронизировать только trainable параметры (LoRA)",
+            value=True,
+            help=(
+                "**Рекомендуется для LoRA** — синхронизация быстрая (~MB адаптера).\n\n"
+                "**Для full fine-tuning** — снимите галочку, будут синхронизироваться все веса (~GB). "
+                "При ZeRO-3 это дорого, поэтому увеличьте sync_interval."
+            ),
+            disabled=not grpo_use_rollout_engine,
+        )
+        grpo_rollout_offload_to_cpu = st.checkbox(
+            "Offload rollout модель на CPU между генерациями (экономит VRAM)",
+            value=False,
+            help="Полезно если VRAM не хватает (особенно при ZeRO-3 + full finetune). Может замедлить rollout.",
+            disabled=not grpo_use_rollout_engine,
+        )
     
     # ВАЖНО: LoRA параметры и квантизация берутся из render_model_config() (секция "🎯 Метод тюнинга")
     # Здесь мы НЕ дублируем их, чтобы избежать повторения в UI
@@ -1481,6 +1533,13 @@ def render_grpo_sidebar_config():
         "grpo_dynamic_sampling": dynamic_sampling,
         "grpo_token_level_loss": token_level_loss,
         "grpo_min_lr_ratio": min_lr_ratio,
+
+        # Rollout engine
+        "grpo_use_rollout_engine": grpo_use_rollout_engine,
+        "grpo_rollout_backend": grpo_rollout_backend,
+        "grpo_rollout_sync_interval": grpo_rollout_sync_interval,
+        "grpo_rollout_trainable_only": grpo_rollout_trainable_only,
+        "grpo_rollout_offload_to_cpu": grpo_rollout_offload_to_cpu,
     }
 
 

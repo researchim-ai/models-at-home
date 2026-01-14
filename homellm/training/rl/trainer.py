@@ -34,10 +34,12 @@ from .experience import Experience, ReplayBuffer, join_experience_batch
 from .loss import GRPOLoss, compute_advantages, compute_entropy
 from .rollout import (
     generate_rollouts,
+    generate_rollouts_vllm,
     rollout_to_experiences,
     build_reasoning_prompt,
     compute_log_probs,
 )
+from .rollout_engine import HFRolloutEngine, VLLMRolloutEngine
 from .rewards.base import RewardFunction, CombinedReward
 from .rewards.math import GSM8KReward
 from .rewards.format import FormatReward, ReasoningQualityReward
@@ -122,6 +124,10 @@ class GRPOTrainer:
         self.tokenizer = tokenizer
         self.model = None
         self.reference_model = None
+
+        # Rollout engine (отдельная модель для генерации, как в verl)
+        self.rollout_engine: Optional[HFRolloutEngine] = None
+        self._rollout_last_sync_step: int = -10**9
         
         # Reward функция
         if reward_fn is None:
@@ -159,6 +165,219 @@ class GRPOTrainer:
         
         # W&B
         self.wandb_run = None
+
+    # ---------------------------------------------------------------------
+    # Rollout engine helpers
+    # ---------------------------------------------------------------------
+    def _get_train_module_for_sync(self) -> PreTrainedModel:
+        """
+        Возвращает "реальную" модель для доступа к named_parameters/state_dict.
+        Для DDP/DeepSpeed обёрток используем accelerator.unwrap_model.
+        """
+        if self.accelerator is not None:
+            try:
+                return self.accelerator.unwrap_model(self.model)  # type: ignore[arg-type]
+            except Exception:
+                pass
+        # fallback
+        return getattr(self.model, "module", self.model)
+
+    def _sync_rollout_engine_weights(self, *, force: bool = False) -> None:
+        """
+        Синхронизирует веса training->rollout.
+        По умолчанию: только trainable параметры (LoRA), чтобы работало быстро и с ZeRO-3.
+        """
+        if not getattr(self.config, "use_rollout_engine", False):
+            return
+        if self.rollout_engine is None:
+            return
+
+        interval = max(int(getattr(self.config, "rollout_sync_interval", 1)), 1)
+        if (not force) and (self.rollout_step - self._rollout_last_sync_step) < interval:
+            return
+
+        backend = getattr(self.config, "rollout_engine_backend", "hf")
+
+        trainable_only = bool(getattr(self.config, "rollout_sync_trainable_only", True))
+        train_mod = self._get_train_module_for_sync()
+
+        state_dict = None
+
+        # Distributed broadcast (rank0 -> all). Для single-GPU: просто локально.
+        is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
+        rank = torch.distributed.get_rank() if is_dist else 0
+
+        # vLLM backend: синхронизируем LoRA адаптер через save_pretrained (rank0) и broadcast path
+        if backend == "vllm":
+            if not bool(getattr(self.config, "use_lora", False)):
+                raise RuntimeError("vLLM rollout backend сейчас поддержан только для LoRA (use_lora=True).")
+            if not trainable_only:
+                raise RuntimeError("vLLM rollout backend: full weight sync не поддержан. Используйте trainable-only (LoRA).")
+
+            adapter_path = None
+            adapter_name = None
+            adapter_int_id = None
+
+            if rank == 0:
+                # Собираем trainable params (LoRA) на rank0 при ZeRO-3 и сохраняем адаптер.
+                try:
+                    from peft.utils import get_peft_model_state_dict
+                except Exception as e:
+                    raise RuntimeError("peft нужен для vLLM LoRA sync. Установите peft.") from e
+
+                peft_model = train_mod
+                if not hasattr(peft_model, "peft_config"):
+                    raise RuntimeError("Модель не выглядит как PEFT/LoRA модель, но use_lora=True. Проверьте загрузку LoRA.")
+
+                out_dir = Path(self.config.output_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                adapter_dir = out_dir / "rollout_engine" / "vllm_adapters" / f"step_{int(self.rollout_step)}"
+                adapter_dir.mkdir(parents=True, exist_ok=True)
+
+                # Gather trainable params for ZeRO-3
+                params = [(n, p) for n, p in peft_model.named_parameters() if getattr(p, "requires_grad", False)]
+                if getattr(self, "is_deepspeed_zero3", False) and params:
+                    from deepspeed.runtime.zero.partition_parameters import GatheredParameters
+                    with GatheredParameters([p for _, p in params], modifier_rank=0):
+                        lora_sd = get_peft_model_state_dict(peft_model)
+                else:
+                    lora_sd = get_peft_model_state_dict(peft_model)
+
+                # save_pretrained with provided state_dict avoids reading partitioned weights
+                peft_model.save_pretrained(str(adapter_dir), state_dict=lora_sd, safe_serialization=True)
+
+                adapter_path = str(adapter_dir)
+                adapter_name = f"rollout_lora_step_{int(self.rollout_step)}"
+                adapter_int_id = int(self.rollout_step) + 1
+
+            if is_dist:
+                obj_list = [(adapter_path, adapter_name, adapter_int_id)]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                adapter_path, adapter_name, adapter_int_id = obj_list[0]
+
+            if adapter_path is None:
+                raise RuntimeError("vLLM adapter sync failed: adapter_path is None")
+
+            # Apply LoRA adapter to vLLM engine
+            if isinstance(self.rollout_engine, VLLMRolloutEngine):
+                self.rollout_engine.set_lora_adapter(
+                    lora_path=adapter_path,
+                    lora_name=adapter_name,
+                    lora_int_id=int(adapter_int_id or 1),
+                )
+            else:
+                raise RuntimeError("rollout_engine backend mismatch (expected VLLMRolloutEngine)")
+
+            if self.is_main_process:
+                logger.info(f"🧩 RolloutEngine(vLLM) sync: adapter={adapter_path}")
+
+            self._rollout_last_sync_step = int(self.rollout_step)
+            return
+
+        # HF backend: state_dict sync
+        if rank == 0:
+            if trainable_only:
+                params = [(n, p) for n, p in train_mod.named_parameters() if getattr(p, "requires_grad", False)]
+                if not params:
+                    logger.warning("RolloutEngine sync: нет trainable параметров, fallback -> full state_dict")
+                    state_dict = {k: v.detach().cpu() for k, v in train_mod.state_dict().items()}
+                else:
+                    if getattr(self, "is_deepspeed_zero3", False):
+                        try:
+                            from deepspeed.runtime.zero.partition_parameters import GatheredParameters
+                            with GatheredParameters([p for _, p in params], modifier_rank=0):
+                                state_dict = {n: p.detach().cpu() for n, p in params}
+                        except Exception as e:
+                            logger.warning(f"RolloutEngine sync (ZeRO-3 trainable-only) failed: {e}. Fallback -> full state_dict")
+                            state_dict = {k: v.detach().cpu() for k, v in train_mod.state_dict().items()}
+                    else:
+                        state_dict = {n: p.detach().cpu() for n, p in params}
+            else:
+                if self.accelerator is not None:
+                    try:
+                        state_dict = {k: v.detach().cpu() for k, v in self.accelerator.get_state_dict(self.model).items()}
+                    except Exception:
+                        state_dict = {k: v.detach().cpu() for k, v in train_mod.state_dict().items()}
+                else:
+                    state_dict = {k: v.detach().cpu() for k, v in train_mod.state_dict().items()}
+
+        if is_dist:
+            obj_list = [state_dict]
+            torch.distributed.broadcast_object_list(obj_list, src=0)
+            state_dict = obj_list[0]
+
+        if state_dict is None:
+            raise RuntimeError("RolloutEngine sync failed: state_dict is None")
+
+        # Применяем state_dict в rollout engine (HF)
+        strict = not trainable_only
+        stats = self.rollout_engine.apply_state_dict(state_dict, strict=strict)
+
+        if self.is_main_process:
+            mode = "trainable-only" if trainable_only else "full"
+            logger.info(
+                f"🧩 RolloutEngine sync: mode={mode}, keys={stats.synced_keys}, "
+                f"~numel={stats.total_numel:,}, interval={interval}"
+            )
+
+        self._rollout_last_sync_step = int(self.rollout_step)
+
+    def _setup_rollout_engine(self) -> None:
+        """
+        Инициализация отдельной модели для генерации (rollout engine).
+        """
+        if not getattr(self.config, "use_rollout_engine", False):
+            return
+
+        backend = getattr(self.config, "rollout_engine_backend", "hf")
+
+        mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
+        if mp == "bf16":
+            dtype = torch.bfloat16
+        elif mp == "fp16":
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
+        offload = bool(getattr(self.config, "rollout_offload_to_cpu", False))
+        rollout_device = getattr(self.config, "rollout_device", "auto")
+        if rollout_device == "cpu":
+            device = torch.device("cpu")
+            offload = True
+        else:
+            device = self.device
+
+        if backend == "hf":
+            self.rollout_engine = HFRolloutEngine(
+                base_model_path=self.model_name,
+                device=device,
+                torch_dtype=dtype,
+                use_flash_attention=bool(getattr(self.config, "use_flash_attention", True)),
+                trust_remote_code=True,
+                offload_to_cpu=offload,
+            )
+            self.rollout_engine.ensure_loaded()
+            self._sync_rollout_engine_weights(force=True)
+        elif backend == "vllm":
+            if offload:
+                raise RuntimeError("vLLM rollout backend не поддерживает offload_to_cpu. Выключите опцию.")
+            if not torch.cuda.is_available():
+                raise RuntimeError("vLLM rollout backend требует CUDA/GPU.")
+            # max_model_len: prompt + response
+            max_len = int(getattr(self.config, "max_prompt_length", 512)) + int(getattr(self.config, "max_new_tokens", 1024))
+            self.rollout_engine = VLLMRolloutEngine(
+                base_model_path=self.model_name,
+                torch_dtype=dtype,
+                trust_remote_code=True,
+                tensor_parallel_size=1,
+                max_model_len=max_len,
+                gpu_memory_utilization=0.90,
+            )
+            self.rollout_engine.ensure_loaded()
+            # Первичный sync LoRA адаптера
+            self._sync_rollout_engine_weights(force=True)
+        else:
+            raise NotImplementedError(f"Unknown rollout_engine_backend='{backend}'")
 
     def _next_group_uids(self, n: int) -> List[int]:
         """Возвращает n уникальных group_id для группировки Experience."""
@@ -1109,6 +1328,10 @@ class GRPOTrainer:
                 _strip_fp32_convert(getattr(base, "module", None))
             except Exception as e:
                 logger.warning(f"Не удалось отключить accelerate convert_to_fp32: {e}")
+
+        # Rollout engine (отдельная модель для генерации) инициализируем ПОСЛЕ prepare(),
+        # чтобы training модель уже была в финальной обёртке (DDP/DeepSpeed).
+        self._setup_rollout_engine()
     
     def train(
         self,
@@ -1429,20 +1652,58 @@ class GRPOTrainer:
                 is_truncated=is_truncated,
             )
         
-        # Генерируем rollout'ы
-        # ВАЖНО: Передаем accelerator для unwrap модели (DDP не поддерживает generate напрямую)
-        rollouts = generate_rollouts(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            prompts=prompts,
-            reference_answers=reference_answers,
-            reward_fn=reward_wrapper,
-            config=self.config,
-            accelerator=self.accelerator,
-            reference_model=self.reference_model,
-            device=self.device,
-            prompt_ids=prompt_ids,
-        )
+        # Генерируем rollout'ы.
+        # ВАЖНО: Для ZeRO-3/FSDP generation внутри training engine может быть на порядки медленнее.
+        # Если включён rollout_engine — генерируем отдельной моделью (как в verl), а training модель
+        # используем только для teacher-forcing logprobs + backprop.
+        use_rollout_engine = bool(getattr(self.config, "use_rollout_engine", False))
+        if use_rollout_engine and self.rollout_engine is not None:
+            # Синхронизируем веса training -> rollout (обычно trainable-only, т.е. LoRA)
+            self._sync_rollout_engine_weights(force=False)
+            backend = getattr(self.config, "rollout_engine_backend", "hf")
+            if backend == "hf":
+                self.rollout_engine.ensure_on_device()
+                rollouts = generate_rollouts(
+                    model=self.rollout_engine.model,  # type: ignore[arg-type]
+                    tokenizer=self.tokenizer,
+                    prompts=prompts,
+                    reference_answers=reference_answers,
+                    reward_fn=reward_wrapper,
+                    config=self.config,
+                    accelerator=None,          # rollout модель не DeepSpeed/DDP wrapper
+                    reference_model=None,      # ref logprobs считаем на training стороне, если нужно
+                    device=self.rollout_engine.device,
+                    prompt_ids=prompt_ids,
+                )
+                self.rollout_engine.maybe_offload()
+            elif backend == "vllm":
+                if not isinstance(self.rollout_engine, VLLMRolloutEngine):
+                    raise RuntimeError("rollout_engine backend mismatch (expected VLLMRolloutEngine)")
+                rollouts = generate_rollouts_vllm(
+                    vllm_engine=self.rollout_engine,
+                    tokenizer=self.tokenizer,
+                    prompts=prompts,
+                    reference_answers=reference_answers,
+                    reward_fn=reward_wrapper,
+                    config=self.config,
+                    prompt_ids=prompt_ids,
+                )
+            else:
+                raise NotImplementedError(f"Unknown rollout_engine_backend='{backend}'")
+        else:
+            # ВАЖНО: Передаем accelerator для unwrap модели (DDP не поддерживает generate напрямую)
+            rollouts = generate_rollouts(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                prompts=prompts,
+                reference_answers=reference_answers,
+                reward_fn=reward_wrapper,
+                config=self.config,
+                accelerator=self.accelerator,
+                reference_model=self.reference_model,
+                device=self.device,
+                prompt_ids=prompt_ids,
+            )
         
         # ВАЖНО: Синхронизация после генерации для ZeRO-3
         if getattr(self, 'is_deepspeed_zero3', False) and self.accelerator is not None:

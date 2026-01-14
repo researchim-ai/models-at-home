@@ -330,6 +330,13 @@ def main():
         # Memory: gradient checkpointing должен приходить из UI
         config.grad_checkpoint = bool(ui_config.get("grad_checkpoint", False))
 
+        # Rollout engine (отдельная модель для генерации, как в verl)
+        config.use_rollout_engine = bool(ui_config.get("grpo_use_rollout_engine", getattr(config, "use_rollout_engine", False)))
+        config.rollout_engine_backend = ui_config.get("grpo_rollout_backend", getattr(config, "rollout_engine_backend", "hf"))
+        config.rollout_sync_interval = int(ui_config.get("grpo_rollout_sync_interval", getattr(config, "rollout_sync_interval", 1)))
+        config.rollout_sync_trainable_only = bool(ui_config.get("grpo_rollout_trainable_only", getattr(config, "rollout_sync_trainable_only", True)))
+        config.rollout_offload_to_cpu = bool(ui_config.get("grpo_rollout_offload_to_cpu", getattr(config, "rollout_offload_to_cpu", False)))
+
         # Сохранение/логирование (из UI output_config)
         config.save_steps = int(ui_config.get("save_every", config.save_steps))
         config.log_steps = int(ui_config.get("log_every", config.log_steps))

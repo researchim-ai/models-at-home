@@ -3,7 +3,8 @@
 ############################
 # 1) Builder stage
 ############################
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04 AS builder
+# CUDA 12.4 для совместимости с torch 2.7+ и flash-attn 2.8+
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -33,22 +34,26 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 
 # Установка основных зависимостей
+# torch 2.7 из PyPI (bundled CUDA 12.4) + flash-attn 2.8.3
+# НЕ используем --index-url, torch из PyPI идёт с встроенным CUDA
 RUN python -m pip install --upgrade pip setuptools wheel \
- && python -m pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 \
+ && python -m pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
  && python -m pip install --no-cache-dir -r /app/requirements.txt \
  && python -m pip install --no-cache-dir deepspeed
 
-# Опциональная установка flash-attn
-# flash-attn требует torch во время сборки для определения версии CUDA
-# Используем --no-build-isolation чтобы использовать уже установленный torch
+# Flash Attention 2.8.3 — pre-built wheel для cu12 + torch 2.7 + Python 3.10
+# Wheels: https://github.com/Dao-AILab/flash-attention/releases
 ARG INSTALL_FLASH_ATTN=true
 RUN if [ "$INSTALL_FLASH_ATTN" = "true" ]; then \
-      echo "Попытка установки flash-attn..." && \
-      export MAX_JOBS=4 && \
-      export CUDA_HOME=/usr/local/cuda && \
-      export PATH=${CUDA_HOME}/bin:${PATH} && \
-      export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH} && \
-      python -m pip install --no-cache-dir flash-attn==2.8.3 --no-build-isolation; \
+      echo "Установка flash-attn 2.8.3 из pre-built wheel (cu12, torch 2.7)..." && \
+      python -m pip install --no-cache-dir \
+        https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl \
+      || ( \
+        echo "Pre-built wheel не подошёл, компилируем..." && \
+        export MAX_JOBS=4 && \
+        export CUDA_HOME=/usr/local/cuda && \
+        python -m pip install --no-cache-dir flash-attn --no-build-isolation \
+      ); \
     else \
       echo "Пропуск установки flash-attn (INSTALL_FLASH_ATTN=false)"; \
     fi
@@ -67,7 +72,7 @@ RUN python -m pip install --no-cache-dir -e .
 ############################
 # 2) Runtime stage
 ############################
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04 AS runtime
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS runtime
 
 LABEL com.modelsathome.image="models-at-home-studio"
 
