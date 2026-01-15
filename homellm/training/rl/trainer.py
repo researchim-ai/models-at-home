@@ -9,6 +9,7 @@ GRPOTrainer - основной класс для обучения GRPO/RL.
 """
 import logging
 import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +32,7 @@ from transformers import (
 
 from .config import GRPOConfig, RLAlgorithm
 from .experience import Experience, ReplayBuffer, join_experience_batch
-from .loss import GRPOLoss, compute_advantages, compute_entropy
+from .loss import GRPOLoss, LigerFusedGRPOLoss, compute_advantages, compute_entropy, create_loss_function
 from .rollout import (
     generate_rollouts,
     generate_rollouts_vllm,
@@ -39,7 +40,7 @@ from .rollout import (
     build_reasoning_prompt,
     compute_log_probs,
 )
-from .rollout_engine import HFRolloutEngine, VLLMRolloutEngine
+from .rollout_engine import HFRolloutEngine, VLLMRolloutEngine, VLLMSubprocessEngine
 from .rewards.base import RewardFunction, CombinedReward
 from .rewards.math import GSM8KReward
 from .rewards.format import FormatReward, ReasoningQualityReward
@@ -125,7 +126,7 @@ class GRPOTrainer:
         self.model = None
         self.reference_model = None
 
-        # Rollout engine (отдельная модель для генерации, как в verl)
+        # Rollout engine (отдельная модель для генерации)
         self.rollout_engine: Optional[HFRolloutEngine] = None
         self._rollout_last_sync_step: int = -10**9
         
@@ -245,9 +246,20 @@ class GRPOTrainer:
 
                 # save_pretrained with provided state_dict avoids reading partitioned weights
                 peft_model.save_pretrained(str(adapter_dir), state_dict=lora_sd, safe_serialization=True)
+                
+                # Проверяем что адаптер сохранился
+                adapter_config_path = adapter_dir / "adapter_config.json"
+                if adapter_config_path.exists():
+                    logger.info(f"🧩 LoRA adapter saved to {adapter_dir}")
+                    # Логируем содержимое директории
+                    saved_files = list(adapter_dir.iterdir())
+                    logger.info(f"🧩 Saved files: {[f.name for f in saved_files]}")
+                else:
+                    logger.error(f"🧩 ERROR: adapter_config.json not found after save_pretrained!")
 
                 adapter_path = str(adapter_dir)
                 adapter_name = f"rollout_lora_step_{int(self.rollout_step)}"
+                # ВАЖНО: используем уникальный id для каждого шага чтобы vLLM перезагрузил адаптер
                 adapter_int_id = int(self.rollout_step) + 1
 
             if is_dist:
@@ -258,15 +270,15 @@ class GRPOTrainer:
             if adapter_path is None:
                 raise RuntimeError("vLLM adapter sync failed: adapter_path is None")
 
-            # Apply LoRA adapter to vLLM engine
-            if isinstance(self.rollout_engine, VLLMRolloutEngine):
+            # Apply LoRA adapter to vLLM engine (поддерживаем оба типа)
+            if isinstance(self.rollout_engine, (VLLMRolloutEngine, VLLMSubprocessEngine)):
                 self.rollout_engine.set_lora_adapter(
                     lora_path=adapter_path,
                     lora_name=adapter_name,
                     lora_int_id=int(adapter_int_id or 1),
                 )
             else:
-                raise RuntimeError("rollout_engine backend mismatch (expected VLLMRolloutEngine)")
+                raise RuntimeError(f"rollout_engine backend mismatch (expected VLLMRolloutEngine or VLLMSubprocessEngine, got {type(self.rollout_engine).__name__})")
 
             if self.is_main_process:
                 logger.info(f"🧩 RolloutEngine(vLLM) sync: adapter={adapter_path}")
@@ -322,6 +334,44 @@ class GRPOTrainer:
 
         self._rollout_last_sync_step = int(self.rollout_step)
 
+    def _create_loss_function(self) -> None:
+        """
+        Создаёт loss функцию.
+        
+        Если liger_fused_grpo=True и Liger доступен — создаёт LigerFusedGRPOLoss.
+        Иначе — стандартный GRPOLoss.
+        
+        ВАЖНО: Вызывается ПОСЛЕ accelerator.prepare() потому что для Liger Fused Loss
+        нужна unwrapped модель для доступа к lm_head.weight.
+        """
+        # Получаем unwrapped модель для Liger (нужен доступ к lm_head.weight)
+        if self.accelerator:
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+        else:
+            unwrapped_model = self.model
+        
+        if self.use_liger_fused_loss:
+            try:
+                from .liger_utils import is_liger_available, get_liger_fused_linear_grpo
+                
+                if is_liger_available() and get_liger_fused_linear_grpo() is not None:
+                    self.loss_fn = LigerFusedGRPOLoss(
+                        model=unwrapped_model,
+                        config=self.config,
+                    )
+                    logger.info("🦁 LigerFusedGRPOLoss активирован!")
+                    logger.info("   ⚡ Logits НЕ материализуются — экономия памяти!")
+                    return
+                else:
+                    logger.warning("⚠️ Liger недоступен, используем стандартный GRPOLoss")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось создать LigerFusedGRPOLoss: {e}")
+                logger.warning("   Используем стандартный GRPOLoss")
+        
+        # Fallback на стандартный GRPOLoss
+        self.loss_fn = GRPOLoss(config=self.config)
+        logger.info("📊 Используется стандартный GRPOLoss")
+
     def _setup_rollout_engine(self) -> None:
         """
         Инициализация отдельной модели для генерации (rollout engine).
@@ -359,21 +409,128 @@ class GRPOTrainer:
             self.rollout_engine.ensure_loaded()
             self._sync_rollout_engine_weights(force=True)
         elif backend == "vllm":
-            if offload:
-                raise RuntimeError("vLLM rollout backend не поддерживает offload_to_cpu. Выключите опцию.")
-            if not torch.cuda.is_available():
-                raise RuntimeError("vLLM rollout backend требует CUDA/GPU.")
+            # Проверяем количество процессов
+            num_processes = getattr(self.accelerator, "num_processes", 1)
+            
+            # vLLM + Multi-GPU DDP не поддерживается (каждый процесс генерирует свои данные)
+            if num_processes > 1:
+                logger.warning(
+                    f"⚠️ vLLM + Multi-GPU DDP ({num_processes} процессов) не поддерживается. "
+                    f"Используем HF backend с Prefix Grouper для генерации."
+                )
+                self.rollout_engine = None
+                return
+            
+            # vLLM устройство из конфига
+            vllm_device_str = getattr(self.config, "vllm_device", "cuda:0")
+            
+            # vLLM на CPU не поддерживается
+            if vllm_device_str == "cpu":
+                raise RuntimeError(
+                    "vLLM не поддерживает CPU. Выберите GPU (cuda:X) или используйте HF backend."
+                )
+            
+            # Извлекаем номер GPU для vLLM (физический индекс из UI)
+            if vllm_device_str.startswith("cuda:"):
+                vllm_physical_gpu = int(vllm_device_str.split(":")[1])
+            else:
+                vllm_physical_gpu = 0
+            
+            # ВАЖНО: Ремапим физический индекс GPU в индекс внутри процесса
+            # CUDA_VISIBLE_DEVICES=0,1 означает cuda:0=physical0, cuda:1=physical1
+            # CUDA_VISIBLE_DEVICES=1,0 означает cuda:0=physical1, cuda:1=physical0
+            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            available_gpus = torch.cuda.device_count()
+            
+            if cuda_visible:
+                visible_gpus = [int(x.strip()) for x in cuda_visible.split(",") if x.strip().isdigit()]
+                if vllm_physical_gpu in visible_gpus:
+                    # Находим индекс внутри процесса
+                    vllm_gpu_id = visible_gpus.index(vllm_physical_gpu)
+                    logger.info(f"🔄 vLLM GPU: physical {vllm_physical_gpu} → process cuda:{vllm_gpu_id}")
+                else:
+                    logger.error(
+                        f"❌ vLLM GPU (physical {vllm_physical_gpu}) не в CUDA_VISIBLE_DEVICES={cuda_visible}! "
+                        f"Используем cuda:0."
+                    )
+                    vllm_gpu_id = 0
+            else:
+                # Нет ограничений, используем физический индекс напрямую
+                vllm_gpu_id = vllm_physical_gpu
+            
+            # Проверяем что GPU существует внутри процесса
+            if vllm_gpu_id >= available_gpus:
+                logger.error(
+                    f"❌ vLLM GPU cuda:{vllm_gpu_id} не существует! "
+                    f"Доступно только {available_gpus} GPU.\n"
+                    f"CUDA_VISIBLE_DEVICES={cuda_visible}\n"
+                    f"Используем cuda:0 для vLLM."
+                )
+                vllm_gpu_id = 0
+            
+            # Определяем текущую GPU training модели
+            training_device = self.device
+            if hasattr(training_device, 'index') and training_device.index is not None:
+                training_gpu_id = training_device.index
+            elif str(training_device).startswith("cuda:"):
+                training_gpu_id = int(str(training_device).split(":")[1])
+            elif str(training_device) == "cuda":
+                training_gpu_id = torch.cuda.current_device()
+            else:
+                training_gpu_id = 0
+            
+            # GPU memory utilization из конфига
+            vllm_gpu_util = float(getattr(self.config, "vllm_gpu_memory_utilization", 0.85))
+            
+            # Проверяем, на той же GPU или на другой
+            same_gpu = (vllm_gpu_id == training_gpu_id)
+            
             # max_model_len: prompt + response
             max_len = int(getattr(self.config, "max_prompt_length", 512)) + int(getattr(self.config, "max_new_tokens", 1024))
-            self.rollout_engine = VLLMRolloutEngine(
-                base_model_path=self.model_name,
-                torch_dtype=dtype,
-                trust_remote_code=True,
-                tensor_parallel_size=1,
-                max_model_len=max_len,
-                gpu_memory_utilization=0.90,
-            )
-            self.rollout_engine.ensure_loaded()
+            
+            if same_gpu:
+                # На той же GPU — используем VLLMRolloutEngine напрямую
+                if vllm_gpu_util > 0.5:
+                    logger.warning(
+                        f"⚠️ vLLM на той же GPU что training (cuda:{training_gpu_id}). "
+                        f"gpu_memory_utilization={vllm_gpu_util:.0%} может быть слишком высоким! "
+                        f"Рекомендуется 30-50%."
+                    )
+                logger.info(f"🧩 vLLM: загружаем на cuda:{vllm_gpu_id} (та же GPU что training, memory={vllm_gpu_util:.0%})")
+                
+                self.rollout_engine = VLLMRolloutEngine(
+                    base_model_path=self.model_name,
+                    torch_dtype=dtype,
+                    trust_remote_code=True,
+                    tensor_parallel_size=1,
+                    max_model_len=max_len,
+                    gpu_memory_utilization=vllm_gpu_util,
+                )
+                self.rollout_engine.ensure_loaded()
+            else:
+                # На ОТДЕЛЬНОЙ GPU — используем VLLMSubprocessEngine!
+                # Это запускает vLLM в отдельном процессе с правильным CUDA_VISIBLE_DEVICES
+                logger.info(f"🧩 vLLM: запуск на cuda:{vllm_gpu_id} через SUBPROCESS (отдельная GPU, memory={vllm_gpu_util:.0%})")
+                logger.info(f"   Training на cuda:{training_gpu_id}, vLLM на cuda:{vllm_physical_gpu}")
+                
+                # Используем ФИЗИЧЕСКИЙ индекс GPU для subprocess
+                # (внутри subprocess будет CUDA_VISIBLE_DEVICES={vllm_physical_gpu})
+                self.rollout_engine = VLLMSubprocessEngine(
+                    base_model_path=self.model_name,
+                    torch_dtype=dtype,
+                    gpu_id=vllm_physical_gpu,  # Физический индекс GPU!
+                    max_model_len=max_len,
+                    gpu_memory_utilization=vllm_gpu_util,
+                    enable_lora=True,
+                    output_dir=getattr(self.config, "output_dir", None),
+                )
+                self.rollout_engine.ensure_loaded()
+            
+            # Сохраняем GPU IDs
+            self._vllm_gpu_id = vllm_gpu_id
+            self._training_gpu_id = training_gpu_id
+            self._use_vllm_subprocess = not same_gpu
+            
             # Первичный sync LoRA адаптера
             self._sync_rollout_engine_weights(force=True)
         else:
@@ -472,8 +629,10 @@ class GRPOTrainer:
         # Загружаем модель
         self._load_model()
         
-        # Loss функция
-        self.loss_fn = GRPOLoss(config=self.config)
+        # Loss функция — создаётся ПОСЛЕ загрузки модели (нужна для Liger Fused Loss)
+        # Будет создана в setup() после accelerator.prepare()
+        self.loss_fn = None
+        self.use_liger_fused_loss = getattr(self.config, 'liger_fused_grpo', False) and getattr(self.config, 'use_liger', False)
         
         # Replay buffer
         self.replay_buffer = ReplayBuffer()
@@ -484,6 +643,14 @@ class GRPOTrainer:
         
         logger.info(f"GRPOTrainer инициализирован на {self.device}")
         logger.info(f"Алгоритм: {self.config.algorithm.value}")
+        if self.config.dynamic_sampling:
+            logger.info(f"  🎯 Dynamic sampling: ON (max_refill_rounds={self.config.max_refill_rounds})")
+        else:
+            logger.info(f"  🎯 Dynamic sampling: OFF (быстрее)")
+        if self.config.token_level_loss:
+            logger.info(f"  📊 Token-level loss: ON")
+        else:
+            logger.info(f"  📊 Sample-level loss: ON")
     
     def _log_and_setup_deepspeed_config(self):
         """Логирует и настраивает DeepSpeed конфигурацию."""
@@ -693,6 +860,29 @@ class GRPOTrainer:
                 logger.info("✅ Gradient checkpointing включен (из UI)")
             except Exception as e:
                 logger.warning(f"Не удалось включить gradient checkpointing: {e}")
+        
+        # Liger Kernel патчинг модели (оптимизированные Triton kernels)
+        if getattr(self.config, "use_liger", True) and getattr(self.config, "liger_patch_model", True):
+            try:
+                from homellm.training.rl.liger_utils import apply_liger_patch_to_model, is_liger_available
+                if is_liger_available():
+                    # Патчим RMSNorm, RoPE, MLP — но НЕ CrossEntropy
+                    # Для GRPO мы используем свой chunked cross-entropy в rollout.py
+                    patched = apply_liger_patch_to_model(
+                        self.model,
+                        patch_rms_norm=True,
+                        patch_rope=True,
+                        patch_mlp=True,
+                        patch_fused_linear_ce=False,  # Используем свой loss
+                    )
+                    if patched:
+                        logger.info("✅ Liger Kernel патчи применены (RMSNorm, RoPE, MLP)")
+                    else:
+                        logger.info("ℹ️ Liger: модель не поддерживается для патчинга, используем стандартные kernels")
+                else:
+                    logger.info("ℹ️ Liger Kernel не установлен, используем стандартные kernels")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось применить Liger патчи: {e}")
         
         # Проверяем использование памяти после загрузки модели
         if torch.cuda.is_available():
@@ -1329,6 +1519,9 @@ class GRPOTrainer:
             except Exception as e:
                 logger.warning(f"Не удалось отключить accelerate convert_to_fp32: {e}")
 
+        # 🦁 Создаём Loss функцию ПОСЛЕ prepare() — нужна unwrapped модель для Liger Fused Loss
+        self._create_loss_function()
+
         # Rollout engine (отдельная модель для генерации) инициализируем ПОСЛЕ prepare(),
         # чтобы training модель уже была в финальной обёртке (DDP/DeepSpeed).
         self._setup_rollout_engine()
@@ -1490,9 +1683,9 @@ class GRPOTrainer:
             logger.info(f"✅ Batch {batch_idx}: генерация завершена, rewards={len(batch_rewards)}")
             refill_rounds = 0
             # DAPO dynamic sampling: добор групп до нужного размера (НЕ уменьшаем batch автоматически)
-            if self.config.dynamic_sampling:
+            if self.config.dynamic_sampling and self.config.max_refill_rounds > 0:
                 import random
-                max_refill_rounds = 8  # защита от бесконечного цикла
+                max_refill_rounds = self.config.max_refill_rounds  # из UI/config (по умолчанию 3)
                 while self.replay_buffer.get_stats().get("num_groups", 0) < desired_groups and refill_rounds < max_refill_rounds:
                     missing = desired_groups - int(self.replay_buffer.get_stats().get("num_groups", 0))
                     if missing <= 0:
@@ -1654,13 +1847,19 @@ class GRPOTrainer:
         
         # Генерируем rollout'ы.
         # ВАЖНО: Для ZeRO-3/FSDP generation внутри training engine может быть на порядки медленнее.
-        # Если включён rollout_engine — генерируем отдельной моделью (как в verl), а training модель
+        # Если включён rollout_engine — генерируем отдельной моделью, а training модель
         # используем только для teacher-forcing logprobs + backprop.
         use_rollout_engine = bool(getattr(self.config, "use_rollout_engine", False))
-        if use_rollout_engine and self.rollout_engine is not None:
+        backend = getattr(self.config, "rollout_engine_backend", "hf")
+        
+        # Проверяем доступность rollout engine
+        # При vLLM + multi-GPU он загружен только на main process
+        rollout_engine_available = use_rollout_engine and self.rollout_engine is not None
+        
+        if rollout_engine_available:
             # Синхронизируем веса training -> rollout (обычно trainable-only, т.е. LoRA)
             self._sync_rollout_engine_weights(force=False)
-            backend = getattr(self.config, "rollout_engine_backend", "hf")
+            
             if backend == "hf":
                 self.rollout_engine.ensure_on_device()
                 rollouts = generate_rollouts(
@@ -1677,8 +1876,12 @@ class GRPOTrainer:
                 )
                 self.rollout_engine.maybe_offload()
             elif backend == "vllm":
-                if not isinstance(self.rollout_engine, VLLMRolloutEngine):
-                    raise RuntimeError("rollout_engine backend mismatch (expected VLLMRolloutEngine)")
+                # Поддерживаем оба типа: VLLMRolloutEngine и VLLMSubprocessEngine
+                if not isinstance(self.rollout_engine, (VLLMRolloutEngine, VLLMSubprocessEngine)):
+                    raise RuntimeError("rollout_engine backend mismatch (expected VLLMRolloutEngine or VLLMSubprocessEngine)")
+                
+                # VLLMSubprocessEngine работает через IPC — не нужно переключать GPU
+                # VLLMRolloutEngine на той же GPU — тоже не нужно переключать
                 rollouts = generate_rollouts_vllm(
                     vllm_engine=self.rollout_engine,
                     tokenizer=self.tokenizer,
@@ -1907,22 +2110,47 @@ class GRPOTrainer:
                         # Очистка кэша перед тяжелой операцией вычисления логитов
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                            
-                        log_probs = compute_log_probs(
-                            self.model,
-                            exp_batch.sequences,
-                            exp_batch.attention_mask,
-                            accelerator=self.accelerator,
-                        )
                         
-                        loss, metrics = self.loss_fn(
-                            log_probs=log_probs,
-                            experience=exp_batch,
-                        )
+                        # 🦁 Разные пути для Liger Fused Loss и стандартного loss
+                        if self.use_liger_fused_loss and isinstance(self.loss_fn, LigerFusedGRPOLoss):
+                            # LIGER FUSED PATH: hidden_states -> fused loss (НЕ материализуем logits!)
+                            # Forward pass с output_hidden_states=True
+                            outputs = self.model(
+                                input_ids=exp_batch.sequences,
+                                attention_mask=exp_batch.attention_mask,
+                                output_hidden_states=True,
+                                use_cache=False,
+                            )
+                            
+                            # Получаем последний hidden state
+                            hidden_states = outputs.hidden_states[-1]
+                            
+                            # Вычисляем loss через Liger Fused Loss
+                            loss, metrics = self.loss_fn.forward_with_experience(
+                                hidden_states=hidden_states,
+                                experience=exp_batch,
+                            )
+                            
+                            # Освобождаем память
+                            del outputs, hidden_states
+                        else:
+                            # STANDARD PATH: logits -> log_probs -> loss
+                            log_probs = compute_log_probs(
+                                self.model,
+                                exp_batch.sequences,
+                                exp_batch.attention_mask,
+                                accelerator=self.accelerator,
+                            )
+                            
+                            loss, metrics = self.loss_fn(
+                                log_probs=log_probs,
+                                experience=exp_batch,
+                            )
+                            
+                            # Освобождаем память
+                            del log_probs
                 
                     # ВАЖНО: Освобождаем промежуточные активации после forward pass
-                    # Это помогает избежать накопления памяти
-                    del log_probs
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     

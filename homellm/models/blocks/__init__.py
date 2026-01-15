@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -9,6 +10,68 @@ import torch.nn.functional as F
 from torch import nn
 
 from homellm.models.home_model import RMSNorm
+
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# LIGER KERNEL — оптимизированные компоненты
+# ============================================================
+_LIGER_AVAILABLE: Optional[bool] = None
+_LIGER_RMSNORM = None
+_LIGER_SWIGLU = None
+_LIGER_ROPE = None
+_LIGER_LAYERNORM = None
+
+
+def _check_liger_available() -> bool:
+    """Проверяет и кэширует доступность Liger Kernel."""
+    global _LIGER_AVAILABLE, _LIGER_RMSNORM, _LIGER_SWIGLU, _LIGER_ROPE, _LIGER_LAYERNORM
+    
+    if _LIGER_AVAILABLE is not None:
+        return _LIGER_AVAILABLE
+    
+    try:
+        from liger_kernel.transformers import (
+            LigerRMSNorm,
+            LigerSwiGLUMLP,
+            LigerLayerNorm,
+            liger_rotary_pos_emb,
+        )
+        _LIGER_RMSNORM = LigerRMSNorm
+        _LIGER_SWIGLU = LigerSwiGLUMLP
+        _LIGER_LAYERNORM = LigerLayerNorm
+        _LIGER_ROPE = liger_rotary_pos_emb
+        _LIGER_AVAILABLE = True
+        logger.info("✅ Liger Kernel доступен для Home моделей")
+    except ImportError:
+        _LIGER_AVAILABLE = False
+        logger.debug("ℹ️ Liger Kernel не установлен")
+    
+    return _LIGER_AVAILABLE
+
+
+def get_liger_rmsnorm():
+    """Возвращает LigerRMSNorm если доступен."""
+    _check_liger_available()
+    return _LIGER_RMSNORM
+
+
+def get_liger_swiglu():
+    """Возвращает LigerSwiGLUMLP если доступен."""
+    _check_liger_available()
+    return _LIGER_SWIGLU
+
+
+def get_liger_layernorm():
+    """Возвращает LigerLayerNorm если доступен."""
+    _check_liger_available()
+    return _LIGER_LAYERNORM
+
+
+def get_liger_rope():
+    """Возвращает liger_rotary_pos_emb если доступен."""
+    _check_liger_available()
+    return _LIGER_ROPE
 
 
 BuildResult = Tuple[nn.Module, int]  # (module, out_hidden_size)
@@ -130,16 +193,55 @@ def build_concat(params: Dict[str, Any], in_dim: int, auto_project: bool) -> Bui
 # NORMALIZATION & ACTIVATION
 # =============================================================================
 
-@register_block("rmsnorm", "RMSNorm")
+@register_block("rmsnorm", "RMSNorm (автоматически использует Liger если доступен)")
 def build_rmsnorm(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
     eps = params.get("eps", 1e-5)
+    use_liger = params.get("use_liger", True)  # По умолчанию пробуем использовать Liger
+    
+    # Пробуем использовать LigerRMSNorm если доступен
+    if use_liger:
+        LigerRMSNorm = get_liger_rmsnorm()
+        if LigerRMSNorm is not None:
+            return LigerRMSNorm(in_dim, eps=eps), in_dim
+    
+    # Fallback на стандартный RMSNorm
     return RMSNorm(in_dim, eps=eps), in_dim
 
 
-@register_block("layernorm", "LayerNorm")
+@register_block("liger_rmsnorm", "LigerRMSNorm (оптимизированный Triton kernel)")
+def build_liger_rmsnorm(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
+    """Явно использует LigerRMSNorm."""
+    eps = params.get("eps", 1e-5)
+    LigerRMSNorm = get_liger_rmsnorm()
+    if LigerRMSNorm is None:
+        logger.warning("⚠️ LigerRMSNorm недоступен, используем стандартный RMSNorm")
+        return RMSNorm(in_dim, eps=eps), in_dim
+    return LigerRMSNorm(in_dim, eps=eps), in_dim
+
+
+@register_block("layernorm", "LayerNorm (автоматически использует Liger если доступен)")
 def build_layernorm(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
     eps = params.get("eps", 1e-5)
+    use_liger = params.get("use_liger", True)
+    
+    # Пробуем использовать LigerLayerNorm если доступен
+    if use_liger:
+        LigerLayerNorm = get_liger_layernorm()
+        if LigerLayerNorm is not None:
+            return LigerLayerNorm(in_dim, eps=eps), in_dim
+    
     return nn.LayerNorm(in_dim, eps=eps), in_dim
+
+
+@register_block("liger_layernorm", "LigerLayerNorm (оптимизированный Triton kernel)")
+def build_liger_layernorm(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
+    """Явно использует LigerLayerNorm."""
+    eps = params.get("eps", 1e-5)
+    LigerLayerNorm = get_liger_layernorm()
+    if LigerLayerNorm is None:
+        logger.warning("⚠️ LigerLayerNorm недоступен, используем стандартный LayerNorm")
+        return nn.LayerNorm(in_dim, eps=eps), in_dim
+    return LigerLayerNorm(in_dim, eps=eps), in_dim
 
 
 class GroupNormWrapper(nn.Module):
@@ -527,7 +629,7 @@ def build_moe(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildR
     expert_type = params.get("expert_type", "mlp") # "mlp" or "swiglu"
     return MoE(in_dim, num_experts, num_select, dropout, expert_type), in_dim
 
-@register_block("swiglu", "SwiGLU FeedForward (Llama style)")
+@register_block("swiglu", "SwiGLU FeedForward (автоматически использует Liger если доступен)")
 def build_swiglu(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
     hidden_size = in_dim
     # Default intermediate size is usually 8/3 * hidden_size or similar for SwiGLU
@@ -535,16 +637,74 @@ def build_swiglu(params: Dict[str, Any], in_dim: int, auto_project: bool) -> Bui
     # Round to multiple of 256 is common but let's keep it simple or user defined
     intermediate = params.get("intermediate_size", default_inter)
     dropout = params.get("dropout", 0.0)
+    use_liger = params.get("use_liger", True)
+    
+    # Пробуем использовать LigerSwiGLUMLP если доступен
+    if use_liger and dropout == 0.0:  # Liger SwiGLU не поддерживает dropout
+        LigerSwiGLUMLP = get_liger_swiglu()
+        if LigerSwiGLUMLP is not None:
+            try:
+                return LigerSwiGLUMLP(hidden_size, intermediate), hidden_size
+            except Exception as e:
+                logger.debug(f"LigerSwiGLUMLP failed: {e}, using standard SwiGLU")
+    
     return SwiGLU(hidden_size, intermediate, dropout), hidden_size
 
 
+@register_block("liger_swiglu", "LigerSwiGLUMLP (оптимизированный fused kernel)")
+def build_liger_swiglu(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
+    """Явно использует LigerSwiGLUMLP."""
+    hidden_size = in_dim
+    default_inter = int(2 * hidden_size * 4 / 3)
+    intermediate = params.get("intermediate_size", default_inter)
+    dropout = params.get("dropout", 0.0)
+    
+    LigerSwiGLUMLP = get_liger_swiglu()
+    if LigerSwiGLUMLP is None:
+        logger.warning("⚠️ LigerSwiGLUMLP недоступен, используем стандартный SwiGLU")
+        return SwiGLU(hidden_size, intermediate, dropout), hidden_size
+    
+    if dropout > 0:
+        logger.warning("⚠️ LigerSwiGLUMLP не поддерживает dropout, dropout будет проигнорирован")
+    
+    return LigerSwiGLUMLP(hidden_size, intermediate), hidden_size
+
+
 class LlamaBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, intermediate_size: int, dropout: float = 0.0, rope_theta: float = 10000.0, eps: float = 1e-5):
+    """Llama-style transformer block с автоматическим использованием Liger."""
+    
+    def __init__(
+        self, 
+        hidden_size: int, 
+        num_heads: int, 
+        intermediate_size: int, 
+        dropout: float = 0.0, 
+        rope_theta: float = 10000.0, 
+        eps: float = 1e-5,
+        use_liger: bool = True,
+    ):
         super().__init__()
-        self.norm1 = RMSNorm(hidden_size, eps=eps)
+        
+        # Выбираем RMSNorm (Liger или стандартный)
+        LigerRMSNorm = get_liger_rmsnorm() if use_liger else None
+        if LigerRMSNorm is not None:
+            self.norm1 = LigerRMSNorm(hidden_size, eps=eps)
+            self.norm2 = LigerRMSNorm(hidden_size, eps=eps)
+        else:
+            self.norm1 = RMSNorm(hidden_size, eps=eps)
+            self.norm2 = RMSNorm(hidden_size, eps=eps)
+        
         self.attn = CausalSelfAttention(hidden_size, num_heads, dropout=dropout, use_rope=True, rope_theta=rope_theta)
-        self.norm2 = RMSNorm(hidden_size, eps=eps)
-        self.mlp = SwiGLU(hidden_size, intermediate_size, dropout=dropout)
+        
+        # Выбираем SwiGLU (Liger или стандартный)
+        LigerSwiGLUMLP = get_liger_swiglu() if use_liger else None
+        if LigerSwiGLUMLP is not None and dropout == 0.0:
+            try:
+                self.mlp = LigerSwiGLUMLP(hidden_size, intermediate_size)
+            except Exception:
+                self.mlp = SwiGLU(hidden_size, intermediate_size, dropout=dropout)
+        else:
+            self.mlp = SwiGLU(hidden_size, intermediate_size, dropout=dropout)
 
     def forward(self, x, attention_mask=None):
         # Pre-Norm Residual Attention
@@ -558,7 +718,7 @@ class LlamaBlock(nn.Module):
         x = x + h
         return x
 
-@register_block("llama_block", "Single Llama Transformer Block (Attn + MLP + Norms)")
+@register_block("llama_block", "Single Llama Transformer Block (автоматически использует Liger)")
 def build_llama_block(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
     num_heads = params.get("num_heads", 8)
     # Default intermediate for SwiGLU
@@ -567,8 +727,22 @@ def build_llama_block(params: Dict[str, Any], in_dim: int, auto_project: bool) -
     dropout = params.get("dropout", 0.0)
     rope_theta = params.get("rope_theta", 10000.0)
     eps = params.get("eps", 1e-5)
+    use_liger = params.get("use_liger", True)  # По умолчанию используем Liger
     
-    return LlamaBlock(in_dim, num_heads, intermediate_size, dropout, rope_theta, eps), in_dim
+    return LlamaBlock(in_dim, num_heads, intermediate_size, dropout, rope_theta, eps, use_liger), in_dim
+
+
+@register_block("liger_llama_block", "LlamaBlock с Liger оптимизациями (явно)")
+def build_liger_llama_block(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
+    """Явно использует Liger компоненты."""
+    num_heads = params.get("num_heads", 8)
+    default_inter = int(2 * in_dim * 4 / 3)
+    intermediate_size = params.get("intermediate_size", default_inter)
+    dropout = params.get("dropout", 0.0)
+    rope_theta = params.get("rope_theta", 10000.0)
+    eps = params.get("eps", 1e-5)
+    
+    return LlamaBlock(in_dim, num_heads, intermediate_size, dropout, rope_theta, eps, use_liger=True), in_dim
 
 
 

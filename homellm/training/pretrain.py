@@ -536,10 +536,10 @@ def main():
                 with accelerator.autocast():
                     outputs = model(**batch)
                     loss = outputs.loss
-                accelerator.backward(loss)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    accelerator.backward(loss)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
             global_step += 1
             if is_main and ((step + 1) % args.log_every == 0 or step == 0):

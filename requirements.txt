@@ -1,20 +1,31 @@
 # HomeLLM - зависимости для тренировки трансформеров дома
 # =========================================================
+# ВАЖНО: Версии зафиксированы для совместимости pre-built wheels!
+# torch 2.5.1 (PyPI, bundled CUDA 12.4) + flash-attn 2.8.3 + liger-kernel 0.6.4
 
-# PyTorch 2.7.x (из PyPI, bundled CUDA 12.4) + flash-attn 2.8.3
-torch==2.7.0
+# PyTorch 2.5.1 (фиксировано для flash-attn pre-built wheel)
+# Устанавливается в Dockerfile из PyPI (bundled CUDA 12.4)
+torch>=2.5.0,<2.6.0
+
+# Triton (нужен для Liger Kernel, обычно идёт с torch)
+triton>=2.3.0
 
 # HuggingFace
 transformers>=4.40.0
 accelerate>=0.28.0
 datasets>=2.19.0
 safetensors>=0.4.0
-# FlashAttention2 (опционально) ставится отдельно в Dockerfile с --no-build-isolation,
-# иначе pip (PEP517) пытается собрать пакет в изолированном окружении без torch.
-# Если ставите не в Docker: `pip install flash-attn --no-build-isolation`
+
+# Liger Kernel 0.6.4 — оптимизированные Triton kernels для LLM
+# ★ Чистый Python/Triton — ставится мгновенно!
+# ★ Экономит память (не материализует logits)
+# https://github.com/linkedin/Liger-Kernel
+liger-kernel==0.6.4
+
+# FlashAttention2 ставится в Dockerfile из pre-built wheel
 # PEFT для LoRA/QLoRA
 peft>=0.10.0
-bitsandbytes>=0.43.0  # Для QLoRA (4-bit/8-bit quantization), рекомендуется >=0.45.0
+bitsandbytes>=0.43.0
 
 # DeepSpeed (для ZeRO optimizer)
 deepspeed>=0.15.0

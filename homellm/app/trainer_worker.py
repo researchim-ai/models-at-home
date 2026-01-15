@@ -30,6 +30,19 @@ from homellm.models.adapters import resolve_adapter
 from homellm.training.pretrain import StreamingTextDataset
 from homellm.training.sft import SFTDataset
 
+# Liger Kernel интеграция (оптимизированные Triton kernels)
+try:
+    from homellm.training.rl.liger_utils import (
+        is_liger_available,
+        apply_liger_patch_to_model,
+        create_liger_fused_ce,
+        LIGER_SUPPORTED_MODELS,
+    )
+    LIGER_UTILS_AVAILABLE = True
+except ImportError:
+    LIGER_UTILS_AVAILABLE = False
+    LIGER_SUPPORTED_MODELS = set()
+
 logger = logging.getLogger(__name__)
 
 
@@ -571,6 +584,62 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         
         # Подготавливаем модель для обучения (resize, LoRA, use_cache, etc.)
         model = adapter.prepare_for_training(model, tokenizer, config)
+        
+        # ============================================================
+        # Liger Kernel патчинг (оптимизированные RMSNorm, RoPE, MLP, FusedCE)
+        # ============================================================
+        use_liger = config.get("use_liger", False)
+        liger_fused_ce = config.get("liger_fused_ce", False)  # Fused lm_head + CE (экономит память!)
+        
+        # Переменная для fused CE loss (если используется отдельно)
+        liger_fused_ce_loss = None
+        
+        if use_liger and LIGER_UTILS_AVAILABLE and is_liger_available():
+            try:
+                model_type = getattr(model.config, "model_type", "").lower()
+                
+                # Патчим RMSNorm, RoPE, MLP
+                patched = apply_liger_patch_to_model(
+                    model,
+                    patch_rms_norm=True,
+                    patch_rope=True,
+                    patch_mlp=True,
+                    patch_fused_linear_ce=False,  # Будем использовать отдельный loss module
+                )
+                if patched:
+                    logger.info("✅ Liger Kernel патчи применены (RMSNorm, RoPE, MLP)")
+                else:
+                    logger.info("ℹ️ Liger: модель не поддерживается для патчинга (home модели и др.)")
+                
+                # 🔥 Fused Linear CrossEntropy — НЕ материализует logits!
+                # Экономит гигабайты памяти при большом vocab_size
+                # ВАЖНО: Fused CE работает для ЛЮБОЙ модели с lm_head, не только HF моделей!
+                if liger_fused_ce:
+                    # Проверяем есть ли lm_head у модели
+                    has_lm_head = hasattr(model, 'lm_head') and model.lm_head is not None
+                    if has_lm_head:
+                        try:
+                            liger_fused_ce_loss = create_liger_fused_ce(
+                                model,
+                                ignore_index=-100,
+                                label_smoothing=config.get("label_smoothing", 0.0),
+                            )
+                            if liger_fused_ce_loss:
+                                logger.info("🦁 LigerFusedLinearCrossEntropyLoss активирован!")
+                                logger.info("   ⚡ Logits НЕ материализуются — экономия памяти!")
+                            else:
+                                logger.warning("⚠️ Не удалось создать LigerFusedCELoss, используем стандартный")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Ошибка создания LigerFusedCELoss: {e}")
+                    else:
+                        logger.info(f"ℹ️ LigerFusedCE: модель не имеет lm_head, пропускаем")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось применить Liger патчи: {e}")
+        elif use_liger and not LIGER_UTILS_AVAILABLE:
+            logger.warning("⚠️ Liger запрошен, но liger_utils недоступен")
+        elif use_liger and not is_liger_available():
+            logger.warning("⚠️ Liger запрошен, но liger-kernel не установлен")
 
         # Диагностика: dtype весов и включён ли SDPA/flash path у HomeModel
         try:
@@ -849,8 +918,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     if is_streaming_sharded:
                         batch = {k: (v.to(accelerator.device) if hasattr(v, "to") else v) for k, v in batch.items()}
                     with accelerator.autocast():
-                    out = model(**batch)
-                    loss = out.loss.detach()
+                        out = model(**batch)
+                        loss = out.loss.detach()
                     # Усредняем loss по всем процессам (каждый процесс видит свою часть val данных)
                     loss = accelerator.reduce(loss, reduction="mean")
                     # Сохраняем только на main process, чтобы избежать дублирования
@@ -974,8 +1043,23 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     if is_streaming_sharded:
                         batch = {k: (v.to(accelerator.device) if hasattr(v, "to") else v) for k, v in batch.items()}
                     with accelerator.autocast():
-                    outputs = model(**batch)
-                    loss = outputs.loss
+                        # 🦁 Liger Fused CE path vs standard path
+                        if liger_fused_ce_loss is not None:
+                            # LIGER FUSED PATH: hidden_states -> fused loss (НЕ материализуем logits!)
+                            # Убираем labels чтобы модель НЕ вычисляла loss
+                            labels = batch.pop("labels", None)
+                            outputs = model(**batch, output_hidden_states=True, use_cache=False)
+                            batch["labels"] = labels  # Возвращаем для совместимости
+                            
+                            # Получаем последний hidden state
+                            hidden_states = outputs.hidden_states[-1]
+                            
+                            # Вычисляем loss через Liger Fused CE
+                            loss = liger_fused_ce_loss(hidden_states, labels)
+                        else:
+                            # STANDARD PATH
+                            outputs = model(**batch)
+                            loss = outputs.loss
                     
                     loss_val = loss.detach().float().item()
                     

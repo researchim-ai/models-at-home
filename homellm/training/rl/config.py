@@ -82,8 +82,8 @@ class GRPOConfig:
         use_flash_attention: Использовать Flash Attention 2
     """
     
-    # Алгоритм
-    algorithm: RLAlgorithm = RLAlgorithm.GRPO
+    # Алгоритм (DAPO рекомендуется)
+    algorithm: RLAlgorithm = RLAlgorithm.DAPO
     
     # Размеры батча
     group_size: int = 8
@@ -126,6 +126,7 @@ class GRPOConfig:
     
     # DAPO
     dynamic_sampling: bool = False  # True для DAPO
+    max_refill_rounds: int = 3  # Макс. попыток добора групп (0 = без добора, 8 = как в статье)
     token_level_loss: bool = False  # True для DAPO
     overlong_penalty: float = -1.0
     overlong_buffer: int = 0  # 4000 в DAPO для длинных контекстов
@@ -148,7 +149,7 @@ class GRPOConfig:
     ds3_gather_for_generation: bool = True
 
     # ============================================================
-    # ROLLOUT ENGINE (отдельная модель для генерации, как в verl)
+    # ROLLOUT ENGINE (отдельная модель для генерации)
     # ============================================================
     # Если True — генерация (rollout) будет делаться отдельной моделью (HF / vLLM),
     # а training-модель (DDP/ZeRO/FSDP) будет использоваться только для teacher-forcing logprobs + backprop.
@@ -174,6 +175,45 @@ class GRPOConfig:
     # - "auto": local accelerator.device (cuda:local_rank)
     # - "cpu": всегда CPU (медленно, но стабильно)
     rollout_device: str = "auto"
+    
+    # vLLM GPU memory utilization (0.0-1.0)
+    # Сколько % памяти GPU выделить под vLLM (KV-cache и модель)
+    vllm_gpu_memory_utilization: float = 0.85
+    
+    # vLLM device: на каком устройстве запускать vLLM
+    # - "cuda:0", "cuda:1", ... — конкретная GPU
+    # - "cpu" — на CPU (медленно, но освобождает GPU для training)
+    # vLLM загружается ТОЛЬКО на main process (rank 0), результаты broadcast'ятся
+    vllm_device: str = "cuda:0"
+    
+    # ============================================================
+    # LIGER KERNEL OPTIMIZATIONS
+    # ============================================================
+    # Liger Kernel — оптимизированные Triton kernels для LLM тренировки
+    # Экономит память (не материализует logits) и ускоряет вычисления
+    # https://github.com/linkedin/Liger-Kernel
+    
+    # Включить Liger оптимизации (CrossEntropy, RMSNorm, MLP и т.д.)
+    use_liger: bool = True
+    
+    # Патчить модель Liger kernels (RMSNorm -> LigerRMSNorm, MLP -> LigerSwiGLU и т.д.)
+    # Поддерживаемые архитектуры: Qwen2, Llama, Mistral, Gemma, Phi3
+    liger_patch_model: bool = True
+    
+    # Размер chunk'а для chunked cross-entropy (уменьшить если OOM)
+    liger_chunk_size: int = 4096
+    
+    # 🔥 LigerFusedLinearGRPOLoss — НЕ материализует logits (экономия до 80% памяти!)
+    # Fused: hidden_states -> lm_head -> GRPO loss в одном kernel
+    # ВАЖНО: требует output_hidden_states=True в forward pass
+    liger_fused_grpo: bool = True
+    
+    # Тип loss для Liger GRPO (если liger_fused_grpo=True):
+    # - "grpo": стандартный GRPO (sample-level нормализация)
+    # - "dapo": DAPO с улучшенной нормализацией (рекомендуется)
+    # - "dr_grpo": DrGRPO с фиксированной нормализацией
+    # - "bnpo": Batch Normalized Per-token loss
+    liger_grpo_loss_type: str = "dapo"  # DAPO рекомендуется как более стабильный
     
     # Логирование
     output_dir: str = "./output/grpo"

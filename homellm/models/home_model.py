@@ -5,16 +5,18 @@ homellm.models.home_model
 но упрощённая и без внешних зависимостей, кроме PyTorch / HF-Transformers.
 
 Особенности:
-• RMSNorm вместо LayerNorm;
+• RMSNorm вместо LayerNorm (автоматически LigerRMSNorm если доступен);
 • Rotary Positional Embedding (RoPE);
 • Свёртка QK-KV на модуль FlashAttention (если доступен) или обычное scaled-dot-prod;
 • Feed-Forward на SiLU (GELU-подобная);
 • Возможность выбора числа голов, слоёв, hidden_size через HomeConfig.
+• 🦁 Liger Kernel оптимизации (если установлен liger-kernel).
 
 Поддерживаются методы generate (через GenerationMixin).
 """
 from __future__ import annotations
 
+import logging
 import math
 from typing import List, Optional, Tuple, Union
 
@@ -23,6 +25,53 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# LIGER KERNEL — автоматическое использование если доступен
+# ============================================================
+_LIGER_RMSNORM = None
+_LIGER_SILUMUL = None
+_LIGER_CHECKED = False
+
+
+def _check_liger_available():
+    """Проверяет и кэширует доступность Liger компонентов."""
+    global _LIGER_RMSNORM, _LIGER_SILUMUL, _LIGER_CHECKED
+    
+    if _LIGER_CHECKED:
+        return
+    
+    _LIGER_CHECKED = True
+    
+    # LigerRMSNorm
+    try:
+        from liger_kernel.transformers import LigerRMSNorm
+        _LIGER_RMSNORM = LigerRMSNorm
+        logger.debug("✅ LigerRMSNorm доступен для Home моделей")
+    except ImportError:
+        _LIGER_RMSNORM = None
+    
+    # LigerSiLUMulFunction (fused SwiGLU)
+    try:
+        from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+        _LIGER_SILUMUL = LigerSiLUMulFunction
+        logger.debug("✅ LigerSiLUMulFunction доступен для Home моделей (fused SwiGLU)")
+    except ImportError:
+        _LIGER_SILUMUL = None
+
+
+def _get_liger_rmsnorm():
+    """Возвращает LigerRMSNorm если доступен (кэширует результат)."""
+    _check_liger_available()
+    return _LIGER_RMSNORM
+
+
+def _get_liger_silumul():
+    """Возвращает LigerSiLUMulFunction если доступен (fused silu * mul)."""
+    _check_liger_available()
+    return _LIGER_SILUMUL
 
 # -----------------------------------------------------------------------------
 # Config
@@ -45,6 +94,7 @@ class HomeConfig(PretrainedConfig):
         max_position_embeddings: int = 4096,
         rope_theta: float = 1e4,
         use_sdpa: bool = True,
+        use_liger: bool = True,  # 🦁 Автоматически использовать Liger если доступен
         **kwargs,
     ):
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -59,6 +109,7 @@ class HomeConfig(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
         self.use_sdpa = bool(use_sdpa)
+        self.use_liger = bool(use_liger)
 
 
 # -----------------------------------------------------------------------------
@@ -67,6 +118,8 @@ class HomeConfig(PretrainedConfig):
 
 
 class RMSNorm(nn.Module):
+    """Стандартный RMSNorm (fallback если Liger недоступен)."""
+    
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
@@ -77,6 +130,25 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         return self.weight * self._norm(x.float()).type_as(x)
+
+
+def create_rmsnorm(dim: int, eps: float = 1e-5, use_liger: bool = True) -> nn.Module:
+    """
+    Создаёт RMSNorm — автоматически LigerRMSNorm если доступен.
+    
+    Args:
+        dim: Размерность
+        eps: Epsilon для стабильности
+        use_liger: Пытаться использовать Liger (по умолчанию True)
+    
+    Returns:
+        RMSNorm или LigerRMSNorm
+    """
+    if use_liger:
+        LigerRMSNorm = _get_liger_rmsnorm()
+        if LigerRMSNorm is not None:
+            return LigerRMSNorm(dim, eps=eps)
+    return RMSNorm(dim, eps=eps)
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float):
@@ -190,24 +262,49 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
+    """
+    SwiGLU FeedForward с опциональной Liger оптимизацией.
+    
+    Если Liger доступен, использует LigerSiLUMulFunction для fused silu(gate) * up:
+    - Экономит память (нет промежуточного тензора)
+    - Быстрее (один kernel вместо двух)
+    """
     def __init__(self, config: HomeConfig):
         super().__init__()
         hidden = config.intermediate_size
-        self.w1 = nn.Linear(config.hidden_size, hidden, bias=False)
-        self.w2 = nn.Linear(hidden, config.hidden_size, bias=False)
-        self.w3 = nn.Linear(config.hidden_size, hidden, bias=False)  # gated-linear
+        self.w1 = nn.Linear(config.hidden_size, hidden, bias=False)  # gate_proj
+        self.w2 = nn.Linear(hidden, config.hidden_size, bias=False)  # down_proj
+        self.w3 = nn.Linear(config.hidden_size, hidden, bias=False)  # up_proj
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(config.dropout)
+        
+        # Проверяем доступность Liger SiLUMul
+        use_liger = getattr(config, 'use_liger', True)
+        self._liger_silumul = _get_liger_silumul() if use_liger else None
+        
+        if self._liger_silumul is not None:
+            logger.debug("🦁 FeedForward: используется LigerSiLUMulFunction (fused SwiGLU)")
 
     def forward(self, x):
-        return self.dropout(self.w2(self.act(self.w1(x)) * self.w3(x)))
+        gate = self.w1(x)  # gate_proj
+        up = self.w3(x)    # up_proj
+        
+        if self._liger_silumul is not None:
+            # 🦁 Liger fused path: silu(gate) * up в одном kernel
+            hidden = self._liger_silumul.apply(gate, up)
+        else:
+            # Standard path
+            hidden = self.act(gate) * up
+        
+        return self.dropout(self.w2(hidden))
 
 
 class HomeBlock(nn.Module):
     def __init__(self, config: HomeConfig):
         super().__init__()
-        self.attn_norm = RMSNorm(config.hidden_size)
-        self.ffn_norm = RMSNorm(config.hidden_size)
+        use_liger = getattr(config, 'use_liger', True)
+        self.attn_norm = create_rmsnorm(config.hidden_size, use_liger=use_liger)
+        self.ffn_norm = create_rmsnorm(config.hidden_size, use_liger=use_liger)
         self.attn = Attention(config)
         self.mlp = FeedForward(config)
 
@@ -231,7 +328,8 @@ class HomeModel(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([HomeBlock(config) for _ in range(config.num_hidden_layers)])
-        self.final_norm = RMSNorm(config.hidden_size)
+        use_liger = getattr(config, 'use_liger', True)
+        self.final_norm = create_rmsnorm(config.hidden_size, use_liger=use_liger)
         self.gradient_checkpointing = False  # Флаг для checkpointing
 
         # Precompute RoPE
@@ -242,6 +340,16 @@ class HomeModel(nn.Module):
         )
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
+        
+        # Логируем Liger оптимизации
+        if use_liger:
+            liger_opts = []
+            if _get_liger_rmsnorm() is not None:
+                liger_opts.append("RMSNorm")
+            if _get_liger_silumul() is not None:
+                liger_opts.append("SwiGLU (fused SiLU*Mul)")
+            if liger_opts:
+                logger.info(f"🦁 HomeModel: Liger оптимизации активны: {', '.join(liger_opts)}")
 
     def forward(
         self,
@@ -356,6 +464,7 @@ class HomeForCausalLM(PreTrainedModel, GenerationMixin):
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         labels: Optional[torch.Tensor] = None,
+        output_hidden_states: bool = False,
         **kwargs,  # Для совместимости с новыми версиями transformers (cache_position, etc.)
     ) -> CausalLMOutputWithPast:
         # Конвертируем DynamicCache в список кортежей если нужно
@@ -386,8 +495,17 @@ class HomeForCausalLM(PreTrainedModel, GenerationMixin):
                 ignore_index=-100,
             )
 
+        # Формируем hidden_states для output если запрошено
+        # CausalLMOutputWithPast ожидает tuple of (hidden_states_per_layer,)
+        # Для Liger Fused CE достаточно только последнего hidden state
+        all_hidden_states = None
+        if output_hidden_states:
+            # Возвращаем tuple с одним элементом — последний hidden state (до lm_head)
+            all_hidden_states = (hidden_states,)
+
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=presents,
+            hidden_states=all_hidden_states,
         )

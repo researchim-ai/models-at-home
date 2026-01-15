@@ -9,14 +9,22 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Callable, Any, Dict
 import torch
-
-logger = logging.getLogger(__name__)
 import torch.nn.functional as F
+
 from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
     GenerationConfig,
 )
+
+# Liger Kernel интеграция для оптимизированного cross-entropy
+from homellm.training.rl.liger_utils import (
+    liger_cross_entropy,
+    chunked_cross_entropy,
+    is_liger_available,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -209,23 +217,24 @@ def sequence_log_probs_from_logits(
     Returns:
         Log-вероятности [batch, seq_len]
     """
-    # ОПТИМИЗАЦИЯ ПАМЯТИ: Используем cross_entropy(reduction='none') вместо log_softmax + gather
-    # Старый подход: log_probs = F.log_softmax(logits, dim=-1).gather(...)
-    # Это создавало тензор [Batch, SeqLen, Vocab], который для Qwen (152k vocab) занимал ~5-6 GB
-    # Новый подход: fused kernel cross_entropy вычисляет только нужные значения
-    # log(p) = -cross_entropy
+    # ОПТИМИЗАЦИЯ ПАМЯТИ: Используем Liger CrossEntropy если доступен
+    # Liger CE более эффективен по памяти чем F.cross_entropy
+    # Для больших vocab (Qwen ~152k) это критично
     
-    # Reshape для cross_entropy: [N, C] и [N]
     batch_size, seq_len, vocab_size = logits.shape
-    logits_flat = logits.reshape(-1, vocab_size)
-    ids_flat = output_ids.reshape(-1)
     
-    # Вычисляем negative log likelihood (loss) для каждого токена
-    # reduction='none' возвращает тензор того же размера, что и input (batch * seq)
-    nll = F.cross_entropy(logits_flat, ids_flat, reduction='none')
+    # Используем chunked cross-entropy для экономии памяти
+    # Это разбивает вычисление на части если batch*seq слишком большой
+    # chunk_size=4096 хорошо работает для большинства GPU
+    nll = chunked_cross_entropy(
+        logits,
+        output_ids,
+        chunk_size=4096,
+        ignore_index=-100,
+    )
     
     # log_prob = -nll
-    log_probs = -nll.view(batch_size, seq_len)
+    log_probs = -nll
     
     return log_probs
 

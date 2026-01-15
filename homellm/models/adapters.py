@@ -542,6 +542,7 @@ class HomeAdapter(ModelAdapter):
                         num_hidden_layers=run_cfg.get("num_layers", 8),
                         num_attention_heads=run_cfg.get("n_heads", 8),
                         max_position_embeddings=run_cfg.get("seq_len", 512),
+                        use_liger=config.get("use_liger", True),  # 🦁 Liger оптимизации
                     )
                 else:
                     raise ValueError(f"Cannot find config.json in {base_model_path}")
@@ -647,6 +648,7 @@ class HomeAdapter(ModelAdapter):
             max_position_embeddings=config["seq_len"],
             dropout=config.get("dropout", 0.0),
             use_sdpa=use_flash_attention,
+            use_liger=config.get("use_liger", True),  # 🦁 Liger оптимизации
         )
         model = HomeForCausalLM(model_config)
         if torch_dtype != torch.float32:

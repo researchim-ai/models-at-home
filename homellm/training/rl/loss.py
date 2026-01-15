@@ -5,14 +5,21 @@ Loss функции для GRPO/RL.
 - GRPO (стандартный)
 - Dr.GRPO (без std нормализации, фиксированный делитель)
 - DAPO (token-level loss, clip higher)
+- 🦁 LigerFusedLinearGRPOLoss — НЕ материализует logits (до 80% экономии памяти!)
 """
-from typing import Optional, Tuple
+import logging
+from typing import Optional, Tuple, TYPE_CHECKING
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .experience import Experience
 from .config import GRPOConfig, RLAlgorithm
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
+
+logger = logging.getLogger(__name__)
 
 
 def approx_kl_divergence(
@@ -397,3 +404,266 @@ def compute_overlong_penalty(
     penalties[over_max] = penalty_value
     
     return penalties
+
+
+# ============================================================
+# 🦁 LIGER FUSED GRPO LOSS
+# ============================================================
+
+class LigerFusedGRPOLoss(nn.Module):
+    """
+    🔥 Fused GRPO Loss с Liger Kernel — НЕ материализует logits!
+    
+    Это самая мощная оптимизация памяти для GRPO:
+    - Вместо model() -> logits [B, T, V] -> log_probs -> loss
+    - Делает: model(output_hidden_states=True) -> hidden [B, T, H] -> fused_loss
+    
+    Для vocab=150k и seq_len=512 экономит ~3GB на batch!
+    
+    Использование:
+        loss_fn = LigerFusedGRPOLoss(model, config)
+        
+        # В training loop:
+        outputs = model(input_ids, attention_mask, output_hidden_states=True)
+        hidden_states = outputs.hidden_states[-1]  # последний layer
+        loss, metrics = loss_fn(
+            hidden_states=hidden_states,
+            selected_token_ids=completion_ids,  # target tokens
+            attention_mask=action_mask,
+            advantages=advantages,
+            old_per_token_logps=old_log_probs,
+            ref_per_token_logps=ref_log_probs,
+        )
+    """
+    
+    def __init__(
+        self,
+        model: "PreTrainedModel",
+        config: Optional[GRPOConfig] = None,
+        beta: float = 0.0,
+        loss_type: str = "grpo",
+        epsilon_low: float = 0.2,
+        epsilon_high: float = 0.2,
+        max_completion_length: Optional[int] = None,
+        chunk_size: int = 1,
+    ):
+        super().__init__()
+        
+        # Импортируем Liger
+        from .liger_utils import get_liger_fused_linear_grpo, is_liger_available
+        
+        if not is_liger_available():
+            raise RuntimeError("LigerFusedGRPOLoss требует установленный liger-kernel!")
+        
+        LigerFusedLinearGRPOLoss = get_liger_fused_linear_grpo()
+        if LigerFusedLinearGRPOLoss is None:
+            raise RuntimeError("LigerFusedLinearGRPOLoss недоступен!")
+        
+        # Параметры из config или аргументов
+        if config is not None:
+            beta = config.kl_weight
+            loss_type = getattr(config, 'liger_grpo_loss_type', 'dapo')
+            epsilon_low = config.clip_eps_low
+            epsilon_high = config.clip_eps_high
+            max_completion_length = config.max_new_tokens
+            chunk_size = getattr(config, 'liger_chunk_size', 1)
+        
+        self.liger_loss = LigerFusedLinearGRPOLoss(
+            beta=beta,
+            loss_type=loss_type,
+            epsilon_low=epsilon_low,
+            epsilon_high=epsilon_high,
+            max_completion_length=max_completion_length,
+            chunk_size=chunk_size,
+            use_ref_model=beta > 0,
+            compiled=False,  # torch.compile падает с динамическими размерами в GRPO
+            importance_sampling_level="token",
+            temperature=1.0,
+        )
+        
+        # Сохраняем ссылку на lm_head
+        self.lm_head_weight = model.lm_head.weight
+        self.lm_head_bias = getattr(model.lm_head, 'bias', None)
+        
+        self.beta = beta
+        self.loss_type = loss_type
+        self.last_components: dict = {}
+        
+        logger.info(f"🦁 LigerFusedGRPOLoss инициализирован:")
+        logger.info(f"   - loss_type: {loss_type}")
+        logger.info(f"   - beta (KL weight): {beta}")
+        logger.info(f"   - epsilon: [{epsilon_low}, {epsilon_high}]")
+        logger.info(f"   - chunk_size: {chunk_size}")
+        logger.info(f"   ⚡ Logits НЕ материализуются — экономия памяти!")
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # [batch, seq, hidden] — последний hidden state
+        selected_token_ids: torch.Tensor,  # [batch, seq] — target token IDs
+        attention_mask: torch.Tensor,  # [batch, seq] — action mask
+        advantages: torch.Tensor,  # [batch] — advantages
+        old_per_token_logps: Optional[torch.Tensor] = None,  # [batch, seq]
+        ref_per_token_logps: Optional[torch.Tensor] = None,  # [batch, seq]
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Вычисляет Fused GRPO Loss.
+        
+        Args:
+            hidden_states: Последний hidden state модели [batch, seq, hidden]
+            selected_token_ids: Target token IDs (completion tokens) [batch, seq]
+            attention_mask: Маска completion токенов [batch, seq]
+            advantages: Advantages для каждого sample [batch]
+            old_per_token_logps: Log probs из rollout policy [batch, seq]
+            ref_per_token_logps: Log probs из reference model [batch, seq]
+        
+        Returns:
+            (loss, metrics_dict)
+        """
+        # Liger ожидает _input в формате [batch, seq, hidden] — передаём напрямую БЕЗ reshape
+        # chunk_forward делает: logits = torch.matmul(input_chunk, weight.t())  # [B, T, H] @ [H, V]
+        
+        # Вызываем Liger Fused Loss
+        result = self.liger_loss(
+            hidden_states,         # [batch, seq, hidden] — НЕ делаем flatten!
+            self.lm_head_weight,   # [vocab, hidden]
+            selected_token_ids,    # [batch, seq]
+            attention_mask,        # [batch, seq]
+            advantages,            # [batch]
+            bias=self.lm_head_bias,
+            ref_per_token_logps=ref_per_token_logps,
+            old_per_token_logps=old_per_token_logps,
+        )
+        
+        # Парсим результат
+        if isinstance(result, tuple):
+            loss = result[0]
+            metrics_list = result[1] if len(result) > 1 else []
+        else:
+            loss = result
+            metrics_list = []
+        
+        # Собираем метрики
+        metrics = {
+            "loss": loss.item() if hasattr(loss, 'item') else float(loss),
+            "advantages_mean": advantages.mean().item(),
+            "advantages_std": advantages.std().item(),
+        }
+        
+        # Метрики из Liger
+        if len(metrics_list) >= 1 and self.beta > 0:
+            kl_val = metrics_list[0]
+            metrics["kl_mean"] = kl_val.item() if hasattr(kl_val, 'item') else float(kl_val)
+        
+        if len(metrics_list) >= 2:
+            clip_idx = 1 if self.beta > 0 else 0
+            if clip_idx < len(metrics_list):
+                clip_val = metrics_list[clip_idx]
+                metrics["clip_fraction"] = clip_val.item() if hasattr(clip_val, 'item') else float(clip_val)
+        
+        self.last_components = metrics
+        return loss, metrics
+    
+    def forward_with_experience(
+        self,
+        hidden_states: torch.Tensor,
+        experience: Experience,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Удобная обёртка для использования с Experience объектом.
+        
+        Args:
+            hidden_states: Последний hidden state [batch, seq, hidden]
+            experience: Experience объект с action_mask, advantages и т.д.
+        
+        Returns:
+            (loss, metrics_dict)
+        """
+        # CAUSAL SHIFT для next-token prediction:
+        # - hidden_states[i] предсказывает tokens[i+1]
+        # - action_log_probs уже имеет размер [batch, T] (shifted при rollout)
+        # - action_mask уже имеет размер [batch, T] (shifted при rollout)
+        #
+        # ВАЖНО: sequences и action_log_probs батчатся независимо,
+        # поэтому их max_len может не совпадать на 1!
+        # Нужно выровнять все тензоры до общего размера.
+        
+        # Получаем размеры
+        seq_len = hidden_states.size(1)  # от модели
+        target_len = experience.action_log_probs.size(1)  # shifted logprobs
+        
+        # Сдвигаем hidden states (убираем последний — он предсказывает несуществующий токен)
+        # Результат: [batch, seq_len-1, hidden]
+        shifted_hidden = hidden_states[:, :-1, :].contiguous()
+        
+        # Сдвигаем sequences (получаем labels)
+        # Результат: [batch, seq_len-1]
+        shifted_labels = experience.sequences[:, 1:].contiguous()
+        
+        # Теперь shifted_hidden и shifted_labels имеют размер seq_len-1
+        # А action_log_probs и action_mask имеют размер target_len
+        # Выравниваем до меньшего из двух
+        final_len = min(shifted_hidden.size(1), target_len)
+        
+        # Обрезаем все тензоры до final_len (справа, т.к. left-padding)
+        shifted_hidden = shifted_hidden[:, -final_len:, :].contiguous()
+        shifted_labels = shifted_labels[:, -final_len:].contiguous()
+        action_log_probs = experience.action_log_probs[:, -final_len:].contiguous()
+        action_mask = experience.action_mask[:, -final_len:]
+        ref_log_probs = experience.log_probs_ref
+        if ref_log_probs is not None:
+            ref_log_probs = ref_log_probs[:, -final_len:].contiguous()
+        
+        # Advantages должен быть [batch], не [batch, 1]
+        advantages = experience.advantages
+        if advantages.dim() > 1:
+            advantages = advantages.squeeze(-1)
+        
+        # Action mask: Liger ожидает float/int, не bool
+        if action_mask.dtype == torch.bool:
+            action_mask = action_mask.to(shifted_hidden.dtype)
+        
+        return self.forward(
+            hidden_states=shifted_hidden,             # [batch, final_len, hidden]
+            selected_token_ids=shifted_labels,        # [batch, final_len]
+            attention_mask=action_mask,               # [batch, final_len] — float
+            advantages=advantages,                    # [batch]
+            old_per_token_logps=action_log_probs,     # [batch, final_len]
+            ref_per_token_logps=ref_log_probs,        # [batch, final_len] или None
+        )
+
+
+def create_loss_function(
+    model: "PreTrainedModel",
+    config: GRPOConfig,
+) -> nn.Module:
+    """
+    Создаёт loss функцию в зависимости от конфигурации.
+    
+    Если liger_fused_grpo=True и Liger доступен — создаёт LigerFusedGRPOLoss.
+    Иначе — стандартный GRPOLoss.
+    
+    Args:
+        model: HuggingFace модель
+        config: GRPOConfig
+    
+    Returns:
+        Loss module (GRPOLoss или LigerFusedGRPOLoss)
+    """
+    use_liger_fused = getattr(config, 'liger_fused_grpo', False) and getattr(config, 'use_liger', False)
+    
+    if use_liger_fused:
+        try:
+            from .liger_utils import is_liger_available
+            
+            if is_liger_available():
+                loss_fn = LigerFusedGRPOLoss(model=model, config=config)
+                logger.info("🦁 Используется LigerFusedGRPOLoss (память оптимизирована!)")
+                return loss_fn
+            else:
+                logger.warning("⚠️ Liger недоступен, fallback на GRPOLoss")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось создать LigerFusedGRPOLoss: {e}")
+            logger.warning("   Используем стандартный GRPOLoss")
+    
+    logger.info("📊 Используется стандартный GRPOLoss")
+    return GRPOLoss(config=config)

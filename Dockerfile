@@ -3,7 +3,11 @@
 ############################
 # 1) Builder stage
 ############################
-# CUDA 12.4 для совместимости с torch 2.7+ и flash-attn 2.8+
+# Зафиксированная комбинация PRE-BUILT WHEELS (быстрая установка!):
+# - CUDA 12.4.1 (Docker образ)
+# - PyTorch 2.5.1 (PyPI, bundled CUDA 12.4)
+# - Flash Attention 2.8.3 (pre-built wheel для torch 2.5 + cu12)
+# - Liger Kernel 0.6.4 (чистый Python/Triton)
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -33,30 +37,28 @@ WORKDIR /app
 # Сначала зависимости (для кеширования слоёв)
 COPY requirements.txt /app/requirements.txt
 
-# Установка основных зависимостей
-# torch 2.7 из PyPI (bundled CUDA 12.4) + flash-attn 2.8.3
-# НЕ используем --index-url, torch из PyPI идёт с встроенным CUDA
-RUN python -m pip install --upgrade pip setuptools wheel \
- && python -m pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
- && python -m pip install --no-cache-dir -r /app/requirements.txt \
- && python -m pip install --no-cache-dir deepspeed
+# ============================================================
+# УСТАНОВКА ЗАВИСИМОСТЕЙ (ВСЁ ИЗ PRE-BUILT WHEELS!)
+# ============================================================
+# ВАЖНО: torch из PyPI (bundled CUDA 12.4) + flash-attn wheel
+# НЕ используем --index-url pytorch — он имеет несовместимый ABI!
 
-# Flash Attention 2.8.3 — pre-built wheel для cu12 + torch 2.7 + Python 3.10
-# Wheels: https://github.com/Dao-AILab/flash-attention/releases
-ARG INSTALL_FLASH_ATTN=true
-RUN if [ "$INSTALL_FLASH_ATTN" = "true" ]; then \
-      echo "Установка flash-attn 2.8.3 из pre-built wheel (cu12, torch 2.7)..." && \
-      python -m pip install --no-cache-dir \
-        https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl \
-      || ( \
-        echo "Pre-built wheel не подошёл, компилируем..." && \
-        export MAX_JOBS=4 && \
-        export CUDA_HOME=/usr/local/cuda && \
-        python -m pip install --no-cache-dir flash-attn --no-build-isolation \
-      ); \
-    else \
-      echo "Пропуск установки flash-attn (INSTALL_FLASH_ATTN=false)"; \
-    fi
+# 1. PyTorch 2.5.1 из PyPI (bundled CUDA 12.4, совместим с flash-attn wheels)
+RUN python -m pip install --upgrade pip setuptools wheel \
+ && python -m pip install --no-cache-dir \
+    torch==2.5.1 \
+    torchvision==0.20.1 \
+    torchaudio==2.5.1
+
+# 2. Flash Attention 2.8.3 — PRE-BUILT WHEEL для torch 2.5 + cu12 + Python 3.10
+# ★ Устанавливается за секунды, без компиляции!
+RUN echo "Установка flash-attn 2.8.3 из pre-built wheel..." \
+ && python -m pip install --no-cache-dir \
+    https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+
+# 3. Остальные зависимости (включая liger-kernel — чистый Python, мгновенная установка)
+RUN python -m pip install --no-cache-dir -r /app/requirements.txt \
+ && python -m pip install --no-cache-dir deepspeed
 
 # Теперь код (ВАЖНО: .dockerignore должен исключать datasets/out/.runs и т.п.)
 COPY . /app

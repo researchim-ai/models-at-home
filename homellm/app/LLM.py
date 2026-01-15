@@ -845,10 +845,25 @@ def start_grpo_training(config: dict) -> tuple[str, subprocess.Popen]:
     # ВАЖНО: применяем выбор GPU из UI (как в start_training)
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    gpu_ids = config.get("gpu_ids") or []
+    gpu_ids = list(config.get("gpu_ids") or [])
+    
+    # Если используется vLLM на другой GPU — добавляем её в CUDA_VISIBLE_DEVICES
+    vllm_device = config.get("grpo_vllm_device", "")
+    use_rollout_engine = config.get("grpo_use_rollout_engine", False)
+    rollout_backend = config.get("grpo_rollout_backend", "hf")
+    
+    if use_rollout_engine and rollout_backend == "vllm" and vllm_device.startswith("cuda:"):
+        vllm_gpu_id = int(vllm_device.split(":")[1])
+        if vllm_gpu_id not in gpu_ids:
+            gpu_ids.append(vllm_gpu_id)
+            logger.info(f"🧩 Добавлена GPU {vllm_gpu_id} для vLLM rollout engine")
+    
     if gpu_ids:
+        # НЕ сортируем! Порядок важен для ремаппинга индексов внутри процесса
+        # Первые GPU — для training, последняя (если добавлена) — для vLLM
+        gpu_ids = list(dict.fromkeys(gpu_ids))  # Убираем дубликаты, сохраняя порядок
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
-        logger.info(f"🎯 Используются GPU: {gpu_ids}")
+        logger.info(f"🎯 CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
     
     process = subprocess.Popen(
         cmd,
@@ -1317,16 +1332,16 @@ def render_grpo_sidebar_config():
     # Алгоритм
     algorithm = st.sidebar.selectbox(
         "Алгоритм",
-        ["grpo", "drgrpo", "dapo"],
+        ["dapo", "grpo", "drgrpo"],
         format_func=lambda x: {
+            "dapo": "⭐ DAPO (рекомендуется)",
             "grpo": "GRPO (стандартный)",
             "drgrpo": "Dr.GRPO (улучшенный)",
-            "dapo": "DAPO (полный)",
         }[x],
         help="""
+        **DAPO** ⭐: Рекомендуется! Token-level loss + асимметричный клиппинг + dynamic sampling
         **GRPO**: Стандартный Group Relative Policy Optimization
         **Dr.GRPO**: Без деления на std, фиксированная нормализация
-        **DAPO**: + асимметричный клиппинг, + dynamic sampling
         """
     )
     
@@ -1427,7 +1442,7 @@ def render_grpo_sidebar_config():
         help="Вес KL-штрафа. Для reasoning обычно 0"
     )
     
-    # Клиппинг
+    # Клиппинг и продвинутые параметры
     with st.sidebar.expander("⚙️ Продвинутые параметры"):
         clip_eps_low = st.slider("Clip ε (low)", 0.1, 0.3, 0.2, 0.01)
         clip_eps_high = st.slider(
@@ -1437,18 +1452,6 @@ def render_grpo_sidebar_config():
             0.01,
             help="DAPO рекомендует 0.28 для верхней границы"
         )
-        
-        dynamic_sampling = st.checkbox(
-            "Dynamic sampling",
-            value=algorithm == "dapo",
-            help="Фильтровать группы с нулевым градиентом"
-        )
-        
-        token_level_loss = st.checkbox(
-            "Token-level loss",
-            value=algorithm == "dapo",
-            help="Агрегировать loss по токенам, а не по сэмплам"
-        )
 
         min_lr_ratio = st.slider(
             "Min LR ratio (floor)",
@@ -1457,11 +1460,87 @@ def render_grpo_sidebar_config():
             0.01,
             help="Нижний предел LR: lr = base_lr * ratio в конце cosine. 0.0 = до нуля."
         )
+        
+        # ============================================================
+        # Настройки специфичные для каждого алгоритма
+        # ============================================================
+        
+        if algorithm == "dapo":
+            st.markdown("---")
+            st.markdown("**🎯 DAPO-специфичные настройки**")
+            
+            dynamic_sampling = st.checkbox(
+                "Dynamic sampling",
+                value=True,
+                help=(
+                    "Фильтровать группы где все rewards одинаковы (zero-gradient).\n\n"
+                    "**⚠️ Замедляет обучение** — делает дополнительные генерации!\n"
+                    "Отключите если скорость важнее качества."
+                )
+            )
+            
+            # Максимум попыток добора (только если dynamic_sampling включён)
+            if dynamic_sampling:
+                max_refill_rounds = st.slider(
+                    "Max refill rounds",
+                    min_value=1,
+                    max_value=8,
+                    value=3,
+                    step=1,
+                    help=(
+                        "Сколько раз пытаться добирать группы.\n"
+                        "**8** = максимум (медленно, но больше данных)\n"
+                        "**2-3** = быстрее (рекомендуется)"
+                    )
+                )
+            else:
+                max_refill_rounds = 0
+            
+            token_level_loss = st.checkbox(
+                "Token-level loss",
+                value=True,
+                help="Агрегировать loss по токенам (DAPO), а не по сэмплам (GRPO)"
+            )
+        
+        elif algorithm == "drgrpo":
+            st.markdown("---")
+            st.markdown("**🔬 Dr.GRPO-специфичные настройки**")
+            st.info(
+                "Dr.GRPO автоматически:\n"
+                "• Отключает деление на std\n"
+                "• Использует фиксированную нормализацию по длине"
+            )
+            # Dr.GRPO не использует dynamic_sampling и token_level_loss
+            dynamic_sampling = False
+            max_refill_rounds = 0
+            token_level_loss = False
+        
+        else:  # GRPO
+            st.markdown("---")
+            st.markdown("**📊 GRPO-специфичные настройки**")
+            st.info(
+                "Стандартный GRPO:\n"
+                "• Нормализация advantages: (r - mean) / std\n"
+                "• Sample-level loss агрегация"
+            )
+            # GRPO не использует dynamic_sampling и token_level_loss
+            dynamic_sampling = False
+            max_refill_rounds = 0
+            token_level_loss = False
 
+        # Liger настройки берутся из общих настроек Precision & Memory (сайдбар)
+        # Здесь только вычисляем loss_type на основе алгоритма
+        algorithm_to_loss_type = {
+            "grpo": "grpo",
+            "dapo": "dapo", 
+            "drgrpo": "dr_grpo",
+        }
+        grpo_liger_loss_type = algorithm_to_loss_type.get(algorithm, "dapo")
+        
         st.markdown("---")
         st.markdown("**🚀 Rollout engine (отдельная модель для генерации)**")
         grpo_use_rollout_engine = st.checkbox(
-            "Использовать отдельную модель для генерации (как в verl)",
+            "Использовать отдельную модель для генерации",
             value=False,
             help=(
                 "Если включено, генерация (rollout) будет выполняться отдельной моделью, "
@@ -1480,6 +1559,102 @@ def render_grpo_sidebar_config():
                 "- Для full fine-tuning: перезагрузка vLLM (~5-15 сек), увеличьте sync interval"
             ),
             disabled=not grpo_use_rollout_engine,
+        )
+        
+        # vLLM: на какой GPU запускать?
+        # Получаем количество GPU
+        try:
+            import torch
+            num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        except:
+            num_gpus = 0
+        
+        # Предупреждение о multi-GPU DDP + vLLM
+        selected_num_gpus = st.session_state.get("num_gpus", 1) or 1
+        if grpo_rollout_backend == "vllm" and selected_num_gpus > 1:
+            st.warning(
+                "⚠️ **vLLM + Multi-GPU DDP не поддерживается!**\n\n"
+                "При использовании нескольких GPU для DDP training, vLLM автоматически отключается.\n\n"
+                "**Для использования vLLM**: выберите 1 GPU для training, "
+                "а vLLM разместите на другой GPU."
+            )
+        
+        # Выбор GPU для vLLM
+        gpu_options = [f"cuda:{i}" for i in range(num_gpus)] if num_gpus > 0 else ["cuda:0"]
+        gpu_labels = {}
+        for i in range(num_gpus):
+            try:
+                name = torch.cuda.get_device_name(i)
+                gpu_labels[f"cuda:{i}"] = f"🎮 GPU {i}: {name}"
+            except:
+                gpu_labels[f"cuda:{i}"] = f"🎮 GPU {i}"
+        
+        # Определяем GPU для training (первая выбранная в multi-select или 0)
+        training_gpu_id = 0
+        selected_gpus = st.session_state.get("selected_gpus", [0])
+        if selected_gpus:
+            training_gpu_id = selected_gpus[0] if isinstance(selected_gpus[0], int) else 0
+        
+        # По умолчанию vLLM на другой GPU если есть
+        default_vllm_gpu_idx = 0
+        if num_gpus > 1:
+            # Выбираем GPU которая НЕ используется для training
+            for i in range(num_gpus):
+                if i != training_gpu_id:
+                    default_vllm_gpu_idx = i
+                    break
+        
+        grpo_vllm_device = st.selectbox(
+            "vLLM GPU",
+            options=gpu_options,
+            index=min(default_vllm_gpu_idx, len(gpu_options) - 1),
+            format_func=lambda x: gpu_labels.get(x, x),
+            help=(
+                "Выберите GPU для vLLM rollout модели.\n\n"
+                "**Рекомендация**: Используйте ОТДЕЛЬНУЮ GPU для vLLM!\n"
+                f"- Training на: cuda:{training_gpu_id}\n"
+                f"- vLLM лучше на: cuda:{default_vllm_gpu_idx if num_gpus > 1 else 0}\n\n"
+                "Если только 1 GPU — vLLM и training делят память (уменьшите % памяти для vLLM)."
+            ),
+            disabled=not (grpo_use_rollout_engine and grpo_rollout_backend == "vllm"),
+        )
+        
+        # Предупреждение если только 1 GPU
+        if grpo_rollout_backend == "vllm" and num_gpus <= 1:
+            st.warning(
+                "⚠️ **Доступна только 1 GPU!**\n\n"
+                "vLLM и training будут на одной GPU.\n"
+                "- Уменьшите **vLLM GPU Memory** до 30-40%\n"
+                "- Или пробросьте больше GPU в Docker (`--gpus all`)"
+            )
+        
+        # Определяем, на той же GPU или на отдельной
+        vllm_gpu_id = int(grpo_vllm_device.split(":")[1]) if grpo_vllm_device.startswith("cuda:") else 0
+        same_gpu = (vllm_gpu_id == training_gpu_id)
+        
+        if grpo_rollout_backend == "vllm" and same_gpu and num_gpus > 1:
+            st.warning(
+                f"⚠️ vLLM и training на одной GPU (cuda:{training_gpu_id})!\n"
+                f"Рекомендуется выбрать другую GPU для vLLM."
+            )
+        
+        # vLLM GPU memory utilization
+        # Если на отдельной GPU — можно больше, если на той же — меньше
+        default_memory = 40 if same_gpu else 85
+        max_memory = 60 if same_gpu else 95
+        
+        grpo_vllm_gpu_memory = st.slider(
+            "vLLM GPU Memory (%)",
+            min_value=10,
+            max_value=max_memory,
+            value=default_memory,
+            step=5,
+            help=(
+                "Сколько % GPU памяти выделить для vLLM.\n\n"
+                "Если vLLM на отдельной GPU — ставьте 70-90%.\n"
+                "Если на той же GPU что training — ставьте 30-50%."
+            ),
+            disabled=not (grpo_use_rollout_engine and grpo_rollout_backend == "vllm"),
         )
         grpo_rollout_sync_interval = st.slider(
             "Синхронизация весов (каждые N rollout-step)",
@@ -1531,8 +1706,13 @@ def render_grpo_sidebar_config():
         "grpo_clip_eps_low": clip_eps_low,
         "grpo_clip_eps_high": clip_eps_high,
         "grpo_dynamic_sampling": dynamic_sampling,
+        "grpo_max_refill_rounds": max_refill_rounds,
         "grpo_token_level_loss": token_level_loss,
         "grpo_min_lr_ratio": min_lr_ratio,
+
+        # Liger loss_type — автоматически из алгоритма
+        # Остальные Liger настройки берутся из distributed_config (Precision & Memory)
+        "grpo_liger_loss_type": grpo_liger_loss_type,
 
         # Rollout engine
         "grpo_use_rollout_engine": grpo_use_rollout_engine,
@@ -1540,6 +1720,8 @@ def render_grpo_sidebar_config():
         "grpo_rollout_sync_interval": grpo_rollout_sync_interval,
         "grpo_rollout_trainable_only": grpo_rollout_trainable_only,
         "grpo_rollout_offload_to_cpu": grpo_rollout_offload_to_cpu,
+        "grpo_vllm_gpu_memory": grpo_vllm_gpu_memory / 100.0,  # Конвертируем % в 0.0-1.0
+        "grpo_vllm_device": grpo_vllm_device,  # "main_gpu" или "cpu"
     }
 
 
@@ -3308,6 +3490,36 @@ def render_distributed_config(training_config: dict | None = None):
             "Для Home-моделей управляет использованием SDPA."
         ),
     )
+    
+    # Liger Kernel — оптимизированные Triton kernels для ускорения и экономии памяти
+    # Применяется ко ВСЕМ режимам: Pretrain, SFT, GRPO
+    default_liger = bool(training_config.get("use_liger", True)) if training_config else True
+    use_liger = st.sidebar.checkbox(
+        "🦁 Liger Kernel оптимизации",
+        value=default_liger,
+        help=(
+            "**Применяется ко ВСЕМ режимам** (Pretrain, SFT, GRPO).\n\n"
+            "Включает оптимизированные Triton-кернелы:\n"
+            "• RMSNorm, RoPE, MLP — патчинг модели\n"
+            "• 🔥 Fused Loss — НЕ материализует logits (до 80% экономии памяти!)\n\n"
+            "**Поддерживаемые модели**: Qwen, Llama, Mistral, Gemma, Phi."
+        ),
+    )
+    
+    # Fused Loss — НЕ материализует logits!
+    # Для Pretrain/SFT это Fused CE, для GRPO — Fused GRPO Loss (включается автоматически)
+    default_liger_fused_ce = bool(training_config.get("liger_fused_ce", True)) if training_config else True
+    liger_fused_ce = st.sidebar.checkbox(
+        "🔥 Fused Loss (экономия памяти)",
+        value=default_liger_fused_ce,
+        disabled=not use_liger,
+        help=(
+            "**Pretrain/SFT**: LigerFusedLinearCrossEntropyLoss\n"
+            "**GRPO**: LigerFusedLinearGRPOLoss (автоматически)\n\n"
+            "НЕ материализует полный logits тензор [batch, seq, vocab] — "
+            "экономия памяти до 80%! **Рекомендуется всегда включать.**"
+        ),
+    )
 
     # Пояснение про batch semantics (частая причина "почему так много VRAM в DDP")
     if training_config:
@@ -3335,6 +3547,8 @@ def render_distributed_config(training_config: dict | None = None):
         "fp16_pure": fp16_pure,
         "grad_checkpoint": grad_checkpoint,
         "use_flash_attention": flash_attention,
+        "use_liger": use_liger,
+        "liger_fused_ce": liger_fused_ce,
     }
 
 
@@ -5165,6 +5379,8 @@ def main():
     full_config["fp16_pure"] = distributed_config.get("fp16_pure", False)
     full_config["grad_checkpoint"] = distributed_config.get("grad_checkpoint", False)
     full_config["use_flash_attention"] = distributed_config.get("use_flash_attention", True)
+    full_config["use_liger"] = distributed_config.get("use_liger", True)
+    full_config["liger_fused_ce"] = distributed_config.get("liger_fused_ce", False)  # Fused CE для pretrain/SFT
     
     # Для SFT, Continual Pretrain и GRPO используем токенизатор базовой модели
     if model_config.get("stage") in ("sft", "continual_pretrain", "grpo") and model_config.get("base_model_path"):

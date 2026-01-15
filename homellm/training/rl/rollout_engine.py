@@ -14,8 +14,12 @@ autoregressive generation внутри sharded training engine может быт
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import select
+import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +29,8 @@ import torch
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 logger = logging.getLogger(__name__)
+
+
 
 
 def _is_zero3_model(model: Any, accelerator: Any) -> bool:
@@ -298,9 +304,266 @@ class HFRolloutEngine:
         return outputs
 
 
+class VLLMSubprocessEngine:
+    """
+    vLLM через subprocess.Popen — позволяет запускать на ОТДЕЛЬНОЙ GPU!
+    
+    Запускает vLLM в НАСТОЯЩЕМ отдельном процессе с CUDA_VISIBLE_DEVICES 
+    установленным ДО запуска Python интерпретатора.
+    
+    Коммуникация через stdin/stdout с JSON lines.
+    """
+    
+    def __init__(
+        self,
+        base_model_path: str,
+        torch_dtype: torch.dtype,
+        gpu_id: int = 0,
+        max_model_len: int = 4096,
+        gpu_memory_utilization: float = 0.85,
+        enable_lora: bool = True,
+        output_dir: Optional[str] = None,
+    ) -> None:
+        self.base_model_path = str(base_model_path)
+        self.torch_dtype = torch_dtype
+        self.gpu_id = int(gpu_id)
+        self.max_model_len = int(max_model_len)
+        self.gpu_memory_utilization = float(gpu_memory_utilization)
+        self.enable_lora = bool(enable_lora)
+        self.output_dir = output_dir
+        
+        self._process = None
+        self._lora_adapter_path: Optional[str] = None
+        self._sync_count = 0
+    
+    def ensure_loaded(self) -> None:
+        """Запускает subprocess с vLLM если ещё не запущен."""
+        if self._process is not None and self._process.poll() is None:
+            return
+        
+        logger.info(f"🧩 VLLMSubprocessEngine: запуск на физической GPU {self.gpu_id}")
+        logger.info(f"🧩 VLLMSubprocessEngine: model={self.base_model_path}, memory={self.gpu_memory_utilization:.0%}")
+        
+        # Путь к worker скрипту
+        worker_script = Path(__file__).parent / "vllm_worker.py"
+        if not worker_script.exists():
+            raise RuntimeError(f"vLLM worker script not found: {worker_script}")
+        
+        # Создаём environment с CUDA_VISIBLE_DEVICES
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        # Очищаем переменные которые могут мешать
+        env.pop("CUDA_DEVICE_ORDER", None)
+        
+        logger.info(f"🧩 VLLMSubprocessEngine: запуск с CUDA_VISIBLE_DEVICES={self.gpu_id}")
+        
+        # Запускаем subprocess
+        self._process = subprocess.Popen(
+            [sys.executable, str(worker_script)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,  # stderr идёт в консоль для отладки
+            env=env,
+            bufsize=1,  # line buffered
+            text=True,
+        )
+        logger.info(f"🧩 VLLMSubprocessEngine: subprocess started (PID={self._process.pid})")
+        
+        # Отправляем конфигурацию
+        dtype_str = "bfloat16" if self.torch_dtype == torch.bfloat16 else (
+            "float16" if self.torch_dtype == torch.float16 else "float32"
+        )
+        config = {
+            "model_path": self.base_model_path,
+            "dtype": dtype_str,
+            "max_model_len": self.max_model_len,
+            "gpu_memory_utilization": self.gpu_memory_utilization,
+            "enable_lora": self.enable_lora,
+        }
+        self._send(config)
+        
+        # Ждём готовности
+        logger.info(f"🧩 VLLMSubprocessEngine: ожидаем загрузку модели...")
+        try:
+            response = self._recv(timeout=300)  # 5 минут на загрузку
+            if response.get("status") == "error":
+                raise RuntimeError(f"vLLM worker failed: {response.get('error')}")
+            logger.info(f"🧩 VLLMSubprocessEngine: ✅ ready on physical GPU {self.gpu_id}")
+        except Exception as e:
+            logger.error(f"🧩 VLLMSubprocessEngine: failed to start: {e}")
+            self.shutdown()
+            raise RuntimeError(f"vLLM subprocess failed to start: {e}")
+    
+    def _send(self, data: dict) -> None:
+        """Отправляет JSON в subprocess."""
+        line = json.dumps(data) + "\n"
+        self._process.stdin.write(line)
+        self._process.stdin.flush()
+    
+    def _recv(self, timeout: float = 60) -> dict:
+        """Получает JSON из subprocess."""
+        # Ждём данные с таймаутом
+        ready, _, _ = select.select([self._process.stdout], [], [], timeout)
+        if not ready:
+            raise TimeoutError(f"vLLM worker timeout after {timeout}s")
+        
+        line = self._process.stdout.readline()
+        if not line:
+            raise RuntimeError("vLLM worker closed connection")
+        
+        return json.loads(line.strip())
+    
+    def shutdown(self) -> None:
+        """Останавливает subprocess."""
+        if self._process is not None:
+            try:
+                self._send({"cmd": "shutdown"})
+            except:
+                pass
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except:
+                self._process.kill()
+            self._process = None
+        logger.info("🧩 VLLMSubprocessEngine: shutdown")
+    
+    def __del__(self):
+        self.shutdown()
+    
+    def set_lora_adapter(self, *, lora_path: Optional[str], lora_name: Optional[str] = None, lora_int_id: int = 1) -> None:
+        """Устанавливает LoRA адаптер."""
+        self.ensure_loaded()
+        # ВАЖНО: передаём lora_int_id чтобы vLLM перезагрузил адаптер
+        self._send({
+            "cmd": "set_lora", 
+            "lora_path": lora_path,
+            "lora_name": lora_name or "rollout_lora",
+            "lora_int_id": int(lora_int_id),
+        })
+        response = self._recv(timeout=60)
+        if response.get("status") == "error":
+            raise RuntimeError(f"set_lora failed: {response.get('error')}")
+        self._lora_adapter_path = lora_path
+        logger.info(f"🧩 VLLMSubprocessEngine: LoRA set to {lora_path} (id={lora_int_id})")
+    
+    def make_sampling_params(
+        self,
+        *,
+        n: int,
+        temperature: float,
+        top_p: float,
+        max_tokens: int,
+        stop_token_ids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Создаёт параметры сэмплирования (как dict для subprocess)."""
+        params = {
+            "n": int(n),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "max_tokens": int(max_tokens),
+        }
+        if stop_token_ids is not None:
+            params["stop_token_ids"] = list(stop_token_ids)
+        return params
+    
+    def generate(
+        self,
+        prompts: List[str],
+        sampling_params: Any,
+    ) -> List[Any]:
+        """Генерирует completions через subprocess."""
+        self.ensure_loaded()
+        
+        # Конвертируем SamplingParams в dict
+        if isinstance(sampling_params, dict):
+            params_dict = sampling_params
+        elif hasattr(sampling_params, "__dict__"):
+            params_dict = {
+                "n": getattr(sampling_params, "n", 1),
+                "max_tokens": getattr(sampling_params, "max_tokens", 1024),
+                "temperature": getattr(sampling_params, "temperature", 0.7),
+                "top_p": getattr(sampling_params, "top_p", 0.9),
+                "stop_token_ids": getattr(sampling_params, "stop_token_ids", None),
+            }
+        else:
+            params_dict = {}
+        
+        self._send({
+            "cmd": "generate",
+            "prompts": prompts,
+            "sampling_params": params_dict,
+        })
+        
+        response = self._recv(timeout=600)  # 10 минут на генерацию
+        if response.get("status") == "error":
+            raise RuntimeError(f"generate failed: {response.get('error')}")
+        
+        # Конвертируем обратно в объекты похожие на vLLM outputs
+        outputs = response.get("outputs", [])
+        return [_VLLMOutput(o) for o in outputs]
+    
+    def sync_weights(
+        self,
+        training_model: PreTrainedModel,
+        accelerator: Any,
+        trainable_only: bool = True,
+    ) -> Optional[RolloutSyncStats]:
+        """Синхронизирует веса — сохраняем LoRA и обновляем в subprocess."""
+        is_peft = getattr(training_model, "peft_type", None) is not None or hasattr(training_model, "get_base_model")
+        
+        if not trainable_only or not is_peft:
+            logger.warning("⚠️ VLLMSubprocessEngine поддерживает только LoRA sync")
+            return None
+        
+        self.ensure_loaded()
+        
+        # Сохраняем LoRA адаптер
+        if self.output_dir:
+            adapter_dir = Path(self.output_dir) / "rollout_engine" / "vllm_adapters" / f"step_{self._sync_count}"
+        else:
+            adapter_dir = Path(tempfile.mkdtemp()) / f"vllm_lora_{self._sync_count}"
+        
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            training_model.save_pretrained(str(adapter_dir), safe_serialization=True)
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения LoRA: {e}")
+            return None
+        
+        self.set_lora_adapter(lora_path=str(adapter_dir))
+        self._sync_count += 1
+        
+        return RolloutSyncStats(
+            time_sync=0.0,
+            time_save=0.0,
+            params_synced=0,
+            bytes_synced=0,
+        )
+
+
+class _VLLMOutput:
+    """Простой wrapper для результатов генерации из subprocess."""
+    def __init__(self, data: dict):
+        self.prompt = data.get("prompt", "")
+        self.outputs = [_VLLMCompletionOutput(o) for o in data.get("outputs", [])]
+
+
+class _VLLMCompletionOutput:
+    """Wrapper для одного completion."""
+    def __init__(self, data: dict):
+        self.text = data.get("text", "")
+        self.token_ids = data.get("token_ids", [])
+        self.finish_reason = data.get("finish_reason", None)
+
+
 class VLLMRolloutEngine:
     """
-    vLLM rollout engine — высокопроизводительная генерация.
+    vLLM rollout engine — высокопроизводительная генерация (НА ТОЙ ЖЕ GPU).
+    
+    ВАЖНО: Этот класс работает только на той же GPU что training!
+    Для использования vLLM на ОТДЕЛЬНОЙ GPU используйте VLLMSubprocessEngine.
 
     vLLM оптимизирован для inference throughput (continuous batching, PagedAttention).
     
