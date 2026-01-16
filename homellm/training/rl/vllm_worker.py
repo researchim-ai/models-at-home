@@ -57,8 +57,10 @@ def main():
     max_model_len = config["max_model_len"]
     gpu_memory_utilization = config["gpu_memory_utilization"]
     enable_lora = config["enable_lora"]
+    max_lora_rank = config.get("max_lora_rank", 64)  # Дефолт 64, чтобы поддерживать rank до 64
     
     print(f"🧩 vLLM Worker: loading model {model_path}", flush=True)
+    print(f"🧩 vLLM Worker: enable_lora={enable_lora}, max_lora_rank={max_lora_rank}", flush=True)
     
     llm_kwargs = {
         "model": model_path,
@@ -72,6 +74,7 @@ def main():
     if enable_lora:
         llm_kwargs["enable_lora"] = True
         llm_kwargs["max_loras"] = 1
+        llm_kwargs["max_lora_rank"] = max_lora_rank  # КРИТИЧНО! Должен быть >= lora_r
     
     try:
         llm = LLM(**llm_kwargs)

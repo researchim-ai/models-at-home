@@ -489,6 +489,9 @@ class GRPOTrainer:
             # max_model_len: prompt + response
             max_len = int(getattr(self.config, "max_prompt_length", 512)) + int(getattr(self.config, "max_new_tokens", 1024))
             
+            # Получаем lora_r для vLLM max_lora_rank
+            lora_rank_for_vllm = self.config.lora_r if self.config.use_lora else 16
+            
             if same_gpu:
                 # На той же GPU — используем VLLMRolloutEngine напрямую
                 if vllm_gpu_util > 0.5:
@@ -506,6 +509,7 @@ class GRPOTrainer:
                     tensor_parallel_size=1,
                     max_model_len=max_len,
                     gpu_memory_utilization=vllm_gpu_util,
+                    max_lora_rank=lora_rank_for_vllm,  # Для vLLM max_lora_rank!
                 )
                 self.rollout_engine.ensure_loaded()
             else:
@@ -523,6 +527,7 @@ class GRPOTrainer:
                     max_model_len=max_len,
                     gpu_memory_utilization=vllm_gpu_util,
                     enable_lora=True,
+                    max_lora_rank=lora_rank_for_vllm,  # Для vLLM max_lora_rank!
                     output_dir=getattr(self.config, "output_dir", None),
                 )
                 self.rollout_engine.ensure_loaded()
@@ -1290,6 +1295,10 @@ class GRPOTrainer:
             logger.info(f"  - alpha: {lora_alpha}")
             logger.info(f"  - dropout: {lora_dropout}")
             logger.info(f"  - target_modules: {target_modules}")
+            
+            # Это включает градиенты для входных эмбеддингов, без чего градиенты не протекают через LoRA!
+            logger.info("🔧 Включение градиентов для входов модели (enable_input_require_grads)...")
+            self.model.enable_input_require_grads()
             
             lora_config = LoraConfig(
                 r=lora_r,
@@ -2228,6 +2237,28 @@ class GRPOTrainer:
                                 self.model.parameters(),
                                 self.config.max_grad_norm,
                             )
+                        
+                        # DEBUG: проверяем градиенты LoRA до optimizer.step()
+                        if self.is_main_process and self.config.use_lora:
+                            lora_grads = []
+                            lora_total_numel = 0
+                            for name, p in self.model.named_parameters():
+                                if p.grad is not None and 'lora' in name.lower():
+                                    grad_norm_p = p.grad.norm().item()
+                                    lora_grads.append((name, grad_norm_p, p.numel()))
+                                    lora_total_numel += p.numel()
+                            
+                            if lora_grads:
+                                avg_lora_grad = sum(g for _, g, _ in lora_grads) / len(lora_grads)
+                                max_lora_grad = max(g for _, g, _ in lora_grads)
+                                # Показываем: матриц, общее число параметров, avg/max grad norm
+                                logger.info(
+                                    f"🔍 LoRA grads: {len(lora_grads)} matrices, "
+                                    f"{lora_total_numel:,} params, "
+                                    f"avg={avg_lora_grad:.6f}, max={max_lora_grad:.6f}"
+                                )
+                            else:
+                                logger.warning(f"⚠️ Нет градиентов для LoRA параметров!")
                         
                         self.optimizer.step()
                         self.scheduler.step()

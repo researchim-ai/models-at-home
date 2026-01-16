@@ -1385,9 +1385,9 @@ def render_grpo_sidebar_config():
     grpo_learning_rate = st.sidebar.select_slider(
         "Learning Rate (GRPO)",
         options=[1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 1e-5, 3e-5, 5e-5, 1e-4],
-        value=1e-5,
+        value=5e-5,
         format_func=lambda x: f"{x:.0e}",
-        help="""**Для LoRA:** рекомендуется **3e-5** (выше чем full fine-tuning).
+        help="""**Для LoRA:** рекомендуется **5e-5** — сразу начинает учиться.
 **Для full fine-tuning:** 1e-6 — 5e-6.
 Слишком низкий LR с LoRA = медленная сходимость!"""
     )
@@ -1440,8 +1440,13 @@ def render_grpo_sidebar_config():
         min_value=0.0,
         max_value=0.1,
         value=0.0,
-        step=0.01,
-        help="Вес KL-штрафа. Для reasoning обычно 0"
+        step=0.001,
+        format="%.3f",
+        help="""**KL penalty** ограничивает отклонение от исходной политики.
+
+- **0.0** — без KL (обычно для full fine-tuning)
+- **0.001** — стандартное значение (если нестабильно)
+- **0.01+** — сильный constraint"""
     )
     
     # Клиппинг и продвинутые параметры
@@ -1787,23 +1792,14 @@ def render_grpo_main_config(data_path: str = None):
         st.warning("⚠️ Выберите датасет или скачайте его на вкладке **💾 Данные** → 🧠 Reasoning")
     
     # Настройки датасета
-    col1, col2 = st.columns(2)
-    with col1:
-        grpo_max_samples = st.number_input(
-            "Макс. примеров (0 = все)",
-            min_value=0,
-            max_value=50000,
-            value=0,
-            step=100,
-            help="Ограничить количество примеров для обучения"
-        )
-    with col2:
-        grpo_dataset_language = st.selectbox(
-            "Язык датасета",
-            ["en", "ru"],
-            index=1 if grpo_dataset_language == "ru" else 0,
-            format_func=lambda x: "🇬🇧 English" if x == "en" else "🇷🇺 Русский",
-        )
+    grpo_max_samples = st.number_input(
+        "Макс. примеров (0 = все)",
+        min_value=0,
+        max_value=50000,
+        value=0,
+        step=100,
+        help="Ограничить количество примеров для обучения"
+    )
     
     st.markdown("---")
 
@@ -4266,8 +4262,12 @@ def download_hf_dataset(repo_id, subset, split, limit_type, limit_val, limit_byt
         return False
 
 
-def render_data_manager():
-    """Вкладка управления данными."""
+def render_data_manager(stage: str = "pretrain"):
+    """Вкладка управления данными.
+    
+    Args:
+        stage: Текущий режим ('pretrain', 'sft', 'grpo', 'continual_pretrain')
+    """
     st.header("💾 Управление данными")
     
     col_upload, col_list = st.columns([1, 2])
@@ -4293,25 +4293,68 @@ def render_data_manager():
 
         # Секция 2: Загрузка с HuggingFace
         st.subheader("🤗 Скачать с HuggingFace")
-        # Словарь пресетов: {название: (repo_id, subset, split)}
-        presets = {
-            # Pretrain датасеты
-            "🟢 Pretrain: FineWeb-2 (Russian)": ("HuggingFaceFW/fineweb-2", "rus_Cyrl", "train"),
-            "🟢 Pretrain: FineWeb-Edu (Educational)": ("HuggingFaceFW/fineweb-edu", "default", "train"),
-            "🟢 Pretrain: Wikitext-103": ("wikitext", "wikitext-103-v1", "train"),
-            # SFT датасеты
-            "🔵 SFT: OpenOrca-ru": ("d0rj/OpenOrca-ru", "default", "train"),
-            "🔵 SFT: ru-instruct": ("d0rj/ru-instruct", "default", "train"),
-            "🔵 SFT: GrandMaster-PRO-MAX": ("Vikhrmodels/GrandMaster-PRO-MAX", "default", "train"),
-            # Reasoning датасеты (для GRPO)
-            "🧠 Reasoning: GSM8K (English)": ("gsm8k", "main", "train"),
-            "🧠 Reasoning: GSM8K-RU (Русский)": ("d0rj/gsm8k-ru", "default", "train"),
-            "🧠 Reasoning: MATH-RU (олимпиады)": ("d0rj/competition_math_ru", "default", "train"),
-            "🧠 Reasoning: MGSM (многоязычный)": ("juletxara/mgsm", "ru", "train"),
-            "🧠 Reasoning: ARC-Challenge": ("allenai/ai2_arc", "ARC-Challenge", "train"),
-            # Ручной ввод
-            "📝 Ввести вручную...": (None, None, None),
-        }
+        
+        # Разные пресеты для разных режимов
+        if stage == "grpo":
+            # GRPO — Reasoning датасеты
+            presets = {
+                # English
+                "🧠 GSM8K (math, EN)": ("gsm8k", "main", "train"),
+                "🧠 MATH (competition, EN)": ("lighteval/MATH", "default", "train"),
+                "🧠 ARC-Challenge (EN)": ("allenai/ai2_arc", "ARC-Challenge", "train"),
+                "🧠 CommonsenseQA (EN)": ("tau/commonsense_qa", "default", "train"),
+                "🧠 HellaSwag (EN)": ("Rowan/hellaswag", "default", "train"),
+                "🧠 TriviaQA (EN)": ("trivia_qa", "rc", "train"),
+                "🧠 PIQA (EN)": ("piqa", "default", "train"),
+                "🧠 WinoGrande (EN)": ("winogrande", "winogrande_xl", "train"),
+                # Russian
+                "🧠 GSM8K-RU (math, RU)": ("d0rj/gsm8k-ru", "default", "train"),
+                "🧠 MATH-RU (олимпиады, RU)": ("d0rj/competition_math_ru", "default", "train"),
+                "🧠 MGSM-RU (multilingual)": ("juletxara/mgsm", "ru", "train"),
+                "🧠 OpenBookQA-RU": ("malakhovks/openbookqa_ru", "default", "train"),
+                "🧠 RuMedBench (medical, RU)": ("d0rj/rumedbench", "default", "train"),
+                # Ручной ввод
+                "📝 Ввести вручную...": (None, None, None),
+            }
+            st.caption("🧠 **Reasoning датасеты** для GRPO тренировки")
+        elif stage == "sft":
+            # SFT — Instruction-following датасеты
+            presets = {
+                # Russian
+                "🔵 OpenOrca-ru": ("d0rj/OpenOrca-ru", "default", "train"),
+                "🔵 ru-instruct": ("d0rj/ru-instruct", "default", "train"),
+                "🔵 GrandMaster-PRO-MAX": ("Vikhrmodels/GrandMaster-PRO-MAX", "default", "train"),
+                "🔵 Alpaca-GPT4-ru": ("IlyaGusev/ru_turbo_alpaca", "default", "train"),
+                "🔵 Saiga-ru (Vikhr)": ("Vikhrmodels/Saiga-2-7b", "default", "train"),
+                # English
+                "🔵 OpenOrca (EN)": ("Open-Orca/OpenOrca", "default", "train"),
+                "🔵 Alpaca-GPT4 (EN)": ("vicgalle/alpaca-gpt4", "default", "train"),
+                "🔵 ShareGPT (EN)": ("anon8231489123/ShareGPT_Vicuna_unfiltered", "default", "train"),
+                "🔵 Dolly-15k (EN)": ("databricks/databricks-dolly-15k", "default", "train"),
+                "🔵 FLAN (EN)": ("Muennighoff/flan", "default", "train"),
+                # Ручной ввод
+                "📝 Ввести вручную...": (None, None, None),
+            }
+            st.caption("🔵 **Instruction-following датасеты** для SFT тренировки")
+        else:
+            # Pretrain / Continual Pretrain — Large text corpora
+            presets = {
+                # Russian
+                "🟢 FineWeb-2 (Russian)": ("HuggingFaceFW/fineweb-2", "rus_Cyrl", "train"),
+                "🟢 MC4-ru (Russian web)": ("mc4", "ru", "train"),
+                "🟢 Wikipedia-ru": ("graelo/wikipedia", "20230601.ru", "train"),
+                "🟢 Taiga Corpus (RU)": ("IlyaGusev/taiga_ru", "default", "train"),
+                # English
+                "🟢 FineWeb-Edu (Educational)": ("HuggingFaceFW/fineweb-edu", "default", "train"),
+                "🟢 Wikitext-103": ("wikitext", "wikitext-103-v1", "train"),
+                "🟢 The Pile (subset)": ("EleutherAI/pile", "default", "train"),
+                "🟢 C4 (EN)": ("allenai/c4", "en", "train"),
+                "🟢 RedPajama-v2": ("togethercomputer/RedPajama-Data-V2", "default", "train"),
+                "🟢 SlimPajama": ("cerebras/SlimPajama-627B", "default", "train"),
+                # Ручной ввод
+                "📝 Ввести вручную...": (None, None, None),
+            }
+            st.caption("🟢 **Text corpora** для Pretrain / Continual Pretrain")
         
         # Инициализация дефолтных значений (FineWeb-2 Russian)
         if "hf_repo_id_input" not in st.session_state:
@@ -5695,7 +5738,7 @@ def main():
             st.info("Нет предыдущих запусков")
             
     with tab5:
-        render_data_manager()
+        render_data_manager(stage=current_stage)
         
         # Подсказка про чат
         st.markdown("---")

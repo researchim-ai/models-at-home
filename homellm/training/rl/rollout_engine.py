@@ -322,6 +322,7 @@ class VLLMSubprocessEngine:
         max_model_len: int = 4096,
         gpu_memory_utilization: float = 0.85,
         enable_lora: bool = True,
+        max_lora_rank: int = 64,  # vLLM max_lora_rank - должен быть >= lora_r
         output_dir: Optional[str] = None,
     ) -> None:
         self.base_model_path = str(base_model_path)
@@ -330,6 +331,7 @@ class VLLMSubprocessEngine:
         self.max_model_len = int(max_model_len)
         self.gpu_memory_utilization = float(gpu_memory_utilization)
         self.enable_lora = bool(enable_lora)
+        self.max_lora_rank = int(max_lora_rank)
         self.output_dir = output_dir
         
         self._process = None
@@ -379,6 +381,7 @@ class VLLMSubprocessEngine:
             "max_model_len": self.max_model_len,
             "gpu_memory_utilization": self.gpu_memory_utilization,
             "enable_lora": self.enable_lora,
+            "max_lora_rank": self.max_lora_rank,
         }
         self._send(config)
         
@@ -591,6 +594,7 @@ class VLLMRolloutEngine:
         max_model_len: int = 4096,
         gpu_memory_utilization: float = 0.90,
         enable_lora: bool = True,
+        max_lora_rank: int = 64,  # vLLM max_lora_rank - должен быть >= lora_r
         output_dir: Optional[str] = None,
     ) -> None:
         self.base_model_path = str(base_model_path)
@@ -600,6 +604,7 @@ class VLLMRolloutEngine:
         self.max_model_len = int(max_model_len)
         self.gpu_memory_utilization = float(gpu_memory_utilization)
         self.enable_lora = bool(enable_lora)
+        self.max_lora_rank = int(max_lora_rank)
         self.output_dir = output_dir
 
         self.llm = None
@@ -652,8 +657,9 @@ class VLLMRolloutEngine:
         }
         if self.enable_lora:
             llm_kwargs["enable_lora"] = True
-            # vLLM требует max_loras если enable_lora=True
+            # vLLM требует max_loras и max_lora_rank если enable_lora=True
             llm_kwargs["max_loras"] = 1
+            llm_kwargs["max_lora_rank"] = self.max_lora_rank
         
         self.llm = LLM(**llm_kwargs)
         logger.info("🧩 RolloutEngine(vLLM): model loaded")
