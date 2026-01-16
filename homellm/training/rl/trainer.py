@@ -258,9 +258,10 @@ class GRPOTrainer:
                     logger.error(f"🧩 ERROR: adapter_config.json not found after save_pretrained!")
 
                 adapter_path = str(adapter_dir)
-                adapter_name = f"rollout_lora_step_{int(self.rollout_step)}"
-                # ВАЖНО: используем уникальный id для каждого шага чтобы vLLM перезагрузил адаптер
-                adapter_int_id = int(self.rollout_step) + 1
+                adapter_name = "rollout_lora"
+                # ВАЖНО: используем ФИКСИРОВАННЫЙ id=1 чтобы vLLM перезаписывал адаптер
+                # Уникальные id накапливаются в памяти vLLM и вызывают CUDA OOM
+                adapter_int_id = 1
 
             if is_dist:
                 obj_list = [(adapter_path, adapter_name, adapter_int_id)]
@@ -583,9 +584,21 @@ class GRPOTrainer:
                 logger.info(f"  - mixed_precision (UI): {mixed_precision}")
                 logger.info(f"  - mixed_precision (accelerate): {accel_mp}")
                 
+                # Проверяем нужен ли find_unused_parameters для DDP
+                # lm_head/embed_tokens связаны через tie_word_embeddings и могут не получать градиенты
+                target_modules = getattr(self.config, "lora_target_modules", None) or []
+                needs_find_unused = any(m in target_modules for m in ["lm_head", "embed_tokens"])
+                
+                ddp_kwargs = None
+                if needs_find_unused:
+                    from accelerate import DistributedDataParallelKwargs
+                    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+                    logger.info(f"  - find_unused_parameters: True (lm_head/embed_tokens в target_modules)")
+                
                 self.accelerator = Accelerator(
                     gradient_accumulation_steps=self.config.gradient_accumulation_steps,
                     mixed_precision=accel_mp,
+                    kwargs_handlers=[ddp_kwargs] if ddp_kwargs else None,
                 )
                 
                 # Устройство берем из accelerator (поддерживает multi-GPU)

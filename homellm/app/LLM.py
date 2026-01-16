@@ -1384,10 +1384,12 @@ def render_grpo_sidebar_config():
     # Обучение
     grpo_learning_rate = st.sidebar.select_slider(
         "Learning Rate (GRPO)",
-        options=[1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5],
-        value=5e-6,
+        options=[1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 1e-5, 3e-5, 5e-5, 1e-4],
+        value=1e-5,
         format_func=lambda x: f"{x:.0e}",
-        help="Для RL обычно требуется меньший LR чем для SFT"
+        help="""**Для LoRA:** рекомендуется **3e-5** (выше чем full fine-tuning).
+**Для full fine-tuning:** 1e-6 — 5e-6.
+Слишком низкий LR с LoRA = медленная сходимость!"""
     )
     
     train_batch_size = st.sidebar.slider(
@@ -2973,17 +2975,70 @@ def render_model_config():
     
     if tuning_method in ("lora", "qlora"):
         st.sidebar.markdown("**LoRA параметры:**")
-        lora_r = st.sidebar.slider("LoRA r", min_value=4, max_value=128, value=16, step=4)
-        lora_alpha = st.sidebar.slider("LoRA alpha", min_value=4, max_value=256, value=32, step=4)
-        lora_dropout = st.sidebar.slider("LoRA dropout", min_value=0.0, max_value=0.5, value=0.1, step=0.05)
-        
-        lora_target_modules_input = st.sidebar.text_input(
-            "Target modules (опционально)",
-            placeholder="q_proj,k_proj,v_proj,o_proj",
-            help="Модули для LoRA (через запятую). Если пусто - автодетект"
+        lora_r = st.sidebar.slider(
+            "LoRA r (rank)", 
+            min_value=8, max_value=128, value=32, step=8,
+            help="Ранг LoRA матриц. **Рекомендуется ≥32** для хорошей сходимости. "
+                 "При rank=32 для 0.5B-3B моделей сходимость почти как full fine-tuning."
         )
-        if lora_target_modules_input:
-            lora_target_modules = [m.strip() for m in lora_target_modules_input.split(",")]
+        lora_alpha = st.sidebar.slider(
+            "LoRA alpha", 
+            min_value=8, max_value=256, value=32, step=8,
+            help="Scaling factor. Обычно = lora_r или 2×lora_r"
+        )
+        lora_dropout = st.sidebar.slider("LoRA dropout", min_value=0.0, max_value=0.5, value=0.05, step=0.05)
+        
+        # Стандартные target_modules для LLaMA/Qwen/Mistral-подобных архитектур
+        LORA_TARGET_MODULES = [
+            "q_proj",      # Query projection (Attention)
+            "k_proj",      # Key projection (Attention)
+            "v_proj",      # Value projection (Attention)
+            "o_proj",      # Output projection (Attention)
+            "gate_proj",   # Gate projection (MLP/SwiGLU)
+            "up_proj",     # Up projection (MLP)
+            "down_proj",   # Down projection (MLP)
+            "lm_head",     # Output head (logits) — ОГРОМНЫЙ!
+            "embed_tokens", # Input embeddings — ОГРОМНЫЙ!
+        ]
+        
+        # Дефолт: all-linear (attention + MLP) — как рекомендует verl
+        # Это даёт сходимость почти как full fine-tuning
+        default_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        
+        lora_target_modules = st.sidebar.multiselect(
+            "🎯 Target modules",
+            options=LORA_TARGET_MODULES,
+            default=default_modules,
+            help="""**Какие слои модели обучать через LoRA:**
+
+**Attention:**
+• `q_proj` — Query projection  
+• `k_proj` — Key projection  
+• `v_proj` — Value projection  
+• `o_proj` — Output projection  
+
+**MLP/FFN:**
+• `gate_proj` — Gate (SwiGLU)
+• `up_proj` — Up projection
+• `down_proj` — Down projection
+
+**Output/Input (⚠️ осторожно!):**
+• `lm_head` — Output head. **ОГРОМНЫЙ!**
+• `embed_tokens` — Input embeddings. **ОГРОМНЫЙ!**
+
+💡 **Рекомендации (из verl):**
+- **all-linear** (все 7 слоёв) — сходимость ≈ full fine-tuning!
+- Только attention (4 слоя) — быстрее, но хуже качество
+- rank≥32 + all-linear = оптимальный баланс
+
+⚠️ **lm_head/embed_tokens:**
+- Только для адаптации к новому домену/языку
+- Медленнее в Multi-GPU (find_unused_parameters)"""
+        )
+        
+        # Если ничего не выбрано — автодетект
+        if not lora_target_modules:
+            lora_target_modules = None
     
     # Сборка конфига
     config = {

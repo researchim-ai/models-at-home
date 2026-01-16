@@ -161,8 +161,9 @@ class GRPOConfig:
     rollout_engine_backend: Literal["hf", "vllm"] = "hf"
 
     # Как часто синхронизировать веса training->rollout (в единицах rollout_step).
-    # 1 = каждый rollout-step (самое on-policy), 2-10 = быстрее (меньше overhead), но слегка "stale".
-    rollout_sync_interval: int = 1
+    # 1 = каждый rollout-step (самое on-policy), 10+ = быстрее (меньше overhead), но слегка "stale".
+    # ВАЖНО: слишком частый sync (=1) может вызывать OOM/CUDA errors в vLLM из-за накопления адаптеров.
+    rollout_sync_interval: int = 10
 
     # Если True — синхронизируем только trainable параметры (например LoRA), а не весь base model.
     # Это критично для ZeRO-3/FSDP, т.к. полный state_dict дорогой.
