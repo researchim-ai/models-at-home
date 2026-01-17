@@ -277,6 +277,63 @@ def main():
         logger.info("Загрузка конфигурации из JSON...")
         ui_config = json.loads(args.config_json)
         
+        # === Unsloth Backend ===
+        training_backend = ui_config.get("training_backend", "models-at-home")
+        if training_backend == "unsloth":
+            logger.info("🦥 Using Unsloth backend for GRPO training")
+            try:
+                from homellm.training.unsloth_grpo import run_unsloth_grpo, is_unsloth_available
+                
+                if is_unsloth_available():
+                    # Создаём простой metrics logger
+                    from pathlib import Path
+                    from datetime import datetime
+                    import time
+                    
+                    ui_run_dir = ui_config.get("ui_run_dir")
+                    if ui_run_dir:
+                        metrics_path = Path(ui_run_dir) / "metrics.json"
+                    else:
+                        metrics_path = Path(ui_config.get("output_dir", "out/grpo")) / "metrics.json"
+                    
+                    class SimpleMetricsLogger:
+                        def __init__(self, path):
+                            self.path = Path(path)
+                            self.metrics = {"status": "initializing", "start_time": datetime.now().isoformat()}
+                            self._save()
+                        
+                        def _save(self):
+                            self.path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(self.path, "w") as f:
+                                json.dump(self.metrics, f, indent=2)
+                        
+                        def update(self, **kwargs):
+                            self.metrics.update(kwargs)
+                            self._save()
+                        
+                        def log_step(self, step, loss, lr, samples_per_sec=0):
+                            self.metrics["current_step"] = step
+                            self.metrics["current_loss"] = loss
+                            self.metrics["current_lr"] = lr
+                            if "loss_history" not in self.metrics:
+                                self.metrics["loss_history"] = []
+                            self.metrics["loss_history"].append(loss)
+                            self._save()
+                        
+                        def log_checkpoint(self, path):
+                            if "checkpoints" not in self.metrics:
+                                self.metrics["checkpoints"] = []
+                            self.metrics["checkpoints"].append({"path": path, "step": self.metrics.get("current_step", 0)})
+                            self._save()
+                    
+                    metrics_logger = SimpleMetricsLogger(metrics_path)
+                    run_unsloth_grpo(ui_config, metrics_logger)
+                    return  # Успешно завершено
+                else:
+                    logger.warning("⚠️ Unsloth not available, falling back to models-at-home backend")
+            except ImportError as e:
+                logger.warning(f"⚠️ Could not import unsloth_grpo: {e}. Falling back to models-at-home backend.")
+        
         # Извлекаем reward правила
         reward_rules = ui_config.get("grpo_reward_rules", [])
         if reward_rules:

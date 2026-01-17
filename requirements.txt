@@ -1,59 +1,82 @@
-# HomeLLM - зависимости для тренировки трансформеров дома
+# HomeLLM + Unsloth — совместимые версии
 # =========================================================
-# ВАЖНО: Версии зафиксированы для совместимости pre-built wheels!
-# torch 2.5.1 (PyPI, bundled CUDA 12.4) + flash-attn 2.8.3 + liger-kernel 0.6.4
+# Версии подобраны под Unsloth December-2025
 
-# PyTorch 2.5.1 (фиксировано для flash-attn pre-built wheel)
-# Устанавливается в Dockerfile из PyPI (bundled CUDA 12.4)
-torch>=2.5.0,<2.6.0
+# PyTorch (ставится в Dockerfile отдельно: torch==2.5.1)
 
-# Triton (нужен для Liger Kernel, обычно идёт с torch)
-triton>=2.3.0
+# Triton (для Liger и Unsloth)
+triton>=3.0.0
 
-# HuggingFace
-transformers>=4.40.0
-accelerate>=0.28.0
-datasets>=2.19.0
+# ============================================================
+# Core ML Stack (версии из Unsloth December-2025 pyproject.toml)
+# ============================================================
+# transformers: >=4.51.3, исключая баговые, <=4.57.3
+transformers==4.57.1
+
+# accelerate: trl 0.20+ требует >=1.4.0
+accelerate>=1.4.0
+
+# datasets: Unsloth требует ==4.3.0 (4.5.0 вызывает recursion errors)
+datasets==4.3.0
+
+# peft: Unsloth требует >=0.18.0
+peft>=0.18.0
+
+# trl: Unsloth требует >=0.18.2,!=0.19.0,<=0.24.0
+trl>=0.18.2,!=0.19.0,<=0.24.0
+
+# huggingface_hub
+huggingface_hub>=0.34.0
+hf_transfer
 safetensors>=0.4.0
 
-# Liger Kernel 0.6.4 — оптимизированные Triton kernels для LLM
-# ★ Чистый Python/Triton — ставится мгновенно!
-# ★ Экономит память (не материализует logits)
-# https://github.com/linkedin/Liger-Kernel
+# ============================================================
+# Unsloth — устанавливается отдельно в Dockerfile
+# ============================================================
+# (см. Dockerfile — ставится после основных пакетов)
+
+# Liger Kernel
 liger-kernel==0.6.4
 
-# FlashAttention2 ставится в Dockerfile из pre-built wheel
-# PEFT для LoRA/QLoRA
-peft>=0.10.0
-bitsandbytes>=0.43.0
+# bitsandbytes для QLoRA
+bitsandbytes>=0.45.0
 
-# DeepSpeed (для ZeRO optimizer)
+# ============================================================
+# Inference / Rollout
+# ============================================================
+# vLLM последняя стабильная
+vllm>=0.6.0
+
+# ============================================================
+# DeepSpeed (для ZeRO)
+# ============================================================
 deepspeed>=0.15.0
 ninja
 
-# Rollout / inference engine (ускорение GRPO)
-# vLLM даёт максимальный throughput на генерации (TP, paged-attn, batching).
-# Примечание: пакет тяжёлый и зависит от CUDA; если ставите без GPU — не устанавливайте.
-vllm>=0.7.3
-
+# ============================================================
 # Утилиты
+# ============================================================
 tqdm>=4.66.0
 numpy>=1.24.0
 pandas>=2.0.0
 psutil>=5.9.0
 pydantic>=2.0
 pyyaml>=6.0
+tyro
+sentencepiece>=0.2.0
+packaging
+protobuf
 
-# Визуальное приложение (Training Studio)
+# UI
 streamlit>=1.32.0
 plotly>=5.18.0
 graphviz>=0.20.1
 
-# Логирование и мониторинг
+# Логирование
 wandb>=0.17.0
 tensorboard>=2.16.0
 
 # RL
-gymnasium[classic_control]>=0.29.0
-imageio>=2.34.0
-imageio-ffmpeg>=0.5.1
+# gymnasium>=1.0.0
+# imageio>=2.34.0
+# imageio-ffmpeg>=0.5.1

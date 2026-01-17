@@ -240,9 +240,42 @@ class MetricsLogger:
 def run_training(config: Dict[str, Any], metrics_path: Path):
     """Запуск тренировки с записью метрик."""
     
+    # === Backend Selection ===
+    training_backend = config.get("training_backend", "models-at-home")
+    stage = config.get("stage", "pretrain")  # pretrain | continual_pretrain | sft | grpo
+    
+    # Unsloth backend для SFT
+    if training_backend == "unsloth" and stage == "sft":
+        logger.info("🦥 Using Unsloth backend for SFT training")
+        try:
+            from homellm.training.unsloth_sft import run_unsloth_sft, is_unsloth_available
+            
+            if not is_unsloth_available():
+                logger.warning("⚠️ Unsloth not available, falling back to models-at-home backend")
+            else:
+                # Создаём MetricsLogger
+                metrics = MetricsLogger(metrics_path, enabled=True)
+                metrics.update(
+                    status="initializing",
+                    backend="unsloth",
+                    stage=stage,
+                )
+                
+                try:
+                    run_unsloth_sft(config, metrics)
+                    return  # Успешно завершено через unsloth
+                except Exception as e:
+                    import traceback
+                    tb = traceback.format_exc()
+                    logger.error(f"🦥 Unsloth training failed: {e}\n{tb}")
+                    metrics.update(status="error", error=f"Unsloth error: {str(e)}\n\n{tb}")
+                    raise
+        except ImportError as e:
+            logger.warning(f"⚠️ Could not import unsloth_sft: {e}. Falling back to models-at-home backend.")
+    
+    # === models-at-home backend (default) ===
     # Mixed precision
     mixed_precision = config.get("mixed_precision", "no")
-    stage = config.get("stage", "pretrain") # pretrain | continual_pretrain | sft
     fp16_pure = bool(config.get("fp16_pure", False))
     use_flash_attention = bool(config.get("use_flash_attention", True))
     

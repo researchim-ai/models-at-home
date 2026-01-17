@@ -773,7 +773,11 @@ def stop_training():
 
 def start_grpo_training(config: dict) -> tuple[str, subprocess.Popen]:
     """Запустить GRPO обучение в фоне."""
+    training_backend = config.get("training_backend", "models-at-home")
     run_id = datetime.now().strftime("grpo_%Y%m%d_%H%M%S")
+    
+    # Логируем backend для отладки
+    logger.info(f"🧠 GRPO Training backend: {training_backend}")
     
     # Папки для сохранения
     experiment_root = Path(PROJECT_ROOT) / config.get("output_dir", "out/grpo")
@@ -3493,6 +3497,50 @@ def render_distributed_config(training_config: dict | None = None):
     # Compute / precision (нужно и для GRPO, потому что training_config для GRPO пустой)
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧠 Precision & Memory")
+    
+    # === Backend selector ===
+    # Выбор между нашим backend и Unsloth
+    backend_options = ["🏠 models-at-home", "🦥 Unsloth (2x faster)"]
+    default_backend = training_config.get("training_backend", "models-at-home") if training_config else "models-at-home"
+    default_idx = 1 if default_backend == "unsloth" else 0
+    
+    selected_backend_display = st.sidebar.radio(
+        "Training Backend",
+        backend_options,
+        index=default_idx,
+        help=(
+            "**🏠 models-at-home**: Наш backend с FlashAttention + Liger Kernels\n\n"
+            "**🦥 Unsloth**: Оптимизированный backend от Unsloth AI:\n"
+            "• 2x быстрее обучение\n"
+            "• До 70% меньше VRAM\n"
+            "• Triton ядра (RMSNorm, RoPE, MLP)\n"
+            "• Умный gradient checkpointing\n\n"
+            "⚠️ Unsloth пока не поддерживает multi-GPU"
+        ),
+    )
+    training_backend = "unsloth" if "Unsloth" in selected_backend_display else "models-at-home"
+    
+    # Показываем информацию о выбранном backend
+    if training_backend == "unsloth":
+        # Проверяем доступность Unsloth
+        try:
+            import unsloth
+            unsloth_available = True
+        except ImportError:
+            unsloth_available = False
+        
+        if unsloth_available:
+            st.sidebar.success("🦥 **Unsloth режим**: ускорение + экономия памяти")
+        else:
+            st.sidebar.error("🦥 **Unsloth не установлен!**")
+            st.sidebar.caption("Пересоберите Docker образ: `docker compose build`")
+        
+        if num_gpus > 1:
+            st.sidebar.warning("⚠️ Unsloth пока не поддерживает multi-GPU. Будет использована 1 GPU.")
+    else:
+        st.sidebar.info("🏠 **models-at-home режим**: FlashAttn + Liger")
+    
+    st.sidebar.markdown("---")
 
     # Если training_config передан (SFT/Pretrain) — берём дефолт из него, иначе bf16 (GRPO дефолт)
     default_mp = (training_config.get("mixed_precision") if training_config else None) or "bf16"
@@ -3528,49 +3576,64 @@ def render_distributed_config(training_config: dict | None = None):
         help="Экономит VRAM, но медленнее. Для GRPO (особенно full+длинные ответы) часто must-have.",
     )
 
-    # FlashAttention toggle (для всех стадий).
-    # - HF модели: attn_implementation=flash_attention_2 (требует flash_attn + fp16/bf16)
-    # - Home модели: SDPA (scaled_dot_product_attention) может использовать flash kernel автоматически при fp16/bf16
-    default_fa = bool(training_config.get("use_flash_attention", True)) if training_config else True
-    flash_attention = st.sidebar.checkbox(
-        "FlashAttention (ускорение attention)",
-        value=default_fa,
-        help=(
-            "Включает быстрый attention где возможно. "
-            "Для HF-моделей использует FlashAttention2 (если установлен flash-attn и включен fp16/bf16). "
-            "Для Home-моделей управляет использованием SDPA."
-        ),
-    )
-    
-    # Liger Kernel — оптимизированные Triton kernels для ускорения и экономии памяти
-    # Применяется ко ВСЕМ режимам: Pretrain, SFT, GRPO
-    default_liger = bool(training_config.get("use_liger", True)) if training_config else True
-    use_liger = st.sidebar.checkbox(
-        "🦁 Liger Kernel оптимизации",
-        value=default_liger,
-        help=(
-            "**Применяется ко ВСЕМ режимам** (Pretrain, SFT, GRPO).\n\n"
-            "Включает оптимизированные Triton-кернелы:\n"
-            "• RMSNorm, RoPE, MLP — патчинг модели\n"
-            "• 🔥 Fused Loss — НЕ материализует logits (до 80% экономии памяти!)\n\n"
-            "**Поддерживаемые модели**: Qwen, Llama, Mistral, Gemma, Phi."
-        ),
-    )
-    
-    # Fused Loss — НЕ материализует logits!
-    # Для Pretrain/SFT это Fused CE, для GRPO — Fused GRPO Loss (включается автоматически)
-    default_liger_fused_ce = bool(training_config.get("liger_fused_ce", True)) if training_config else True
-    liger_fused_ce = st.sidebar.checkbox(
-        "🔥 Fused Loss (экономия памяти)",
-        value=default_liger_fused_ce,
-        disabled=not use_liger,
-        help=(
-            "**Pretrain/SFT**: LigerFusedLinearCrossEntropyLoss\n"
-            "**GRPO**: LigerFusedLinearGRPOLoss (автоматически)\n\n"
-            "НЕ материализует полный logits тензор [batch, seq, vocab] — "
-            "экономия памяти до 80%! **Рекомендуется всегда включать.**"
-        ),
-    )
+    # === Backend-specific optimizations ===
+    # Показываем только для models-at-home backend
+    if training_backend == "models-at-home":
+        # FlashAttention toggle (для всех стадий).
+        # - HF модели: attn_implementation=flash_attention_2 (требует flash_attn + fp16/bf16)
+        # - Home модели: SDPA (scaled_dot_product_attention) может использовать flash kernel автоматически при fp16/bf16
+        default_fa = bool(training_config.get("use_flash_attention", True)) if training_config else True
+        flash_attention = st.sidebar.checkbox(
+            "FlashAttention (ускорение attention)",
+            value=default_fa,
+            help=(
+                "Включает быстрый attention где возможно. "
+                "Для HF-моделей использует FlashAttention2 (если установлен flash-attn и включен fp16/bf16). "
+                "Для Home-моделей управляет использованием SDPA."
+            ),
+        )
+        
+        # Liger Kernel — оптимизированные Triton kernels для ускорения и экономии памяти
+        # Применяется ко ВСЕМ режимам: Pretrain, SFT, GRPO
+        default_liger = bool(training_config.get("use_liger", True)) if training_config else True
+        use_liger = st.sidebar.checkbox(
+            "🦁 Liger Kernel оптимизации",
+            value=default_liger,
+            help=(
+                "**Применяется ко ВСЕМ режимам** (Pretrain, SFT, GRPO).\n\n"
+                "Включает оптимизированные Triton-кернелы:\n"
+                "• RMSNorm, RoPE, MLP — патчинг модели\n"
+                "• 🔥 Fused Loss — НЕ материализует logits (до 80% экономии памяти!)\n\n"
+                "**Поддерживаемые модели**: Qwen, Llama, Mistral, Gemma, Phi."
+            ),
+        )
+        
+        # Fused Loss — НЕ материализует logits!
+        # Для Pretrain/SFT это Fused CE, для GRPO — Fused GRPO Loss (включается автоматически)
+        default_liger_fused_ce = bool(training_config.get("liger_fused_ce", True)) if training_config else True
+        liger_fused_ce = st.sidebar.checkbox(
+            "🔥 Fused Loss (экономия памяти)",
+            value=default_liger_fused_ce,
+            disabled=not use_liger,
+            help=(
+                "**Pretrain/SFT**: LigerFusedLinearCrossEntropyLoss\n"
+                "**GRPO**: LigerFusedLinearGRPOLoss (автоматически)\n\n"
+                "НЕ материализует полный logits тензор [batch, seq, vocab] — "
+                "экономия памяти до 80%! **Рекомендуется всегда включать.**"
+            ),
+        )
+    else:
+        # Unsloth backend — эти настройки управляются Unsloth автоматически
+        flash_attention = True  # Unsloth включает свои оптимизации
+        use_liger = False  # Unsloth имеет свои Triton kernels
+        liger_fused_ce = False
+        
+        st.sidebar.caption(
+            "🦥 **Unsloth оптимизации включены автоматически:**\n"
+            "• Triton RMSNorm, RoPE, SwiGLU\n"
+            "• Smart Gradient Checkpointing\n"
+            "• Fused Cross-Entropy Loss"
+        )
 
     # Пояснение про batch semantics (частая причина "почему так много VRAM в DDP")
     if training_config:
@@ -3600,6 +3663,7 @@ def render_distributed_config(training_config: dict | None = None):
         "use_flash_attention": flash_attention,
         "use_liger": use_liger,
         "liger_fused_ce": liger_fused_ce,
+        "training_backend": training_backend,  # "models-at-home" или "unsloth"
     }
 
 
@@ -5479,6 +5543,7 @@ def main():
     full_config["use_flash_attention"] = distributed_config.get("use_flash_attention", True)
     full_config["use_liger"] = distributed_config.get("use_liger", True)
     full_config["liger_fused_ce"] = distributed_config.get("liger_fused_ce", False)  # Fused CE для pretrain/SFT
+    full_config["training_backend"] = distributed_config.get("training_backend", "models-at-home")  # "models-at-home" или "unsloth"
     
     # Для SFT, Continual Pretrain и GRPO используем токенизатор базовой модели
     if model_config.get("stage") in ("sft", "continual_pretrain", "grpo") and model_config.get("base_model_path"):

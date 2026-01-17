@@ -27,10 +27,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
  && rm -rf /var/lib/apt/lists/*
 
-# venv для зависимостей (удобно копировать в финальный образ)
+# Устанавливаем uv (быстрый pip, 10-100x быстрее)
+RUN pip install uv
+
+# venv для зависимостей через uv
 ENV VENV_PATH=/opt/venv
-RUN python3.10 -m venv ${VENV_PATH}
+RUN uv venv ${VENV_PATH} --python python3.10
 ENV PATH="${VENV_PATH}/bin:${PATH}"
+ENV VIRTUAL_ENV="${VENV_PATH}"
 
 WORKDIR /app
 
@@ -38,27 +42,32 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 
 # ============================================================
-# УСТАНОВКА ЗАВИСИМОСТЕЙ (ВСЁ ИЗ PRE-BUILT WHEELS!)
+# УСТАНОВКА ЗАВИСИМОСТЕЙ ЧЕРЕЗ UV с кэшированием между сборками
+# --mount=type=cache сохраняет скачанные пакеты на хосте
 # ============================================================
-# ВАЖНО: torch из PyPI (bundled CUDA 12.4) + flash-attn wheel
-# НЕ используем --index-url pytorch — он имеет несовместимый ABI!
 
 # 1. PyTorch 2.5.1 из PyPI (bundled CUDA 12.4, совместим с flash-attn wheels)
-RUN python -m pip install --upgrade pip setuptools wheel \
- && python -m pip install --no-cache-dir \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install \
     torch==2.5.1 \
     torchvision==0.20.1 \
     torchaudio==2.5.1
 
 # 2. Flash Attention 2.8.3 — PRE-BUILT WHEEL для torch 2.5 + cu12 + Python 3.10
-# ★ Устанавливается за секунды, без компиляции!
-RUN echo "Установка flash-attn 2.8.3 из pre-built wheel..." \
- && python -m pip install --no-cache-dir \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install \
     https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 
-# 3. Остальные зависимости (включая liger-kernel — чистый Python, мгновенная установка)
-RUN python -m pip install --no-cache-dir -r /app/requirements.txt \
- && python -m pip install --no-cache-dir deepspeed
+# 3. Установка остальных зависимостей через uv
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install -r /app/requirements.txt \
+ && uv pip install deepspeed
+
+# 4. Unsloth — ставим ПОСЛЕ основных пакетов с --no-deps
+# чтобы не перезаписывать уже установленные transformers/peft/trl
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-deps unsloth unsloth-zoo \
+ || echo "Warning: Unsloth installation failed, continuing without it"
 
 # Теперь код (ВАЖНО: .dockerignore должен исключать datasets/out/.runs и т.п.)
 COPY . /app
@@ -68,8 +77,8 @@ RUN if [ -d scripts ]; then \
       find scripts -type f -name "*.sh" -exec sed -i 's/\r$//' {} \; -exec chmod +x {} \;; \
     fi
 
-# Установим проект (можно оставить editable, но обычно достаточно обычной установки)
-RUN python -m pip install --no-cache-dir -e .
+# Установим проект через uv
+RUN uv pip install -e .
 
 ############################
 # 2) Runtime stage
