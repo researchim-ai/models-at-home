@@ -1399,10 +1399,10 @@ def render_grpo_sidebar_config():
     train_batch_size = st.sidebar.slider(
         "Train Batch Size",
         min_value=1,
-        max_value=16,
+        max_value=128,
         value=2,
         step=1,
-        help="Размер микро-батча при обучении на опыте. Уменьшите до 1-2, если возникает OOM (как в re-grpo)."
+        help="Размер микро-батча при обучении на опыте. Уменьшите до 1-2, если возникает OOM"
     )
 
     grpo_grad_accum = st.sidebar.slider(
@@ -1701,6 +1701,25 @@ def render_grpo_sidebar_config():
     # Все LoRA параметры (use_lora, lora_r, lora_alpha, lora_dropout, lora_target_modules)
     # и квантизация (use_4bit, use_8bit) будут взяты из model_config
     
+    # === Логирование сэмплов ===
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**📝 Логирование сэмплов**")
+    
+    grpo_log_completions = st.sidebar.checkbox(
+        "Показывать сгенерированные ответы",
+        value=True,
+        help="Выводить примеры сгенерированных ответов в консоль"
+    )
+    
+    grpo_completion_log_interval = st.sidebar.slider(
+        "Интервал логирования (шаги)",
+        min_value=1,
+        max_value=100,
+        value=10,
+        step=1,
+        help="Каждые N шагов показывать примеры генерации"
+    )
+    
     return {
         # GRPO параметры (обязательные)
         "grpo_algorithm": algorithm,
@@ -1733,6 +1752,10 @@ def render_grpo_sidebar_config():
         "grpo_rollout_offload_to_cpu": grpo_rollout_offload_to_cpu,
         "grpo_vllm_gpu_memory": grpo_vllm_gpu_memory / 100.0,  # Конвертируем % в 0.0-1.0
         "grpo_vllm_device": grpo_vllm_device,  # "main_gpu" или "cpu"
+        
+        # Логирование
+        "grpo_log_completions": grpo_log_completions,
+        "grpo_completion_log_interval": grpo_completion_log_interval,
     }
 
 
@@ -2518,11 +2541,12 @@ Total is 72.
     
     reasoning_format = st.selectbox(
         "Формат тегов",
-        ["deepseek", "simple", "russian"],
+        ["deepseek", "simple", "russian", "gsm8k"],
         format_func=lambda x: {
             "deepseek": "DeepSeek (<think>...</think>, <answer>...</answer>)",
             "simple": "Simple (<reasoning>...</reasoning>, <answer>...</answer>)",
             "russian": "Russian (на русском языке)",
+            "gsm8k": "GSM8K (#### <number>)",
         }[x],
     )
     
@@ -2550,10 +2574,86 @@ Total is 72.
 <answer>
 42
 </answer>""",
+        "gsm8k": """Let me solve this step by step.
+Step 1: First, I need to...
+Step 2: Then, I calculate...
+Therefore, the answer is 42.
+#### 42""",
     }
     
     with st.expander("📋 Пример формата ответа"):
         st.code(format_examples[reasoning_format], language=None)
+    
+    # =========================================================================
+    # System Prompt (редактируемый!)
+    # =========================================================================
+    st.markdown("---")
+    st.markdown("#### 💬 System Prompt")
+    st.caption("Системный промпт определяет как модель должна отвечать. Можете изменить по своему желанию.")
+    
+    # Дефолтные system prompts для каждого формата
+    default_system_prompts = {
+        "deepseek": """A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
+The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think>
+<answer> answer here </answer>""",
+        "simple": """Отвечай строго в формате:
+<reasoning>
+(Шаги решения)
+</reasoning>
+<answer>
+(Короткий итоговый ответ)
+</answer>""",
+        "russian": """Ты — умный помощник. Решай задачи пошагово.
+Сначала подробно рассуждай в теге <reasoning>...</reasoning>,
+затем дай краткий ответ в теге <answer>...</answer>.
+
+Пример:
+<reasoning>
+Дано: ...
+Нужно найти: ...
+Решение: ...
+</reasoning>
+<answer>
+42
+</answer>""",
+        "gsm8k": """You are a helpful assistant that solves math problems step by step.
+Show your reasoning process, then provide the final numerical answer after ####.
+
+Example format:
+Let me solve this step by step.
+Step 1: ...
+Step 2: ...
+Therefore, the answer is X.
+#### X""",
+    }
+    
+    # Получаем сохранённый system prompt или используем дефолт для текущего формата
+    saved_prompt_key = f"grpo_system_prompt_{reasoning_format}"
+    if saved_prompt_key not in st.session_state:
+        st.session_state[saved_prompt_key] = default_system_prompts[reasoning_format]
+    
+    # Кнопка сброса к дефолту
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        if st.button("🔄 Сбросить", key="reset_system_prompt", help="Вернуть дефолтный промпт"):
+            st.session_state[saved_prompt_key] = default_system_prompts[reasoning_format]
+            st.rerun()
+    
+    # Текстовое поле для редактирования system prompt
+    system_prompt = st.text_area(
+        "System Prompt",
+        value=st.session_state[saved_prompt_key],
+        height=200,
+        key=f"system_prompt_editor_{reasoning_format}",
+        help="Этот текст будет отправлен модели как системный промпт"
+    )
+    
+    # Сохраняем изменения
+    st.session_state[saved_prompt_key] = system_prompt
+    
+    # Показываем предупреждение если промпт сильно изменён
+    if system_prompt != default_system_prompts[reasoning_format]:
+        st.info("ℹ️ Используется кастомный System Prompt")
     
     # Собираем конфигурацию reward правил (новый универсальный формат)
     reward_rules = [
@@ -2579,6 +2679,7 @@ Total is 72.
         "grpo_max_samples": grpo_max_samples if grpo_max_samples > 0 else None,
         "grpo_reward_rules": reward_rules,
         "grpo_reasoning_format": reasoning_format,
+        "grpo_system_prompt": system_prompt,  # Кастомный system prompt из UI
     }
 
 

@@ -200,18 +200,54 @@ def run_unsloth_grpo(
     device_map = {"": f"cuda:{local_rank}"}
     logger.info(f"🦥 Device map: {device_map} (LOCAL_RANK={local_rank})")
     
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    # vLLM GPU utilization из UI config
+    gpu_memory_utilization = config.get("grpo_vllm_gpu_util", 0.4)
+    
+    # Параметры для FastLanguageModel.from_pretrained
+    load_kwargs = dict(
         model_name=base_model_path,
         max_seq_length=max_seq_length,
         dtype=dtype,
         load_in_4bit=load_in_4bit,
-        full_finetuning=full_finetuning,  # ← NEW: для full fine-tuning
-        trust_remote_code=True,
         device_map=device_map,
     )
     
+    # fast_inference=True включает vLLM для быстрой генерации (ВАЖНО для скорости!)
+    # НО: fast_inference НЕ совместим с trust_remote_code!
+    # НО: fast_inference требует LoRA, не работает с full_finetuning
+    # НО: fast_inference НЕ работает с multi-GPU (DDP) — каждый процесс пытается запустить vLLM!
+    
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_multi_gpu = world_size > 1
+    
+    if use_lora and not is_multi_gpu:
+        # Single GPU + LoRA: включаем fast_inference для скорости
+        load_kwargs["fast_inference"] = True  # Включаем vLLM!
+        load_kwargs["max_lora_rank"] = lora_r
+        load_kwargs["gpu_memory_utilization"] = gpu_memory_utilization
+        # НЕ добавляем trust_remote_code — несовместимо с fast_inference!
+        logger.info(f"🦥 Single GPU: Enabling fast_inference (vLLM) with max_lora_rank={lora_r}, gpu_util={gpu_memory_utilization}")
+    elif use_lora and is_multi_gpu:
+        # Multi-GPU + LoRA: fast_inference не поддерживается!
+        load_kwargs["trust_remote_code"] = True
+        logger.warning(f"⚠️ Multi-GPU ({world_size} GPUs): fast_inference disabled (not supported with DDP)")
+        logger.info("🦥 Multi-GPU LoRA mode: using standard inference (slower but works)")
+    else:
+        # Full fine-tuning: vLLM не поддерживается, но модель тренируется
+        load_kwargs["full_finetuning"] = full_finetuning
+        load_kwargs["trust_remote_code"] = True  # Только без fast_inference
+        logger.info("🦥 Full fine-tuning mode: fast_inference disabled (not supported)")
+    
+    model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+    
     # === Добавляем LoRA адаптеры ===
     if use_lora:
+        # Unsloth рекомендует lora_alpha = lora_r * 2 для ускорения обучения
+        # Если пользователь не задал alpha, используем r*2
+        if lora_alpha is None or lora_alpha == lora_r:
+            lora_alpha = lora_r * 2
+            logger.info(f"🦥 Using optimized lora_alpha = lora_r * 2 = {lora_alpha} (speeds up training)")
+        
         logger.info(f"🦥 Unsloth: Adding LoRA adapters (r={lora_r}, alpha={lora_alpha})")
         
         # Target modules из конфига или дефолтные для трансформеров
@@ -229,7 +265,7 @@ def run_unsloth_grpo(
             model,
             r=lora_r,
             lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
+            lora_dropout=lora_dropout,  # Unsloth требует 0 для оптимизаций
             target_modules=target_modules,
             bias="none",
             use_gradient_checkpointing="unsloth",  # Unsloth smart checkpointing
@@ -301,23 +337,96 @@ def run_unsloth_grpo(
     if "answer" in cols and answer_col not in cols:
         answer_col = "answer"
     
+    # ===== System prompt на основе reasoning_format (как в обычном бэкенде!) =====
+    reasoning_format = config.get("grpo_reasoning_format", "deepseek")
+    custom_system_prompt = config.get("grpo_system_prompt", None)
+    
+    # Формируем system prompt в зависимости от формата (как в rollout.py build_reasoning_prompt)
+    if custom_system_prompt:
+        # Если пользователь задал кастомный промпт в UI — используем его
+        system_prompt = custom_system_prompt
+    elif reasoning_format == "deepseek":
+        # Формат DeepSeek с <think> тегами
+        system_prompt = """A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
+The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think>
+<answer> answer here </answer>"""
+    elif reasoning_format == "simple":
+        # Простой формат с <reasoning> тегами
+        system_prompt = """Отвечай строго в формате:
+<reasoning>
+(Шаги решения)
+</reasoning>
+<answer>
+(Короткий итоговый ответ)
+</answer>"""
+    elif reasoning_format == "russian":
+        # Русский формат
+        system_prompt = """Ты — умный помощник. Решай задачи пошагово.
+Сначала подробно рассуждай в теге <reasoning>...</reasoning>,
+затем дай краткий ответ в теге <answer>...</answer>.
+
+Пример:
+<reasoning>
+Дано: ...
+Нужно найти: ...
+Решение: ...
+</reasoning>
+<answer>
+42
+</answer>"""
+    elif reasoning_format == "gsm8k":
+        # Формат GSM8K с ####
+        system_prompt = """You are a helpful assistant that solves math problems step by step.
+Show your reasoning process, then provide the final numerical answer after ####.
+
+Example format:
+Let me solve this step by step.
+Step 1: ...
+Step 2: ...
+Therefore, the answer is X.
+#### X"""
+    else:
+        # Fallback: используем дефолтный промпт для deepseek
+        system_prompt = """A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
+The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think>
+<answer> answer here </answer>"""
+    
+    logger.info(f"🦥 Reasoning format: {reasoning_format}")
+    logger.info(f"🦥 System prompt preview: {system_prompt[:100]}...")
+    
     def format_for_grpo(example):
-        """Форматирует пример для GRPO."""
+        """Форматирует пример для GRPO с chat messages (как в примере Unsloth)."""
         question = example.get(prompt_col, "")
-        answer = example.get(answer_col, "")
+        raw_answer = example.get(answer_col, "")
         
-        # Формируем промпт
-        prompt = f"Question: {question}\n\nLet's think step by step.\n\n"
+        # TRL ожидает prompt как список chat messages!
+        # Именно так работает в примере Unsloth qwen3_grpo.py
+        prompt = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ]
+        
+        # Для GSM8K извлекаем число после ####, для остальных датасетов берём as-is
+        if "####" in str(raw_answer):
+            answer = str(raw_answer).split("####")[-1].strip()
+        else:
+            answer = str(raw_answer).strip()
         
         return {
-            "prompt": prompt,
-            "ground_truth": answer,
+            "prompt": prompt,  # Chat messages!
+            "answer": answer,  # TRL передаёт это в reward_funcs как kwarg
         }
     
     dataset = dataset.map(format_for_grpo, remove_columns=dataset.column_names)
-    dataset = dataset.filter(lambda x: len(x.get("prompt", "")) > 0)
+    dataset = dataset.filter(lambda x: len(x.get("prompt", [])) > 0)
     
+    # DEBUG: Проверяем структуру датасета
     logger.info(f"🦥 Dataset prepared: {len(dataset)} examples")
+    logger.info(f"🦥 Dataset columns after formatting: {dataset.column_names}")
+    if len(dataset) > 0:
+        first_prompt = dataset[0]['prompt']
+        prompt_preview = first_prompt[-1]["content"][:80] if isinstance(first_prompt, list) else str(first_prompt)[:80]
+        logger.info(f"🦥 First example: prompt={prompt_preview}..., answer={dataset[0].get('answer', 'MISSING!')}")
     
     metrics_logger.update(
         status="training",
@@ -353,11 +462,11 @@ def run_unsloth_grpo(
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation,
         learning_rate=learning_rate,
-        weight_decay=config.get("weight_decay", 0.01),
+        weight_decay=config.get("weight_decay", 0.001),  # Как в примере Unsloth
         warmup_steps=config.get("warmup_steps", 50),
         warmup_ratio=config.get("warmup_ratio", 0.1),
-        lr_scheduler_type=config.get("lr_schedule", "cosine"),
-        logging_steps=config.get("log_every", 10),
+        lr_scheduler_type=config.get("lr_schedule", "linear"),  # linear как в примере Unsloth
+        logging_steps=config.get("log_every", 1),  # Чаще логируем для наглядности
         save_steps=config.get("save_every", 500),
         save_total_limit=3,
         bf16=mixed_precision == "bf16" and is_bfloat16_supported(),
@@ -371,6 +480,7 @@ def run_unsloth_grpo(
         num_generations=num_generations,
         temperature=temperature,
         beta=kl_weight,  # KL coefficient
+        
     )
     
     # Loss type: grpo, bnpo (для DAPO используется bnpo), dr_grpo
@@ -392,162 +502,259 @@ def run_unsloth_grpo(
         grpo_kwargs["epsilon_low"] = clip_eps
         grpo_kwargs["epsilon_high"] = config.get("grpo_clip_eps_high", clip_eps)
     
-    # max_completion_length (новый API trl) или max_new_tokens (старый API)
+    # max_prompt_length и max_completion_length (как в примере Unsloth)
+    # Важно: max_prompt_length + max_completion_length <= max_seq_length
+    max_prompt_length = max_seq_length // 2  # Половина для промпта
+    
+    if "max_prompt_length" in grpo_sig.parameters:
+        grpo_kwargs["max_prompt_length"] = max_prompt_length
+    
     if "max_completion_length" in grpo_sig.parameters:
-        grpo_kwargs["max_completion_length"] = max_new_tokens
+        grpo_kwargs["max_completion_length"] = min(max_new_tokens, max_seq_length - max_prompt_length)
     elif "max_new_tokens" in grpo_sig.parameters:
         grpo_kwargs["max_new_tokens"] = max_new_tokens
     
+    # vLLM SamplingParams (как в примере Unsloth qwen3_grpo.py)
+    if "vllm_sampling_params" in grpo_sig.parameters:
+        try:
+            from vllm import SamplingParams
+            vllm_sampling_params = SamplingParams(
+                min_p=0.1,
+                top_p=1.0,
+                top_k=-1,
+                seed=42,
+                stop=[tokenizer.eos_token] if tokenizer.eos_token else None,
+                include_stop_str_in_output=True,
+            )
+            grpo_kwargs["vllm_sampling_params"] = vllm_sampling_params
+            logger.info("🦥 Added vLLM SamplingParams to GRPOConfig")
+        except ImportError:
+            logger.debug("vLLM not available, skipping sampling params")
+    
     grpo_config = GRPOConfig(**grpo_kwargs)
     
-    # === Reward Function ===
+    # === Reward Function с логированием сэмплов ===
     # Получаем reward rules из конфига UI
     reward_rules = config.get("grpo_reward_rules", [])
     reasoning_format = config.get("grpo_reasoning_format", "reasoning_answer")
     
     import re
+    import json
+    
+    # === Хелпер для извлечения content из TRL completions ===
+    # TRL передаёт completions как список chat messages: [{"role": "assistant", "content": "..."}]
+    # А не как простые строки!
+    def _get_content(item) -> str:
+        """Извлекает текст из completion (может быть строка или chat message)."""
+        if isinstance(item, str):
+            return item
+        elif isinstance(item, list) and len(item) > 0:
+            # [{"role": "assistant", "content": "..."}]
+            if isinstance(item[0], dict) and "content" in item[0]:
+                return item[0]["content"]
+            elif isinstance(item[0], str):
+                return item[0]
+        elif isinstance(item, dict) and "content" in item:
+            return item["content"]
+        return str(item)
+    
+    def _get_question(prompt) -> str:
+        """Извлекает вопрос из prompt (может быть строка или chat messages).
+        
+        TRL передаёт prompts в формате chat messages:
+        [{"role": "system", "content": "..."}, {"role": "user", "content": "вопрос"}]
+        """
+        if isinstance(prompt, str):
+            return prompt
+        elif isinstance(prompt, list) and len(prompt) > 0:
+            # Ищем последний user message (как в примере Unsloth: prompts[0][-1]["content"])
+            for msg in reversed(prompt):
+                if isinstance(msg, dict):
+                    if msg.get("role") == "user" and "content" in msg:
+                        return msg["content"]
+            # Fallback: берём content последнего сообщения
+            if isinstance(prompt[-1], dict) and "content" in prompt[-1]:
+                return prompt[-1]["content"]
+        elif isinstance(prompt, dict) and "content" in prompt:
+            return prompt["content"]
+        return str(prompt)
+    
+    # Глобальные переменные для логирования (как в оригинальном Unsloth примере)
+    global UNSLOTH_PRINTED_TIMES
+    UNSLOTH_PRINTED_TIMES = 0
+    
+    # Интервал логирования
+    log_completions = config.get("grpo_log_completions", True)
+    completion_log_interval = config.get("grpo_completion_log_interval", 10)
+    
+    # UI run dir для samples.jsonl
+    ui_run_dir = config.get("ui_run_dir")
+    samples_file = output_dir / "samples.jsonl"
+    ui_samples_file = Path(ui_run_dir) / "samples.jsonl" if ui_run_dir else None
+    
+    def _save_sample_to_file(
+        step: int, 
+        prompt_messages: List,  # Chat messages формат
+        completion: str, 
+        reward: float, 
+        reference_answer: str = "", 
+        extracted: str = "",
+        all_completions: Optional[List[str]] = None,
+        all_rewards: Optional[List[float]] = None,
+    ):
+        """Сохраняет сэмпл в samples.jsonl для UI (как в обычном бэкенде)."""
+        try:
+            # Форматируем промпт для отображения
+            if isinstance(prompt_messages, list):
+                # Применяем chat template для красивого отображения
+                try:
+                    formatted_prompt = tokenizer.apply_chat_template(
+                        prompt_messages, 
+                        tokenize=False, 
+                        add_generation_prompt=True
+                    )
+                except:
+                    # Fallback: просто конкатенируем сообщения
+                    formatted_prompt = "\n".join(
+                        f"[{m.get('role', 'unknown')}]: {m.get('content', '')}"
+                        for m in prompt_messages if isinstance(m, dict)
+                    )
+            else:
+                formatted_prompt = str(prompt_messages)
+            
+            # Формируем full_texts (промпт + completion) как в обычном бэкенде
+            completions_list = all_completions if all_completions else [completion]
+            rewards_list = all_rewards if all_rewards else [reward]
+            
+            full_texts = [formatted_prompt + comp for comp in completions_list]
+            
+            sample_entry = {
+                "step": step,
+                "prompt": formatted_prompt,
+                "reference_answer": reference_answer,
+                "completions": completions_list,
+                "full_texts": full_texts,  # Промпт + completion для UI отображения
+                "rewards": rewards_list,
+                "extracted": extracted,
+                "timestamp": datetime.now().isoformat(),
+            }
+            
+            # Сохраняем в output_dir/samples.jsonl
+            with open(samples_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(sample_entry, ensure_ascii=False) + "\n")
+            
+            # Дублируем в UI run_dir
+            if ui_samples_file:
+                ui_samples_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(ui_samples_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(sample_entry, ensure_ascii=False) + "\n")
+            
+            logger.debug(f"📝 Saved sample to samples.jsonl (step={step})")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not save sample: {e}")
+    
+    def _print_sample(
+        step: int, 
+        prompt_messages: List,  # Chat messages формат
+        answer: str, 
+        response: str, 
+        extracted: str, 
+        reward: float
+    ):
+        """Выводит сэмпл в консоль с полным промптом (как в обычном бэкенде)."""
+        # Форматируем промпт для отображения
+        if isinstance(prompt_messages, list):
+            try:
+                formatted_prompt = tokenizer.apply_chat_template(
+                    prompt_messages, 
+                    tokenize=False, 
+                    add_generation_prompt=True
+                )
+            except:
+                formatted_prompt = "\n".join(
+                    f"[{m.get('role', 'unknown')}]: {m.get('content', '')}"
+                    for m in prompt_messages if isinstance(m, dict)
+                )
+        else:
+            formatted_prompt = str(prompt_messages)
+        
+        print("\n" + "=" * 80)
+        print(f"📝 SAMPLE AT STEP {step}")
+        print("=" * 80)
+        print(f"\n{'─'*40} PROMPT {'─'*40}")
+        print(formatted_prompt[:1000])
+        if len(formatted_prompt) > 1000:
+            print(f"... (truncated, total {len(formatted_prompt)} chars)")
+        print(f"\n{'─'*40} REFERENCE ANSWER {'─'*40}")
+        print(f"✅ {answer}")
+        print(f"\n{'─'*40} MODEL RESPONSE {'─'*40}")
+        print(response[:1500])
+        if len(response) > 1500:
+            print(f"... (truncated, total {len(response)} chars)")
+        print(f"\n{'─'*40} EVALUATION {'─'*40}")
+        print(f"🎯 Extracted: {extracted}")
+        print(f"⭐ Reward: {reward:.4f}")
+        print("=" * 80 + "\n")
     
     def create_trl_reward_fn_from_rules(rules: List[Dict], reasoning_fmt: str):
         """
-        Создаёт TRL-совместимые reward функции из правил UI.
+        Создаёт TRL-совместимую reward функцию из UI правил (Reward Designer).
         
-        TRL вызывает: reward_fn(completions=..., prompts=..., **kwargs)
+        Использует UniversalRuleReward из обычного бэкенда для полной совместимости!
+        
+        TRL вызывает: reward_fn(prompts, completions, answer, **kwargs)
         """
-        reward_fns = []
+        from homellm.training.rl.rewards.base import UniversalRuleReward
         
-        for rule in rules:
-            if not rule.get("enabled", True):
-                continue
-                
-            rule_type = rule.get("type", "format_check")
-            rule_name = rule.get("name", "unknown")
-            rule_weight = rule.get("weight", 1.0)
-            params = rule.get("params", {})
-            
-            if rule_type == "format_check":
-                # Проверка формата ответа
-                fmt = params.get("format", reasoning_fmt)
-                
-                def format_check_fn(
-                    completions: List[str],
-                    prompts: Optional[List[str]] = None,
-                    fmt=fmt,
-                    **kwargs
-                ) -> List[float]:
-                    rewards = []
-                    for completion in completions:
-                        if fmt == "reasoning_answer":
-                            # <think>...</think> или #### формат
-                            if "<think>" in completion and "</think>" in completion:
-                                rewards.append(1.0)
-                            elif "####" in completion:
-                                after = completion.split("####")[-1].strip()
-                                if re.search(r'-?\d+', after):
-                                    rewards.append(1.0)
-                                else:
-                                    rewards.append(0.3)
-                            else:
-                                rewards.append(0.0)
-                        elif fmt == "deepseek":
-                            if "<think>" in completion and "</think>" in completion:
-                                rewards.append(1.0)
-                            else:
-                                rewards.append(0.0)
-                        else:  # gsm8k или другой
-                            if "####" in completion:
-                                rewards.append(1.0)
-                            else:
-                                rewards.append(0.0)
-                    return rewards
-                
-                reward_fns.append(format_check_fn)
-                logger.info(f"🦥 Added reward: {rule_name} (format_check, weight={rule_weight})")
-                
-            elif rule_type == "exact_match":
-                # Точное совпадение с ground_truth
-                # TRL не передаёт ground_truth напрямую, но он может быть в inputs
-                
-                def exact_match_fn(
-                    completions: List[str],
-                    prompts: Optional[List[str]] = None,
-                    ground_truth: Optional[List[str]] = None,
-                    **kwargs
-                ) -> List[float]:
-                    rewards = []
-                    # Пробуем получить ground_truth из разных источников
-                    gt_list = ground_truth or kwargs.get("ground_truths", []) or []
-                    
-                    for i, completion in enumerate(completions):
-                        if i < len(gt_list):
-                            gt = str(gt_list[i]).strip()
-                            # Извлекаем ответ из completion
-                            if "####" in completion:
-                                pred = completion.split("####")[-1].strip()
-                            else:
-                                # Берём последнее число
-                                numbers = re.findall(r'-?\d+(?:,\d{3})*(?:\.\d+)?', completion)
-                                pred = numbers[-1] if numbers else ""
-                            
-                            # Нормализуем для сравнения
-                            pred_clean = re.sub(r'[,\s]', '', pred)
-                            gt_clean = re.sub(r'[,\s]', '', gt)
-                            
-                            if pred_clean == gt_clean:
-                                rewards.append(1.0)
-                            elif gt_clean in pred_clean or pred_clean in gt_clean:
-                                rewards.append(0.5)
-                            else:
-                                rewards.append(0.0)
-                        else:
-                            # Нет ground_truth — даём 0
-                            rewards.append(0.0)
-                    return rewards
-                
-                reward_fns.append(exact_match_fn)
-                logger.info(f"🦥 Added reward: {rule_name} (exact_match, weight={rule_weight})")
-                
-            elif rule_type == "reasoning_quality":
-                # Качество reasoning — длина, структура
-                
-                def reasoning_quality_fn(
-                    completions: List[str],
-                    prompts: Optional[List[str]] = None,
-                    **kwargs
-                ) -> List[float]:
-                    rewards = []
-                    for completion in completions:
-                        score = 0.0
-                        
-                        # Длина (не слишком короткая, не слишком длинная)
-                        length = len(completion)
-                        if 100 < length < 1500:
-                            score += 0.3
-                        elif 50 < length <= 100:
-                            score += 0.1
-                        
-                        # Есть шаги рассуждения
-                        step_markers = ["Step", "step", "First", "Then", "Next", "Finally", "Therefore"]
-                        if any(marker in completion for marker in step_markers):
-                            score += 0.3
-                        
-                        # Есть числа/вычисления
-                        if re.search(r'\d+\s*[+\-*/=]\s*\d+', completion):
-                            score += 0.2
-                        
-                        # Структурированный ответ
-                        if "####" in completion or "</think>" in completion:
-                            score += 0.2
-                        
-                        rewards.append(min(score, 1.0))
-                    return rewards
-                
-                reward_fns.append(reasoning_quality_fn)
-                logger.info(f"🦥 Added reward: {rule_name} (reasoning_quality, weight={rule_weight})")
-            
-            else:
-                logger.warning(f"🦥 Unknown reward type: {rule_type}, skipping {rule_name}")
+        # Фильтруем только активные правила
+        active_rules = [r for r in rules if r.get("enabled", True)]
+        if not active_rules:
+            return []
         
-        return reward_fns
+        # Создаём UniversalRuleReward из правил
+        universal_reward = UniversalRuleReward.from_config(active_rules)
+        logger.info(f"🦥 Created UniversalRuleReward from {len(active_rules)} UI rules")
+        
+        for rule in active_rules:
+            logger.info(f"🦥   - {rule.get('name', 'unnamed')} (weight={rule.get('weight', 1.0)})")
+        
+        # Создаём TRL-совместимую обёртку
+        def ui_rules_reward_fn(
+            prompts: List,
+            completions: List,
+            answer: Optional[List[str]] = None,
+            **kwargs
+        ) -> List[float]:
+            """TRL-совместимая обёртка для UniversalRuleReward."""
+            rewards = []
+            
+            # Получаем ground truth
+            gt_list = answer or []
+            if isinstance(gt_list, str):
+                gt_list = [gt_list]
+            
+            for i, completion in enumerate(completions):
+                # Извлекаем текст из chat messages
+                response = _get_content(completion)
+                
+                # Получаем промпт
+                prompt_text = _get_question(prompts[i]) if i < len(prompts) else ""
+                
+                # Получаем reference answer
+                reference = gt_list[i] if i < len(gt_list) else ""
+                
+                # Вызываем UniversalRuleReward
+                reward = universal_reward(
+                    completion=response,
+                    reference_answer=str(reference),
+                    prompt=prompt_text,
+                )
+                rewards.append(reward)
+            
+            return rewards
+        
+        # Возвращаем как список с одной функцией (TRL ожидает список)
+        return [ui_rules_reward_fn]
     
     if reward_rules and len(reward_rules) > 0:
         # Используем правила из UI
@@ -558,44 +765,229 @@ def run_unsloth_grpo(
             reward_fn = None
     
     if reward_fn is None:
-        # Дефолтные reward функции для GSM8K
+        # Дефолтные reward функции (адаптируются под reasoning_format)
+        
+        # Паттерны для проверки формата в зависимости от reasoning_format
+        if reasoning_format in ("deepseek", "simple", "russian"):
+            format_pattern = re.compile(r'<answer>\s*.+?\s*</answer>', re.DOTALL | re.IGNORECASE)
+            format_name = "<answer>...</answer>"
+            use_answer_tags = True
+        else:  # gsm8k или другие
+            format_pattern = re.compile(r'####\s*-?\d+')
+            format_name = "#### <number>"
+            use_answer_tags = False
+        
         def default_format_fn(
-            completions: List[str],
-            prompts: Optional[List[str]] = None,
+            prompts: List,
+            completions: List,
+            answer: Optional[List[str]] = None,
             **kwargs
         ) -> List[float]:
+            """Проверяет соответствие формату ответа."""
             rewards = []
             for completion in completions:
-                if "####" in completion:
-                    after = completion.split("####")[-1].strip()
-                    if re.search(r'-?\d+', after):
-                        rewards.append(1.0)
+                response = _get_content(completion)
+                if format_pattern.search(response):
+                    rewards.append(1.0)  # Формат соблюдён
+                else:
+                    # Частичный reward если есть хоть какой-то ответ
+                    if use_answer_tags:
+                        if "<answer>" in response.lower():
+                            rewards.append(0.3)
+                        else:
+                            rewards.append(0.0)
                     else:
-                        rewards.append(0.3)
-                else:
-                    rewards.append(0.0)
+                        if "####" in response:
+                            rewards.append(0.3)
+                        else:
+                            rewards.append(0.0)
             return rewards
         
-        def default_length_fn(
-            completions: List[str],
-            prompts: Optional[List[str]] = None,
+        def default_correctness_fn(
+            prompts: List,
+            completions: List,
+            answer: Optional[List[str]] = None,
             **kwargs
         ) -> List[float]:
+            """Проверяет правильность ответа (сравнение с ground truth)."""
             rewards = []
-            for completion in completions:
-                length = len(completion)
-                if 100 < length < 800:
-                    rewards.append(1.0)
-                elif 50 < length <= 100:
-                    rewards.append(0.5)
-                elif length >= 800:
-                    rewards.append(0.3)
-                else:
+            gt_list = answer or []
+            
+            for i, completion in enumerate(completions):
+                response = _get_content(completion)
+                extracted = extract_answer_from_response(response)
+                true_answer = gt_list[i] if i < len(gt_list) else None
+                
+                if extracted is None:
+                    rewards.append(-1.0)  # Штраф за отсутствие ответа
+                    continue
+                
+                if true_answer is None:
                     rewards.append(0.0)
+                    continue
+                
+                try:
+                    # Пробуем числовое сравнение
+                    true_val = float(str(true_answer).strip().replace(",", ""))
+                    guess_val = float(str(extracted).strip().replace(",", ""))
+                    if guess_val == true_val:
+                        rewards.append(3.0)  # Правильный ответ
+                    else:
+                        # Частичный reward за близкий ответ
+                        ratio = guess_val / true_val if true_val != 0 else 0
+                        if 0.9 <= ratio <= 1.1:
+                            rewards.append(1.0)
+                        else:
+                            rewards.append(-0.5)
+                except (ValueError, TypeError):
+                    # Строковое сравнение
+                    if str(extracted).strip().lower() == str(true_answer).strip().lower():
+                        rewards.append(3.0)
+                    else:
+                        rewards.append(-0.5)
+            
             return rewards
         
-        reward_fn = [default_format_fn, default_length_fn]
-        logger.info("🦥 Using default GSM8K reward functions: format + length")
+        reward_fn = [default_format_fn, default_correctness_fn]
+        logger.info(f"🦥 Using default reward functions for format={reasoning_format} (pattern: {format_name})")
+    
+    # === Wrapper для логирования сэмплов (как в оригинальном Unsloth примере) ===
+    # Создаём последнюю reward функцию которая логирует промпт/ответ/reward
+    
+    # Паттерны для извлечения ответа в зависимости от формата
+    # reasoning_format уже определён выше
+    if reasoning_format in ("deepseek", "simple", "russian"):
+        # Формат с <answer>...</answer> тегами
+        answer_tag_pattern = re.compile(r'<answer>\s*(.*?)\s*</answer>', re.DOTALL | re.IGNORECASE)
+        use_hash_format = False
+        logger.info(f"🦥 Using <answer> tag pattern for extraction (format={reasoning_format})")
+    else:
+        # Формат с #### (GSM8K style)
+        answer_tag_pattern = None
+        use_hash_format = True
+        logger.info(f"🦥 Using #### pattern for extraction (format={reasoning_format})")
+    
+    answer_hash_pattern = re.compile(r'####\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)')
+    
+    def extract_answer_from_response(response: str) -> Optional[str]:
+        """Извлекает ответ из response в зависимости от формата."""
+        # Сначала пробуем <answer> теги (если формат поддерживает)
+        if answer_tag_pattern:
+            match = answer_tag_pattern.search(response)
+            if match:
+                return match.group(1).strip()
+        
+        # Затем пробуем #### формат
+        match = answer_hash_pattern.search(response)
+        if match:
+            return match.group(1).replace(",", "")
+        
+        # Fallback: ищем после ####
+        if "####" in response:
+            after = response.split("####")[-1].strip()
+            numbers = re.findall(r'-?\d+(?:\.\d+)?', after)
+            if numbers:
+                return numbers[0]
+        
+        # Последний fallback: последнее число в тексте
+        numbers = re.findall(r'-?\d+(?:\.\d+)?', response)
+        return numbers[-1] if numbers else None
+    
+    def logging_reward_fn(
+        prompts: List,
+        completions: List,
+        answer: Optional[List[str]] = None,  # ground truth от TRL (позиционный!)
+        **kwargs
+    ) -> List[float]:
+        """Reward функция с логированием (как check_numbers в Unsloth примере)."""
+        global UNSLOTH_PRINTED_TIMES
+        
+        # DEBUG: Логируем что получили от TRL (только на первом вызове)
+        if UNSLOTH_PRINTED_TIMES == 0:
+            logger.info(f"🔍 DEBUG: answer count={len(answer) if answer else 0}, completions count={len(completions)}")
+        
+        # Извлекаем текст из completions (TRL передаёт как chat messages!)
+        responses = [_get_content(c) for c in completions]
+        
+        # Извлекаем ответы из responses (используем универсальную функцию)
+        extracted_responses = [extract_answer_from_response(r) for r in responses]
+        
+        # Получаем ground truth
+        # TRL передаёт answer как ПОЗИЦИОННЫЙ аргумент (не через kwargs!)
+        gt_list = answer or []
+        
+        # Убедимся что это список
+        if gt_list is None:
+            gt_list = []
+        elif isinstance(gt_list, str):
+            gt_list = [gt_list]
+        
+        # Эта функция только для ЛОГИРОВАНИЯ, не влияет на итоговый reward
+        # Основные rewards идут из UI-заданных функций (format_check, exact_match и т.д.)
+        scores = [0.0] * len(completions)  # Всегда возвращаем 0 — не влияем на обучение
+        
+        # Вычисляем "информационный" reward только для отображения в логах
+        display_rewards = []
+        for i, (guess, response) in enumerate(zip(extracted_responses, responses)):
+            true_answer = gt_list[i] if i < len(gt_list) else None
+            
+            if guess is None:
+                display_rewards.append(0.0)
+                continue
+            
+            try:
+                if true_answer is not None:
+                    true_val = float(str(true_answer).strip().replace(",", ""))
+                    guess_val = float(guess)
+                    display_rewards.append(1.0 if guess_val == true_val else 0.0)
+                else:
+                    display_rewards.append(0.0)
+            except:
+                display_rewards.append(0.0)
+        
+        # Логируем периодически (как в оригинальном Unsloth примере)
+        if log_completions and UNSLOTH_PRINTED_TIMES % completion_log_interval == 0:
+            # Получаем первый промпт (chat messages)
+            first_prompt = prompts[0] if prompts else []
+            
+            gt_str = str(gt_list[0]) if gt_list else "N/A"
+            response_text = responses[0] if responses else "N/A"
+            extracted = extracted_responses[0] if extracted_responses else "N/A"
+            # Используем display_reward для логирования (informational only)
+            display_reward = display_rewards[0] if display_rewards else 0.0
+            
+            # Выводим в консоль с полным промптом
+            _print_sample(
+                step=UNSLOTH_PRINTED_TIMES,
+                prompt_messages=first_prompt,  # Передаём chat messages
+                answer=gt_str,
+                response=response_text,
+                extracted=str(extracted),
+                reward=display_reward if isinstance(display_reward, float) else 0.0,
+            )
+            
+            # Сохраняем в файл для UI (с полным промптом и всеми completions)
+            _save_sample_to_file(
+                step=UNSLOTH_PRINTED_TIMES,
+                prompt_messages=first_prompt,  # Chat messages
+                completion=response_text,
+                reward=display_reward if isinstance(display_reward, float) else 0.0,
+                reference_answer=gt_str,
+                extracted=str(extracted),
+                all_completions=responses,  # Все completions из batch
+                all_rewards=display_rewards,  # Все rewards
+            )
+        
+        UNSLOTH_PRINTED_TIMES += 1
+        return scores
+    
+    # Добавляем logging_reward_fn к списку
+    if isinstance(reward_fn, list):
+        reward_fn.append(logging_reward_fn)
+    else:
+        reward_fn = [reward_fn, logging_reward_fn] if reward_fn else [logging_reward_fn]
+    
+    logger.info(f"🦥 Added logging reward function (log_every={completion_log_interval} steps)")
     
     # === Патч для DDP: monkeypatch для unwrap model ===
     # Unsloth использует model.config напрямую, но при DDP модель обёрнута
@@ -620,9 +1012,10 @@ def run_unsloth_grpo(
             logger.warning(f"⚠️ Could not patch DDP: {e}")
     
     # === Trainer ===
+    # GRPOTrainer — используем processing_class как в примере Unsloth
     trainer = GRPOTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,  # Новый API TRL (не tokenizer!)
         train_dataset=dataset,
         args=grpo_config,
         reward_funcs=reward_fn,
@@ -632,11 +1025,13 @@ def run_unsloth_grpo(
     from transformers import TrainerCallback
     
     class MetricsCallback(TrainerCallback):
-        def __init__(self, metrics_logger, start_time, total_steps):
+        def __init__(self, metrics_logger, start_time, total_steps, tokenizer):
             self.metrics_logger = metrics_logger
             self.start_time = start_time
             self.total_steps = total_steps
+            self.tokenizer = tokenizer
             self.last_log_step = -1
+            self.sample_log_interval = 50  # Логировать сэмплы каждые N шагов
         
         def on_train_begin(self, args, state, control, **kwargs):
             self.metrics_logger.update(
@@ -663,6 +1058,11 @@ def run_unsloth_grpo(
             reward = logs.get("reward", logs.get("rewards/mean", 0.0))
             kl = logs.get("kl", logs.get("kl_divergence", 0.0))
             
+            # Дополнительные метрики из TRL
+            policy_loss = logs.get("loss/policy", logs.get("policy_loss", None))
+            value_loss = logs.get("loss/value", logs.get("value_loss", None))
+            entropy = logs.get("loss/entropy", logs.get("entropy", None))
+            
             elapsed = time.time() - self.start_time
             samples_per_sec = step / elapsed if elapsed > 0 else 0
             
@@ -684,7 +1084,45 @@ def run_unsloth_grpo(
                 samples_per_second=samples_per_sec,
             )
             
-            logger.info(f"🦥 Step {step}/{self.total_steps} | Loss: {loss:.4f} | Reward: {reward:.4f} | LR: {lr:.2e}")
+            # Красивый лог в консоль
+            log_msg = f"🦥 Step {step}/{self.total_steps} | Loss: {loss:.4f} | Reward: {reward:.4f} | KL: {kl:.4f} | LR: {lr:.2e}"
+            if policy_loss is not None:
+                log_msg += f" | Policy: {policy_loss:.4f}"
+            logger.info(log_msg)
+            
+            # Показываем completions из логов если есть
+            completions = logs.get("completions", None)
+            if completions and step % self.sample_log_interval == 0:
+                self._log_sample_completions(step, completions)
+        
+        def _log_sample_completions(self, step, completions):
+            """Логирует примеры сгенерированных ответов."""
+            if not completions:
+                return
+            
+            logger.info("=" * 80)
+            logger.info(f"📝 Sample completions at step {step}:")
+            logger.info("=" * 80)
+            
+            # Показываем до 3 примеров
+            samples_to_show = completions[:3] if isinstance(completions, list) else [completions]
+            
+            for i, completion in enumerate(samples_to_show):
+                if isinstance(completion, dict):
+                    prompt = completion.get("prompt", "N/A")[:200]
+                    response = completion.get("response", completion.get("completion", "N/A"))[:500]
+                    reward = completion.get("reward", "N/A")
+                else:
+                    prompt = "N/A"
+                    response = str(completion)[:500]
+                    reward = "N/A"
+                
+                logger.info(f"\n--- Sample {i+1} ---")
+                logger.info(f"Prompt: {prompt}...")
+                logger.info(f"Response: {response}...")
+                logger.info(f"Reward: {reward}")
+            
+            logger.info("=" * 80)
         
         def on_save(self, args, state, control, **kwargs):
             ckpt_path = str(output_dir / f"checkpoint-{state.global_step}")
@@ -704,7 +1142,7 @@ def run_unsloth_grpo(
         * grpo_config.num_train_epochs
     )
     
-    trainer.add_callback(MetricsCallback(metrics_logger, time.time(), total_steps))
+    trainer.add_callback(MetricsCallback(metrics_logger, time.time(), total_steps, tokenizer))
     
     # === Запуск тренировки ===
     logger.info("🦥 Unsloth: Starting GRPO training...")
