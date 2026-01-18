@@ -287,7 +287,6 @@ def main():
                 if is_unsloth_available():
                     # Создаём простой metrics logger
                     from pathlib import Path
-                    from datetime import datetime
                     import time
                     
                     ui_run_dir = ui_config.get("ui_run_dir")
