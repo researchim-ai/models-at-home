@@ -1336,15 +1336,15 @@ def render_grpo_sidebar_config():
     # Алгоритм
     algorithm = st.sidebar.selectbox(
         "Алгоритм",
-        ["dapo", "grpo", "drgrpo"],
+        ["grpo", "dapo", "dr_grpo"],
         format_func=lambda x: {
-            "dapo": "⭐ DAPO (рекомендуется)",
-            "grpo": "GRPO (стандартный)",
-            "drgrpo": "Dr.GRPO (улучшенный)",
+            "grpo": "⭐ GRPO (рекомендуется)",
+            "dapo": "DAPO (Dynamic Advantage)",
+            "dr_grpo": "Dr.GRPO (улучшенный)",
         }[x],
         help="""
-        **DAPO** ⭐: Рекомендуется! Token-level loss + асимметричный клиппинг + dynamic sampling
-        **GRPO**: Стандартный Group Relative Policy Optimization
+        **GRPO** ⭐: Рекомендуется! Стандартный Group Relative Policy Optimization
+        **DAPO**: Token-level loss + асимметричный клиппинг + dynamic sampling
         **Dr.GRPO**: Без деления на std, фиксированная нормализация
         """
     )
@@ -1513,7 +1513,7 @@ def render_grpo_sidebar_config():
                 help="Агрегировать loss по токенам (DAPO), а не по сэмплам (GRPO)"
             )
         
-        elif algorithm == "drgrpo":
+        elif algorithm == "dr_grpo":
             st.markdown("---")
             st.markdown("**🔬 Dr.GRPO-специфичные настройки**")
             st.info(
@@ -1544,9 +1544,9 @@ def render_grpo_sidebar_config():
         algorithm_to_loss_type = {
             "grpo": "grpo",
             "dapo": "dapo", 
-            "drgrpo": "dr_grpo",
+            "dr_grpo": "dr_grpo",
         }
-        grpo_liger_loss_type = algorithm_to_loss_type.get(algorithm, "dapo")
+        grpo_liger_loss_type = algorithm_to_loss_type.get(algorithm, "grpo")
         
         st.markdown("---")
         st.markdown("**🚀 Rollout engine (отдельная модель для генерации)**")
@@ -4120,13 +4120,16 @@ def render_metrics_dashboard(metrics: dict):
     
     # Обычные графики для других стадий
     elif metrics.get("loss_history"):
+        # Генерируем steps_history если его нет
+        steps_history = metrics.get("steps_history", list(range(1, len(metrics["loss_history"]) + 1)))
+        
         col1, col2 = st.columns(2)
         
         with col1:
             # Loss chart
             fig_loss = go.Figure()
             fig_loss.add_trace(go.Scatter(
-                x=metrics["steps_history"],
+                x=steps_history,
                 y=metrics["loss_history"],
                 mode='lines',
                 name='Train Loss',
@@ -4152,23 +4155,71 @@ def render_metrics_dashboard(metrics: dict):
         
         with col2:
             # LR chart
-            fig_lr = go.Figure()
-            fig_lr.add_trace(go.Scatter(
-                x=metrics["steps_history"],
-                y=metrics["lr_history"],
-                mode='lines',
-                name='LR',
-                line=dict(color='#60a5fa', width=2)
-            ))
-            fig_lr.update_layout(
-                title="Learning Rate Schedule",
-                xaxis_title="Step",
-                yaxis_title="LR",
-                template="plotly_dark",
-                height=300,
-                margin=dict(l=0, r=0, t=40, b=0)
-            )
-            st.plotly_chart(fig_lr, key=f"lr_chart_{rid}")
+            lr_history = metrics.get("lr_history", [])
+            if lr_history:
+                fig_lr = go.Figure()
+                fig_lr.add_trace(go.Scatter(
+                    x=steps_history[:len(lr_history)],
+                    y=lr_history,
+                    mode='lines',
+                    name='LR',
+                    line=dict(color='#60a5fa', width=2)
+                ))
+                fig_lr.update_layout(
+                    title="Learning Rate Schedule",
+                    xaxis_title="Step",
+                    yaxis_title="LR",
+                    template="plotly_dark",
+                    height=300,
+                    margin=dict(l=0, r=0, t=40, b=0)
+                )
+                st.plotly_chart(fig_lr, key=f"lr_chart_{rid}")
+        
+        # GRPO специфичные графики: Reward и KL
+        if metrics.get("reward_history") or metrics.get("kl_history"):
+            col3, col4 = st.columns(2)
+            
+            with col3:
+                reward_history = metrics.get("reward_history", [])
+                if reward_history:
+                    fig_reward = go.Figure()
+                    fig_reward.add_trace(go.Scatter(
+                        x=steps_history[:len(reward_history)],
+                        y=reward_history,
+                        mode='lines',
+                        name='Reward',
+                        line=dict(color='#10b981', width=2)
+                    ))
+                    fig_reward.update_layout(
+                        title="🎯 Reward (GRPO)",
+                        xaxis_title="Step",
+                        yaxis_title="Reward",
+                        template="plotly_dark",
+                        height=300,
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
+                    st.plotly_chart(fig_reward, key=f"reward_chart_{rid}")
+            
+            with col4:
+                kl_history = metrics.get("kl_history", [])
+                if kl_history:
+                    fig_kl = go.Figure()
+                    fig_kl.add_trace(go.Scatter(
+                        x=steps_history[:len(kl_history)],
+                        y=kl_history,
+                        mode='lines',
+                        name='KL Divergence',
+                        line=dict(color='#f59e0b', width=2)
+                    ))
+                    fig_kl.update_layout(
+                        title="📊 KL Divergence (GRPO)",
+                        xaxis_title="Step",
+                        yaxis_title="KL",
+                        template="plotly_dark",
+                        height=300,
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
+                    st.plotly_chart(fig_kl, key=f"kl_chart_{rid}")
     
     # Checkpoints
     if metrics.get("checkpoints"):

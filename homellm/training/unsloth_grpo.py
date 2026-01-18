@@ -329,10 +329,21 @@ def run_unsloth_grpo(
     output_dir = Path(config.get("output_dir", "out/unsloth_grpo"))
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    batch_size = config.get("batch_size", 1)
-    gradient_accumulation = config.get("gradient_accumulation", 8)
-    num_generations = config.get("grpo_num_generations", 4)
+    # Параметры из UI (с правильными именами!)
+    batch_size = config.get("grpo_train_batch_size", config.get("batch_size", 1))
+    gradient_accumulation = config.get("gradient_accumulation", 4)
+    num_generations = config.get("grpo_group_size", config.get("grpo_num_generations", 8))
     max_new_tokens = config.get("grpo_max_new_tokens", 512)
+    learning_rate = config.get("grpo_learning_rate", config.get("learning_rate", 5e-5))
+    temperature = config.get("grpo_temperature", 0.7)
+    kl_weight = config.get("grpo_kl_weight", config.get("grpo_beta", 0.1))
+    clip_eps = config.get("grpo_clip_eps_low", 0.2)
+    algorithm = config.get("grpo_algorithm", "grpo")  # grpo, dapo, dr_grpo
+    
+    logger.info(f"🦥 GRPO Config from UI:")
+    logger.info(f"   learning_rate={learning_rate}, batch_size={batch_size}, grad_accum={gradient_accumulation}")
+    logger.info(f"   num_generations={num_generations}, temperature={temperature}, kl_weight={kl_weight}")
+    logger.info(f"   algorithm={algorithm}, clip_eps={clip_eps}")
     
     # Базовые параметры GRPOConfig (совместимо с разными версиями trl)
     grpo_kwargs = dict(
@@ -341,9 +352,10 @@ def run_unsloth_grpo(
         max_steps=config.get("max_steps", -1),
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation,
-        learning_rate=config.get("learning_rate", 5e-6),
+        learning_rate=learning_rate,
         weight_decay=config.get("weight_decay", 0.01),
         warmup_steps=config.get("warmup_steps", 50),
+        warmup_ratio=config.get("warmup_ratio", 0.1),
         lr_scheduler_type=config.get("lr_schedule", "cosine"),
         logging_steps=config.get("log_every", 10),
         save_steps=config.get("save_every", 500),
@@ -357,14 +369,30 @@ def run_unsloth_grpo(
         
         # GRPO specific
         num_generations=num_generations,
-        temperature=config.get("grpo_temperature", 0.7),
-        beta=config.get("grpo_beta", 0.1),  # KL coefficient
+        temperature=temperature,
+        beta=kl_weight,  # KL coefficient
     )
     
-    # Добавляем max_completion_length если поддерживается (новый API trl)
-    # или max_new_tokens (старый API)
+    # Loss type: grpo, bnpo (для DAPO используется bnpo), dr_grpo
+    if algorithm == "dapo":
+        grpo_kwargs["loss_type"] = "dapo"  # или "bnpo" для DAPO
+    elif algorithm == "dr_grpo":
+        grpo_kwargs["loss_type"] = "dr_grpo"
+    else:
+        grpo_kwargs["loss_type"] = "grpo"  # дефолт
+    
+    # Проверяем какие параметры поддерживаются в GRPOConfig
     import inspect
     grpo_sig = inspect.signature(GRPOConfig.__init__)
+    
+    # Epsilon для PPO clipping
+    if "epsilon" in grpo_sig.parameters:
+        grpo_kwargs["epsilon"] = clip_eps
+    elif "epsilon_low" in grpo_sig.parameters:
+        grpo_kwargs["epsilon_low"] = clip_eps
+        grpo_kwargs["epsilon_high"] = config.get("grpo_clip_eps_high", clip_eps)
+    
+    # max_completion_length (новый API trl) или max_new_tokens (старый API)
     if "max_completion_length" in grpo_sig.parameters:
         grpo_kwargs["max_completion_length"] = max_new_tokens
     elif "max_new_tokens" in grpo_sig.parameters:
@@ -604,38 +632,79 @@ def run_unsloth_grpo(
     from transformers import TrainerCallback
     
     class MetricsCallback(TrainerCallback):
-        def __init__(self, metrics_logger, start_time):
+        def __init__(self, metrics_logger, start_time, total_steps):
             self.metrics_logger = metrics_logger
             self.start_time = start_time
+            self.total_steps = total_steps
+            self.last_log_step = -1
+        
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.metrics_logger.update(
+                status="training",
+                total_steps=self.total_steps,
+                backend="unsloth",
+            )
         
         def on_log(self, args, state, control, logs=None, **kwargs):
             if logs is None:
                 return
             
             step = state.global_step
+            
+            # Избегаем дублирования логов для одного шага
+            if step == self.last_log_step:
+                return
+            self.last_log_step = step
+            
             loss = logs.get("loss", 0.0)
             lr = logs.get("learning_rate", 0.0)
-            reward = logs.get("reward", 0.0)
+            
+            # GRPO специфичные метрики
+            reward = logs.get("reward", logs.get("rewards/mean", 0.0))
+            kl = logs.get("kl", logs.get("kl_divergence", 0.0))
             
             elapsed = time.time() - self.start_time
+            samples_per_sec = step / elapsed if elapsed > 0 else 0
             
+            # Логируем шаг со всеми метриками
             self.metrics_logger.log_step(
                 step=step,
                 loss=loss,
                 lr=lr,
+                samples_per_sec=samples_per_sec,
+                reward=reward,
+                kl=kl,
             )
             
-            # Дополнительные GRPO метрики
+            # Дополнительные метрики для UI
+            eta_seconds = (self.total_steps - step) / samples_per_sec if samples_per_sec > 0 else 0
             self.metrics_logger.update(
-                current_reward=reward,
-                kl_divergence=logs.get("kl", 0.0),
+                elapsed_time=elapsed,
+                eta_seconds=eta_seconds,
+                samples_per_second=samples_per_sec,
             )
+            
+            logger.info(f"🦥 Step {step}/{self.total_steps} | Loss: {loss:.4f} | Reward: {reward:.4f} | LR: {lr:.2e}")
         
         def on_save(self, args, state, control, **kwargs):
             ckpt_path = str(output_dir / f"checkpoint-{state.global_step}")
             self.metrics_logger.log_checkpoint(ckpt_path)
+        
+        def on_train_end(self, args, state, control, **kwargs):
+            total_time = time.time() - self.start_time
+            self.metrics_logger.update(
+                status="completed",
+                total_training_time=total_time,
+                final_step=state.global_step,
+            )
     
-    trainer.add_callback(MetricsCallback(metrics_logger, time.time()))
+    # Рассчитываем total_steps
+    total_steps = grpo_config.max_steps if grpo_config.max_steps > 0 else (
+        len(dataset) // (grpo_config.per_device_train_batch_size * grpo_config.gradient_accumulation_steps * max(1, world_size))
+        * grpo_config.num_train_epochs
+    )
+    
+    trainer.add_callback(MetricsCallback(metrics_logger, time.time(), total_steps))
     
     # === Запуск тренировки ===
     logger.info("🦥 Unsloth: Starting GRPO training...")

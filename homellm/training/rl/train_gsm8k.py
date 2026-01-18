@@ -298,7 +298,15 @@ def main():
                     class SimpleMetricsLogger:
                         def __init__(self, path):
                             self.path = Path(path)
-                            self.metrics = {"status": "initializing", "start_time": datetime.now().isoformat()}
+                            self.metrics = {
+                                "status": "initializing", 
+                                "start_time": datetime.now().isoformat(),
+                                "steps_history": [],
+                                "loss_history": [],
+                                "lr_history": [],
+                                "reward_history": [],
+                                "kl_history": [],
+                            }
                             self._save()
                         
                         def _save(self):
@@ -310,13 +318,24 @@ def main():
                             self.metrics.update(kwargs)
                             self._save()
                         
-                        def log_step(self, step, loss, lr, samples_per_sec=0):
+                        def log_step(self, step, loss, lr, samples_per_sec=0, reward=None, kl=None):
                             self.metrics["current_step"] = step
                             self.metrics["current_loss"] = loss
                             self.metrics["current_lr"] = lr
-                            if "loss_history" not in self.metrics:
-                                self.metrics["loss_history"] = []
+                            
+                            # Добавляем в историю
+                            self.metrics["steps_history"].append(step)
                             self.metrics["loss_history"].append(loss)
+                            self.metrics["lr_history"].append(lr)
+                            
+                            # GRPO специфичные метрики
+                            if reward is not None:
+                                self.metrics["current_reward"] = reward
+                                self.metrics["reward_history"].append(reward)
+                            if kl is not None:
+                                self.metrics["current_kl"] = kl
+                                self.metrics["kl_history"].append(kl)
+                            
                             self._save()
                         
                         def log_checkpoint(self, path):
