@@ -409,6 +409,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 seq_len=config["seq_len"],
                 sft_columns=config.get("sft_columns"),
                 sft_template=config.get("sft_template"),
+                chat_template=config.get("chat_template"),  # ✅ Используем chat_template модели
                 num_replicas=accelerator.num_processes,  # ✅ Явное шардирование
                 rank=accelerator.process_index,  # ✅ Явное шардирование
                 split="train",
@@ -523,6 +524,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     seq_len=config["seq_len"],
                     sft_columns=config.get("sft_columns"),
                     sft_template=config.get("sft_template"),
+                    chat_template=config.get("chat_template"),  # ✅ Используем chat_template модели
                     num_replicas=accelerator.num_processes,  # ✅ Явное шардирование
                     rank=accelerator.process_index,  # ✅ Явное шардирование
                     split="val",
@@ -1276,31 +1278,40 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                                     tmp_dir.mkdir(parents=True, exist_ok=True)
 
                                     # SFT: убедимся, что chat_template попадает в tokenizer_config.json
-                                    if stage == "sft" and config.get("sft_template"):
-                                        tmpl = config["sft_template"]
-                                        default_sys = tmpl.get("system", "You are a helpful assistant.")
-                                        u_tag = tmpl.get("user_tag", "### User:")
-                                        b_tag = tmpl.get("bot_tag", "### Assistant:")
-                                        default_sys_escaped = default_sys.replace("'", "\\'")
-                                        u_tag_escaped = u_tag.replace("'", "\\'")
-                                        b_tag_escaped = b_tag.replace("'", "\\'")
-                                        tokenizer.chat_template = (
-                                            "{% if messages and messages[0]['role'] == 'system' %}"
-                                            "{{ messages[0]['content'] }}\n\n"
-                                            "{% else %}"
-                                            f"{{{{ '{default_sys_escaped}' }}}}\n\n"
-                                            "{% endif %}"
-                                            "{% for message in messages %}"
-                                            "{% if message['role'] == 'user' %}"
-                                            f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
-                                            "{% elif message['role'] == 'assistant' %}"
-                                            f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
-                                            "{% endif %}"
-                                            "{% endfor %}"
-                                            "{% if add_generation_prompt %}"
-                                            f"{b_tag_escaped}\n"
-                                            "{% endif %}"
-                                        )
+                                    if stage == "sft":
+                                        # Приоритет: пользовательский chat_template > генерация из sft_template
+                                        user_chat_template = config.get("chat_template")
+                                        if user_chat_template:
+                                            # Используем пользовательский chat_template
+                                            tokenizer.chat_template = user_chat_template
+                                            logger.info("Using user-provided chat_template")
+                                        elif config.get("sft_template"):
+                                            # Генерируем chat_template из sft_template
+                                            tmpl = config["sft_template"]
+                                            default_sys = tmpl.get("system", "You are a helpful assistant.")
+                                            u_tag = tmpl.get("user_tag", "### User:")
+                                            b_tag = tmpl.get("bot_tag", "### Assistant:")
+                                            default_sys_escaped = default_sys.replace("'", "\\'")
+                                            u_tag_escaped = u_tag.replace("'", "\\'")
+                                            b_tag_escaped = b_tag.replace("'", "\\'")
+                                            tokenizer.chat_template = (
+                                                "{% if messages and messages[0]['role'] == 'system' %}"
+                                                "{{ messages[0]['content'] }}\n\n"
+                                                "{% else %}"
+                                                f"{{{{ '{default_sys_escaped}' }}}}\n\n"
+                                                "{% endif %}"
+                                                "{% for message in messages %}"
+                                                "{% if message['role'] == 'user' %}"
+                                                f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                                                "{% elif message['role'] == 'assistant' %}"
+                                                f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                                                "{% endif %}"
+                                                "{% endfor %}"
+                                                "{% if add_generation_prompt %}"
+                                                f"{b_tag_escaped}\n"
+                                                "{% endif %}"
+                                            )
+                                            logger.info("Generated chat_template from sft_template")
 
                                     adapter.save_final(accelerator, model, tokenizer, tmp_dir)
 
@@ -1355,35 +1366,43 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             final_dir.mkdir(parents=True, exist_ok=True)
             
             # --- (опционально) сохраняем chat_template для SFT ---
-            if stage == "sft" and config.get("sft_template"):
-                tmpl = config["sft_template"]
-                
-                default_sys = tmpl.get("system", "You are a helpful assistant.")
-                u_tag = tmpl.get("user_tag", "### User:")
-                b_tag = tmpl.get("bot_tag", "### Assistant:")
-                
-                default_sys_escaped = default_sys.replace("'", "\\'")
-                u_tag_escaped = u_tag.replace("'", "\\'")
-                b_tag_escaped = b_tag.replace("'", "\\'")
-                
-                tokenizer.chat_template = (
-                    "{% if messages and messages[0]['role'] == 'system' %}"
-                    "{{ messages[0]['content'] }}\n\n"
-                    "{% else %}"
-                    f"{{{{ '{default_sys_escaped}' }}}}\n\n"
-                    "{% endif %}"
-                    "{% for message in messages %}"
-                    "{% if message['role'] == 'user' %}"
-                    f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
-                    "{% elif message['role'] == 'assistant' %}"
-                    f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
-                    "{% endif %}"
-                    "{% endfor %}"
-                    "{% if add_generation_prompt %}"
-                    f"{b_tag_escaped}\n"
-                    "{% endif %}"
-                )
-                logger.info(f"Saved chat_template: user_tag='{u_tag}', bot_tag='{b_tag}'")
+            if stage == "sft":
+                # Приоритет: пользовательский chat_template > генерация из sft_template
+                user_chat_template = config.get("chat_template")
+                if user_chat_template:
+                    # Используем пользовательский chat_template
+                    tokenizer.chat_template = user_chat_template
+                    logger.info("Final save: using user-provided chat_template")
+                elif config.get("sft_template"):
+                    # Генерируем chat_template из sft_template
+                    tmpl = config["sft_template"]
+                    
+                    default_sys = tmpl.get("system", "You are a helpful assistant.")
+                    u_tag = tmpl.get("user_tag", "### User:")
+                    b_tag = tmpl.get("bot_tag", "### Assistant:")
+                    
+                    default_sys_escaped = default_sys.replace("'", "\\'")
+                    u_tag_escaped = u_tag.replace("'", "\\'")
+                    b_tag_escaped = b_tag.replace("'", "\\'")
+                    
+                    tokenizer.chat_template = (
+                        "{% if messages and messages[0]['role'] == 'system' %}"
+                        "{{ messages[0]['content'] }}\n\n"
+                        "{% else %}"
+                        f"{{{{ '{default_sys_escaped}' }}}}\n\n"
+                        "{% endif %}"
+                        "{% for message in messages %}"
+                        "{% if message['role'] == 'user' %}"
+                        f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                        "{% elif message['role'] == 'assistant' %}"
+                        f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                        "{% endif %}"
+                        "{% endfor %}"
+                        "{% if add_generation_prompt %}"
+                        f"{b_tag_escaped}\n"
+                        "{% endif %}"
+                    )
+                    logger.info(f"Final save: generated chat_template from sft_template (user_tag='{u_tag}', bot_tag='{b_tag}')")
             
             # --- ВСЕГДА сохраняем финальную модель (и для pretrain тоже) ---
             # Используем адаптер для универсального сохранения (работает для Home и HF моделей)

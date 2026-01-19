@@ -29,6 +29,7 @@ class SFTDataset(IterableDataset):
         seq_len: int = 2048,
         sft_columns: Optional[dict] = None,
         sft_template: Optional[dict] = None,
+        chat_template: Optional[str] = None,  # Jinja2 chat_template из модели
         num_replicas: int = 1,
         rank: int = 0,
         split: str = "train",      # "train" | "val"
@@ -56,6 +57,22 @@ class SFTDataset(IterableDataset):
             "bot_tag": "### Assistant:",
             "separator": "\n\n",
         }
+        
+        # Chat template: если указан явно — используем его, иначе берём из токенизатора
+        self.chat_template = chat_template
+        self.use_chat_template = False
+        
+        if self.chat_template:
+            # Устанавливаем пользовательский chat_template в токенизатор
+            self.tokenizer.chat_template = self.chat_template
+            self.use_chat_template = True
+            logger.info("SFTDataset: Using user-provided chat_template")
+        elif hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template:
+            # Используем chat_template из токенизатора модели
+            self.use_chat_template = True
+            logger.info("SFTDataset: Using model's native chat_template")
+        else:
+            logger.info("SFTDataset: No chat_template found, using sft_template tags")
 
         # Убедимся что есть pad token
         if self.tokenizer.pad_token is None:
@@ -164,7 +181,151 @@ class SFTDataset(IterableDataset):
         text, _ = self._format_prompt_chat_with_spans(data)
         return text
 
+    def _format_with_chat_template(self, data: Dict[str, Any]) -> Tuple[Optional[str], List[Tuple[int, int]]]:
+        """
+        Форматирует данные через tokenizer.apply_chat_template().
+        
+        Возвращает (text, spans) где spans - char-позиции ответов assistant для masking.
+        
+        Алгоритм определения spans:
+        1. Для каждого ответа assistant форматируем диалог до этого ответа (с add_generation_prompt=True)
+        2. Форматируем диалог включая этот ответ
+        3. Разница = текст ответа assistant → добавляем в spans
+        """
+        msg_path = self.cols.get("messages_path") or self.cols.get("messages", "messages")
+        msgs = self._get_nested(data, msg_path)
+        if not msgs:
+            return None, []
+        if isinstance(msgs, str):
+            try:
+                msgs = json.loads(msgs)
+            except Exception:
+                return None, []
+        if not isinstance(msgs, list) or not msgs:
+            return None, []
+
+        role_field = self.cols.get("role_field", "role")
+        content_field = self.cols.get("content_field", "content")
+        role_system = self.cols.get("role_system", "system")
+        role_user = self.cols.get("role_user", "user")
+        role_assistant = self.cols.get("role_assistant", "assistant")
+        default_system = self.tmpl.get("system", "You are a helpful assistant.")
+
+        # Конвертируем в стандартный формат messages
+        std_messages = []
+        has_system = False
+        has_assistant = False
+        
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            role_val = str(m.get(role_field, ""))
+            content_val = self._as_text(m.get(content_field, ""))
+            
+            if role_val == role_system:
+                std_messages.append({"role": "system", "content": content_val})
+                has_system = True
+            elif role_val == role_user:
+                std_messages.append({"role": "user", "content": content_val})
+            elif role_val == role_assistant:
+                std_messages.append({"role": "assistant", "content": content_val})
+                has_assistant = True
+        
+        if not has_assistant:
+            return None, []
+        
+        # Добавляем системное сообщение если его нет
+        if not has_system:
+            std_messages.insert(0, {"role": "system", "content": default_system})
+        
+        # Форматируем полный диалог
+        try:
+            full_text = self.tokenizer.apply_chat_template(
+                std_messages,
+                tokenize=False,
+                add_generation_prompt=False
+            )
+        except Exception as e:
+            logger.warning(f"apply_chat_template failed: {e}")
+            return None, []
+        
+        if not full_text or len(full_text.strip()) < 10:
+            return None, []
+        
+        # Определяем spans для ответов assistant
+        # Стратегия: форматируем диалог инкрементально и находим позиции ответов
+        spans = []
+        
+        # Собираем позиции каждого ответа assistant
+        accumulated_messages = []
+        prev_text = ""
+        
+        for msg in std_messages:
+            accumulated_messages.append(msg)
+            
+            if msg["role"] == "assistant":
+                # Форматируем диалог ДО этого ответа (с add_generation_prompt=True)
+                messages_before = accumulated_messages[:-1]
+                if messages_before:
+                    try:
+                        text_before = self.tokenizer.apply_chat_template(
+                            messages_before,
+                            tokenize=False,
+                            add_generation_prompt=True
+                        )
+                    except Exception:
+                        text_before = prev_text
+                else:
+                    text_before = ""
+                
+                # Форматируем диалог ВКЛЮЧАЯ этот ответ
+                try:
+                    text_with = self.tokenizer.apply_chat_template(
+                        accumulated_messages,
+                        tokenize=False,
+                        add_generation_prompt=False
+                    )
+                except Exception:
+                    continue
+                
+                # Ответ assistant = разница между text_with и text_before
+                # Находим позицию начала ответа
+                start_pos = len(text_before)
+                end_pos = len(text_with)
+                
+                if end_pos > start_pos:
+                    spans.append((start_pos, end_pos))
+                
+                prev_text = text_with
+            else:
+                try:
+                    prev_text = self.tokenizer.apply_chat_template(
+                        accumulated_messages,
+                        tokenize=False,
+                        add_generation_prompt=False
+                    )
+                except Exception:
+                    pass
+        
+        # Добавляем EOS токен
+        eos = self.tokenizer.eos_token or ""
+        if eos and not full_text.endswith(eos):
+            eos_start = len(full_text)
+            full_text = full_text + eos
+            # EOS тоже trainable
+            spans.append((eos_start, len(full_text)))
+        
+        return full_text, spans
+
     def _format_prompt_chat_with_spans(self, data: Dict[str, Any]) -> Tuple[Optional[str], List[Tuple[int, int]]]:
+        # Если есть chat_template — используем его
+        if self.use_chat_template:
+            result = self._format_with_chat_template(data)
+            if result[0]:  # Если успешно отформатировали
+                return result
+            # Иначе fallback на теги
+        
+        # Fallback: форматирование через теги (sft_template)
         msg_path = self.cols.get("messages_path") or self.cols.get("messages", "messages")
         msgs = self._get_nested(data, msg_path)
         if not msgs:
@@ -230,7 +391,76 @@ class SFTDataset(IterableDataset):
         text, _ = self._format_prompt_instruct_with_spans(data)
         return text
 
+    def _format_instruct_with_chat_template(self, data: Dict[str, Any]) -> Tuple[Optional[str], List[Tuple[int, int]]]:
+        """Форматирует instruct данные через chat_template."""
+        instr_path = self.cols.get("instruction", "instruction")
+        out_path = self.cols.get("output", "output")
+        instr = self._as_text(self._get_nested(data, instr_path))
+        out = self._as_text(self._get_nested(data, out_path))
+
+        if not instr.strip() or not out.strip():
+            return None, []
+
+        default_system = self.tmpl.get("system", "You are a helpful assistant.")
+        sys_val = default_system
+
+        sys_field = self.cols.get("system_field")
+        if sys_field:
+            v = self._as_text(self._get_nested(data, sys_field))
+            if v.strip():
+                sys_val = v
+
+        # Формируем messages
+        std_messages = [
+            {"role": "system", "content": sys_val},
+            {"role": "user", "content": instr},
+            {"role": "assistant", "content": out}
+        ]
+
+        try:
+            # Текст до ответа assistant
+            text_before = self.tokenizer.apply_chat_template(
+                std_messages[:-1],  # без assistant
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            # Полный текст
+            full_text = self.tokenizer.apply_chat_template(
+                std_messages,
+                tokenize=False,
+                add_generation_prompt=False
+            )
+        except Exception as e:
+            logger.warning(f"apply_chat_template failed for instruct: {e}")
+            return None, []
+
+        if not full_text or len(full_text.strip()) < 10:
+            return None, []
+
+        # Span для ответа assistant
+        start_pos = len(text_before)
+        end_pos = len(full_text)
+        spans = [(start_pos, end_pos)] if end_pos > start_pos else []
+
+        # EOS
+        eos = self.tokenizer.eos_token or ""
+        if eos and not full_text.endswith(eos):
+            eos_start = len(full_text)
+            full_text = full_text + eos
+            spans.append((eos_start, len(full_text)))
+
+        return full_text, spans
+
     def _format_prompt_instruct_with_spans(self, data: Dict[str, Any]) -> Tuple[Optional[str], List[Tuple[int, int]]]:
+        # Если есть chat_template — используем его
+        if self.use_chat_template:
+            result = self._format_instruct_with_chat_template(data)
+            if result[0]:
+                return result
+            # Fallback на теги
+        
+        # Fallback: форматирование через теги (sft_template)
         instr_path = self.cols.get("instruction", "instruction")
         out_path = self.cols.get("output", "output")
         instr = self._as_text(self._get_nested(data, instr_path))

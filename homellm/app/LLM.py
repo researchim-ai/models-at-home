@@ -1096,7 +1096,11 @@ def get_all_leaf_paths(data, parent_path: str = '', depth: int = 0, max_depth: i
 
 
 def render_sft_main_config(data_path: str):
-    """Универсальный конфигуратор SFT — автодетект + ручной выбор."""
+    """Универсальный конфигуратор SFT — автодетект + ручной выбор.
+    
+    Args:
+        data_path: Путь к датасету
+    """
     st.markdown("### 🛠️ Настройка данных для SFT")
     
     columns, sample = get_dataset_columns(data_path)
@@ -1274,45 +1278,117 @@ def render_sft_main_config(data_path: str):
         st.markdown("#### 👁️ Превью:")
         
         try:
-            sep = "\n\n"
+            # Получаем токенизатор из session_state (если загружен для SFT)
+            sft_tokenizer = st.session_state.get("sft_tokenizer")
+            use_model_chat_template = False
+            
+            # Проверяем, есть ли у токенизатора chat_template
+            if sft_tokenizer and hasattr(sft_tokenizer, 'chat_template') and sft_tokenizer.chat_template:
+                use_model_chat_template = True
+            
+            # Также проверяем пользовательский chat_template
+            user_chat_template = st.session_state.get("sft_user_chat_template", "").strip()
+            if user_chat_template and sft_tokenizer:
+                # Временно устанавливаем пользовательский шаблон
+                sft_tokenizer.chat_template = user_chat_template
+                use_model_chat_template = True
+            
             preview = ""
             
             if sft_columns["format"] == "chat":
+                # Получаем сообщения из sample
                 messages = sample[sft_columns["messages_path"]]
-                sys_text = default_system
                 
+                # Конвертируем в стандартный формат messages
+                std_messages = []
                 for msg in messages:
-                    role = str(msg.get(sft_columns["role_field"], ""))
-                    content = str(msg.get(sft_columns["content_field"], ""))
+                    role_val = str(msg.get(sft_columns["role_field"], ""))
+                    content_val = str(msg.get(sft_columns["content_field"], ""))[:300]
                     
-                    if role == sft_columns["role_system"]:
-                        sys_text = content
-                    elif role == sft_columns["role_user"]:
-                        preview += f"{user_tag}\n{content[:200]}{'...' if len(content) > 200 else ''}{sep}"
-                    elif role == sft_columns["role_assistant"]:
-                        preview += f"{assistant_tag}\n{content[:200]}{'...' if len(content) > 200 else ''}{sep}"
+                    # Маппинг ролей
+                    if role_val == sft_columns.get("role_system"):
+                        std_messages.append({"role": "system", "content": content_val})
+                    elif role_val == sft_columns.get("role_user"):
+                        std_messages.append({"role": "user", "content": content_val})
+                    elif role_val == sft_columns.get("role_assistant"):
+                        std_messages.append({"role": "assistant", "content": content_val})
                 
-                preview = f"{sys_text}{sep}" + preview + "<|endoftext|>"
+                # Если нет системного сообщения, добавляем дефолтное
+                if not std_messages or std_messages[0]["role"] != "system":
+                    std_messages.insert(0, {"role": "system", "content": default_system})
+                
+                # Используем chat_template если есть
+                if use_model_chat_template and sft_tokenizer:
+                    try:
+                        preview = sft_tokenizer.apply_chat_template(
+                            std_messages,
+                            tokenize=False,
+                            add_generation_prompt=False
+                        )
+                        st.caption("✨ Превью сформировано через **chat_template модели**")
+                    except Exception as e:
+                        st.warning(f"Ошибка apply_chat_template: {e}. Используем fallback.")
+                        use_model_chat_template = False
+                
+                # Fallback: простой формат с тегами
+                if not use_model_chat_template or not preview:
+                    sep = "\n\n"
+                    sys_text = default_system
+                    preview = ""
+                    
+                    for msg in messages:
+                        role = str(msg.get(sft_columns["role_field"], ""))
+                        content = str(msg.get(sft_columns["content_field"], ""))
+                        
+                        if role == sft_columns["role_system"]:
+                            sys_text = content
+                        elif role == sft_columns["role_user"]:
+                            preview += f"{user_tag}\n{content[:200]}{'...' if len(content) > 200 else ''}{sep}"
+                        elif role == sft_columns["role_assistant"]:
+                            preview += f"{assistant_tag}\n{content[:200]}{'...' if len(content) > 200 else ''}{sep}"
+                    
+                    preview = f"{sys_text}{sep}" + preview + "<|endoftext|>"
+                    st.caption("ℹ️ Превью сформировано через **теги** (chat_template не используется)")
             else:
+                # Instruct формат
                 user_val = str(get_nested_value(sample, sft_columns["instruction"]) or "")[:300]
                 asst_val = str(get_nested_value(sample, sft_columns["output"]) or "")[:300]
                 
-                # System prompt: сначала пытаемся получить из семпла, если указано поле
+                # System prompt
                 sys_val = default_system
                 system_field = sft_columns.get("system_field")
-                
-                # Если указано поле system_field, пытаемся получить значение из семпла
                 if system_field and system_field != "(не выбрано)" and system_field.strip():
                     field_sys = get_nested_value(sample, system_field)
-                    # Если значение найдено и не пустое, используем его вместо дефолтного
                     if field_sys is not None:
                         field_sys_str = str(field_sys).strip()
                         if field_sys_str:
                             sys_val = field_sys_str[:200]
                 
-                # Формируем превью: системный промпт всегда показываем в начале
-                # ВАЖНО: системный промпт должен быть виден, даже если он дефолтный
-                preview = f"{sys_val}{sep}{user_tag}\n{user_val}{sep}{assistant_tag}\n{asst_val}<|endoftext|>"
+                # Формируем messages для chat_template
+                std_messages = [
+                    {"role": "system", "content": sys_val},
+                    {"role": "user", "content": user_val},
+                    {"role": "assistant", "content": asst_val}
+                ]
+                
+                # Используем chat_template если есть
+                if use_model_chat_template and sft_tokenizer:
+                    try:
+                        preview = sft_tokenizer.apply_chat_template(
+                            std_messages,
+                            tokenize=False,
+                            add_generation_prompt=False
+                        )
+                        st.caption("✨ Превью сформировано через **chat_template модели**")
+                    except Exception as e:
+                        st.warning(f"Ошибка apply_chat_template: {e}. Используем fallback.")
+                        use_model_chat_template = False
+                
+                # Fallback
+                if not use_model_chat_template or not preview:
+                    sep = "\n\n"
+                    preview = f"{sys_val}{sep}{user_tag}\n{user_val}{sep}{assistant_tag}\n{asst_val}<|endoftext|>"
+                    st.caption("ℹ️ Превью сформировано через **теги** (chat_template не используется)")
             
             with st.container(height=400):
                 st.code(preview, language=None)
@@ -5780,10 +5856,70 @@ def main():
             # Передаем full_config, чтобы калькулятор памяти видел batch_size и grad_checkpoint
             render_model_preview(full_config, distributed_config)
             
-            # SFT Config (Main Area)
+            # SFT: Chat Template модели (отдельный блок ПЕРЕД настройкой данных)
+            if model_config.get("stage") == "sft" and model_config.get("base_model_path"):
+                st.markdown("---")
+                st.markdown("### 📝 Chat Template модели")
+                
+                # Загружаем chat_template из базовой модели
+                base_model_path = model_config.get("base_model_path")
+                model_chat_template = None
+                
+                try:
+                    from transformers import AutoTokenizer
+                    with st.spinner("Загрузка chat_template из модели..."):
+                        tok = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
+                        # Сохраняем токенизатор в session_state для использования в превью
+                        st.session_state.sft_tokenizer = tok
+                        if hasattr(tok, 'chat_template') and tok.chat_template:
+                            model_chat_template = tok.chat_template
+                except Exception as e:
+                    st.warning(f"Не удалось загрузить токенизатор: {e}")
+                    st.session_state.sft_tokenizer = None
+                
+                # Показываем статус
+                if model_chat_template:
+                    st.success(f"✅ Chat template загружен из модели `{Path(base_model_path).name}`")
+                else:
+                    st.info("ℹ️ У базовой модели нет chat_template. Будет сгенерирован автоматически при сохранении.")
+                
+                # Инициализируем session_state если нужно
+                if "sft_user_chat_template" not in st.session_state:
+                    st.session_state.sft_user_chat_template = model_chat_template or ""
+                
+                # Редактируемое поле для chat_template
+                user_chat_template = st.text_area(
+                    "Chat Template (Jinja2):",
+                    value=st.session_state.sft_user_chat_template,
+                    height=200,
+                    key="sft_chat_template_field",
+                    help="Jinja2 шаблон для форматирования диалогов. Оставьте пустым для автогенерации.",
+                    placeholder="Оставьте пустым для автогенерации на основе тегов..."
+                )
+                
+                # Синхронизируем с session_state
+                st.session_state.sft_user_chat_template = user_chat_template
+                
+                # Кнопки управления
+                col_btn1, col_btn2, col_btn3 = st.columns(3)
+                with col_btn1:
+                    if model_chat_template and st.button("↩️ Вернуть из модели", key="sft_restore_template"):
+                        st.session_state.sft_user_chat_template = model_chat_template
+                        st.rerun()
+                with col_btn2:
+                    if st.button("🗑️ Очистить", key="sft_clear_template"):
+                        st.session_state.sft_user_chat_template = ""
+                        st.rerun()
+                with col_btn3:
+                    if user_chat_template.strip():
+                        st.caption(f"Длина: {len(user_chat_template)} символов")
+                
+                # Добавляем chat_template в конфиг
+                full_config["chat_template"] = user_chat_template.strip() if user_chat_template.strip() else None
+            
+            # SFT Config (Main Area) - настройка данных
             if model_config.get("stage") == "sft" and dataset_config.get("data_path"):
                 st.markdown("---")
-                # Вызываем функцию (даже если она дублирована, вызовется последняя определенная)
                 sft_cfg = render_sft_main_config(dataset_config["data_path"])
                 full_config.update(sft_cfg)
             

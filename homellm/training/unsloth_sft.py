@@ -144,36 +144,79 @@ def run_unsloth_sft(
         dataset = load_dataset(data_path, split="train")
     
     # === Форматирование данных для SFT ===
+    # Проверяем наличие chat_template
+    use_chat_template = hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template
+    if use_chat_template:
+        logger.info("🦥 Using model's chat_template for formatting")
+    else:
+        logger.info("🦥 Using sft_template tags for formatting")
+    
     def format_instruction(example):
         """Форматирует пример в instruction-response формат."""
         fmt = sft_columns.get("format", "instruct")
         
         if fmt == "chat":
             # Chat format с messages
-            messages_col = sft_columns.get("messages", "messages")
+            messages_col = sft_columns.get("messages_path") or sft_columns.get("messages", "messages")
             messages = example.get(messages_col, [])
             if not messages:
                 return {"text": ""}
             
+            # Получаем маппинг полей и ролей
+            role_field = sft_columns.get("role_field", "role")
+            content_field = sft_columns.get("content_field", "content")
+            role_system = sft_columns.get("role_system", "system")
+            role_user = sft_columns.get("role_user", "user")
+            role_assistant = sft_columns.get("role_assistant", "assistant")
+            default_system = sft_template.get("system", "You are a helpful assistant.")
+            
+            # Конвертируем в стандартный формат messages
+            std_messages = []
+            has_system = False
+            
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                role_val = str(msg.get(role_field, ""))
+                content_val = str(msg.get(content_field, ""))
+                
+                if role_val == role_system:
+                    std_messages.append({"role": "system", "content": content_val})
+                    has_system = True
+                elif role_val == role_user:
+                    std_messages.append({"role": "user", "content": content_val})
+                elif role_val == role_assistant:
+                    std_messages.append({"role": "assistant", "content": content_val})
+            
+            # Добавляем системное сообщение если его нет
+            if not has_system:
+                std_messages.insert(0, {"role": "system", "content": default_system})
+            
             # Применяем chat template если есть
-            if hasattr(tokenizer, "apply_chat_template"):
-                text = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
-            else:
-                # Fallback к простому форматированию
-                text = ""
-                for msg in messages:
-                    role = msg.get("role", "")
-                    content = msg.get("content", "")
-                    if role == "user":
-                        text += f"### User:\n{content}\n\n"
-                    elif role == "assistant":
-                        text += f"### Assistant:\n{content}\n\n"
-                    elif role == "system":
-                        text += f"{content}\n\n"
+            if use_chat_template:
+                try:
+                    text = tokenizer.apply_chat_template(
+                        std_messages,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                    )
+                    return {"text": text}
+                except Exception as e:
+                    logger.warning(f"apply_chat_template failed: {e}")
+            
+            # Fallback к простому форматированию через теги
+            user_tag = sft_template.get("user_tag", "### User:")
+            bot_tag = sft_template.get("bot_tag", "### Assistant:")
+            sep = sft_template.get("separator", "\n\n")
+            
+            text = ""
+            for msg in std_messages:
+                if msg["role"] == "system":
+                    text = f"{msg['content']}{sep}"
+                elif msg["role"] == "user":
+                    text += f"{user_tag}\n{msg['content']}{sep}"
+                elif msg["role"] == "assistant":
+                    text += f"{bot_tag}\n{msg['content']}{sep}"
             
             return {"text": text}
         else:
@@ -186,13 +229,35 @@ def run_unsloth_sft(
             inp = example.get(input_col, "")
             output = example.get(output_col, "")
             
+            if not instruction and not output:
+                return {"text": ""}
+            
             # Шаблон
             system = sft_template.get("system", "You are a helpful assistant.")
+            
+            # Если есть chat_template — используем его для instruct тоже
+            if use_chat_template:
+                user_content = f"{instruction}\n\nInput: {inp}" if inp else instruction
+                std_messages = [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": output}
+                ]
+                try:
+                    text = tokenizer.apply_chat_template(
+                        std_messages,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                    )
+                    return {"text": text}
+                except Exception:
+                    pass  # Fallback below
+            
+            # Fallback к тегам
             user_tag = sft_template.get("user_tag", "### User:")
             bot_tag = sft_template.get("bot_tag", "### Assistant:")
             separator = sft_template.get("separator", "\n\n")
             
-            # Формируем текст
             text = f"{system}{separator}"
             if inp:
                 text += f"{user_tag}{separator}{instruction}\n\nInput: {inp}{separator}"
@@ -310,6 +375,41 @@ def run_unsloth_sft(
     
     final_dir = output_dir / "final_model"
     final_dir.mkdir(parents=True, exist_ok=True)
+    
+    # --- Устанавливаем chat_template перед сохранением ---
+    # Приоритет: пользовательский chat_template > генерация из sft_template
+    user_chat_template = config.get("chat_template")
+    if user_chat_template:
+        tokenizer.chat_template = user_chat_template
+        logger.info("🦥 Using user-provided chat_template")
+    elif config.get("sft_template"):
+        tmpl = config["sft_template"]
+        default_sys = tmpl.get("system", "You are a helpful assistant.")
+        u_tag = tmpl.get("user_tag", "### User:")
+        b_tag = tmpl.get("bot_tag", "### Assistant:")
+        
+        default_sys_escaped = default_sys.replace("'", "\\'")
+        u_tag_escaped = u_tag.replace("'", "\\'")
+        b_tag_escaped = b_tag.replace("'", "\\'")
+        
+        tokenizer.chat_template = (
+            "{% if messages and messages[0]['role'] == 'system' %}"
+            "{{ messages[0]['content'] }}\n\n"
+            "{% else %}"
+            f"{{{{ '{default_sys_escaped}' }}}}\n\n"
+            "{% endif %}"
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}"
+            f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+            "{% elif message['role'] == 'assistant' %}"
+            f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            f"{b_tag_escaped}\n"
+            "{% endif %}"
+        )
+        logger.info(f"🦥 Generated chat_template from sft_template (user_tag='{u_tag}')")
     
     # Сохраняем LoRA адаптеры (если use_lora=True) или всю модель
     if use_lora:
