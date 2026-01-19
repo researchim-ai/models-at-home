@@ -953,11 +953,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     with accelerator.autocast():
                         out = model(**batch)
                         loss = out.loss.detach()
-                    # Усредняем loss по всем процессам (каждый процесс видит свою часть val данных)
-                    loss = accelerator.reduce(loss, reduction="mean")
-                    # Сохраняем только на main process, чтобы избежать дублирования
-                    if accelerator.is_main_process:
-                        losses.append(loss.item())
+                        # Усредняем loss по всем процессам (каждый процесс видит свою часть val данных)
+                        loss = accelerator.reduce(loss, reduction="mean")
+                        # Сохраняем только на main process, чтобы избежать дублирования
+                        if accelerator.is_main_process:
+                            losses.append(loss.item())
             model.train()
             if not losses:
                 return None
@@ -1093,8 +1093,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                             # STANDARD PATH
                             outputs = model(**batch)
                             loss = outputs.loss
-                    
-                    loss_val = loss.detach().float().item()
+                        
+                        loss_val = loss.detach().float().item()
                     
                     # КРИТИЧНО: если loss NaN/Inf - пропускаем этот шаг и останавливаемся
                     if math.isnan(loss_val) or math.isinf(loss_val):

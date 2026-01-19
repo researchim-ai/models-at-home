@@ -84,10 +84,11 @@ def run_unsloth_grpo(
     """
     import os
     
-    # === Проверка multi-GPU ===
+    # === Проверка и инициализация multi-GPU ===
     # Unsloth имеет экспериментальную поддержку multi-GPU
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
     
     if world_size > 1:
         logger.warning("=" * 60)
@@ -95,6 +96,24 @@ def run_unsloth_grpo(
         logger.warning(f"   WORLD_SIZE={world_size}, LOCAL_RANK={local_rank}")
         logger.warning("   При проблемах используйте 'models-at-home backend'")
         logger.warning("=" * 60)
+        
+        # ВАЖНО: Инициализируем torch.distributed РАНЬШЕ загрузки модели
+        # чтобы можно было использовать барьеры для последовательной загрузки
+        if not torch.distributed.is_initialized():
+            logger.info(f"🦥 Rank {rank}: Initializing torch.distributed for sequential model loading...")
+            torch.distributed.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                world_size=world_size,
+                rank=rank,
+            )
+            torch.cuda.set_device(local_rank)
+            logger.info(f"🦥 Rank {rank}: torch.distributed initialized!")
+        
+        # ВАЖНО: Барьер чтобы все процессы дождались инициализации друг друга
+        logger.info(f"🦥 Rank {rank}: Waiting for all processes to initialize...")
+        torch.distributed.barrier()
+        logger.info(f"🦥 Rank {rank}: All processes ready!")
     
     # === Определяем режим тюнинга ДО импорта Unsloth ===
     tuning_method = config.get("tuning_method", "full")
@@ -215,30 +234,57 @@ def run_unsloth_grpo(
     # fast_inference=True включает vLLM для быстрой генерации (ВАЖНО для скорости!)
     # НО: fast_inference НЕ совместим с trust_remote_code!
     # НО: fast_inference требует LoRA, не работает с full_finetuning
-    # НО: fast_inference НЕ работает с multi-GPU (DDP) — каждый процесс пытается запустить vLLM!
     
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_multi_gpu = world_size > 1
+    rank = int(os.environ.get("RANK", 0))
     
-    if use_lora and not is_multi_gpu:
-        # Single GPU + LoRA: включаем fast_inference для скорости
-        load_kwargs["fast_inference"] = True  # Включаем vLLM!
+    if use_lora:
+        # LoRA mode: включаем fast_inference для скорости
         load_kwargs["max_lora_rank"] = lora_r
         load_kwargs["gpu_memory_utilization"] = gpu_memory_utilization
-        # НЕ добавляем trust_remote_code — несовместимо с fast_inference!
-        logger.info(f"🦥 Single GPU: Enabling fast_inference (vLLM) with max_lora_rank={lora_r}, gpu_util={gpu_memory_utilization}")
-    elif use_lora and is_multi_gpu:
-        # Multi-GPU + LoRA: fast_inference не поддерживается!
-        load_kwargs["trust_remote_code"] = True
-        logger.warning(f"⚠️ Multi-GPU ({world_size} GPUs): fast_inference disabled (not supported with DDP)")
-        logger.info("🦥 Multi-GPU LoRA mode: using standard inference (slower but works)")
+        
+        if is_multi_gpu:
+            # Multi-GPU: vLLM конфликтует при DDP, отключаем fast_inference
+            # Unsloth официально: "Unsloth currently does not support multi GPU setups"
+            # Но DDP для training работает, просто без vLLM для генерации
+            load_kwargs["fast_inference"] = False
+            logger.warning("=" * 60)
+            logger.warning("⚠️ Multi-GPU + fast_inference (vLLM) НЕ поддерживается Unsloth!")
+            logger.warning("   Отключаю fast_inference для стабильной работы.")
+            logger.warning("   Для максимальной скорости используйте single GPU:")
+            logger.warning("   CUDA_VISIBLE_DEVICES=0 python -m homellm.training.rl.train_gsm8k")
+            logger.warning("=" * 60)
+            logger.info(f"🦥 Multi-GPU ({world_size} GPUs): Training with DDP (без vLLM)")
+        else:
+            load_kwargs["fast_inference"] = True  # Включаем vLLM только для single GPU!
+            logger.info(f"🦥 Single GPU: Enabling fast_inference (vLLM) with max_lora_rank={lora_r}, gpu_util={gpu_memory_utilization}")
     else:
-        # Full fine-tuning: vLLM не поддерживается, но модель тренируется
+        # Full fine-tuning: vLLM не поддерживается
         load_kwargs["full_finetuning"] = full_finetuning
-        load_kwargs["trust_remote_code"] = True  # Только без fast_inference
+        load_kwargs["trust_remote_code"] = True
         logger.info("🦥 Full fine-tuning mode: fast_inference disabled (not supported)")
     
-    model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+    # === MULTI-GPU: Последовательная загрузка моделей ===
+    # При DDP каждый процесс загружает свою копию модели.
+    # vLLM + компиляция могут конфликтовать при одновременной загрузке.
+    # Решение: загружаем модели ПОСЛЕДОВАТЕЛЬНО — один за одним.
+    
+    if is_multi_gpu and torch.distributed.is_initialized():
+        # Каждый rank ждёт своей очереди
+        for loading_rank in range(world_size):
+            if rank == loading_rank:
+                logger.info(f"🦥 Rank {rank}/{world_size}: Loading model NOW...")
+                model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+                logger.info(f"🦥 Rank {rank}/{world_size}: Model loaded successfully!")
+            # Синхронизация после каждой загрузки
+            torch.distributed.barrier()
+            if rank != loading_rank:
+                logger.info(f"🦥 Rank {rank}: Rank {loading_rank} finished loading, continuing...")
+        logger.info(f"🦥 Rank {rank}: All {world_size} models loaded!")
+    else:
+        # Single GPU — просто загружаем
+        model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
     
     # === Добавляем LoRA адаптеры ===
     if use_lora:
@@ -272,6 +318,11 @@ def run_unsloth_grpo(
             random_state=42,
             max_seq_length=max_seq_length,
         )
+    
+    # Барьер после добавления LoRA адаптеров
+    if is_multi_gpu and torch.distributed.is_initialized():
+        logger.info(f"🦥 Rank {rank}: LoRA adapters added, syncing all processes...")
+        torch.distributed.barrier()
     
     # Pad token
     if tokenizer.pad_token is None:

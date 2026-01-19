@@ -1330,7 +1330,11 @@ def render_sft_main_config(data_path: str):
 # ============================================================================
 
 def render_grpo_sidebar_config():
-    """Конфигурация GRPO в сайдбаре."""
+    """Конфигурация GRPO в сайдбаре.
+    
+    Training Backend теперь выбирается в render_model_config() (до выбора модели),
+    вместе с методом тюнинга (lora/qlora/full).
+    """
     st.sidebar.subheader("🧠 Параметры GRPO")
     
     # Алгоритм
@@ -1721,6 +1725,8 @@ def render_grpo_sidebar_config():
     )
     
     return {
+        # Training Backend теперь в render_model_config()
+        
         # GRPO параметры (обязательные)
         "grpo_algorithm": algorithm,
         "grpo_group_size": group_size,
@@ -3060,13 +3066,65 @@ def render_model_config():
                     "чужой код. Используйте только проверенные репозитории."
                 )
     
+    # === Training Backend (только для GRPO!) ===
+    # Для pretrain/sft используем models-at-home по умолчанию
+    if selected_stage == "grpo":
+        st.sidebar.subheader("⚙️ Training Backend")
+        
+        backend_options = ["🏠 models-at-home", "🦥 Unsloth"]
+        selected_backend_display = st.sidebar.radio(
+            "Backend",
+            backend_options,
+            index=0,  # По умолчанию models-at-home
+            help=(
+                "**🏠 models-at-home** (рекомендуется):\n"
+                "• Multi-GPU поддержка (DDP)\n"
+                "• Full fine-tuning + LoRA/QLoRA\n"
+                "• FlashAttention + Liger Kernels\n\n"
+                "**🦥 Unsloth** (быстрее на 1 GPU):\n"
+                "• ⚡ 2x быстрее на **одной GPU**\n"
+                "• 💾 До 70% меньше VRAM\n"
+                "• ⚠️ **Только LoRA/QLoRA** (не full)\n"
+                "• ⚠️ Multi-GPU: работает, но без fast_inference"
+            ),
+            key="training_backend_radio"
+        )
+        training_backend = "unsloth" if "Unsloth" in selected_backend_display else "models-at-home"
+        
+        # Показываем информацию о backend
+        if training_backend == "unsloth":
+            try:
+                import unsloth
+                st.sidebar.success("🦥 **Unsloth**: 2x быстрее, 70% меньше VRAM")
+                st.sidebar.caption("⚠️ Только LoRA/QLoRA • 1 GPU для fast_inference")
+            except ImportError:
+                st.sidebar.error("🦥 **Unsloth не установлен!**")
+        else:
+            st.sidebar.info("🏠 **models-at-home**: Multi-GPU, Full/LoRA/QLoRA")
+        
+        st.sidebar.markdown("---")
+    else:
+        # Для pretrain/sft — всегда models-at-home
+        training_backend = "models-at-home"
+    
     # Метод тюнинга (full/LoRA/QLoRA)
     st.sidebar.subheader("🎯 Метод тюнинга")
+    
+    # При Unsloth (только GRPO) доступны только lora/qlora
+    if training_backend == "unsloth":
+        tuning_options = ["lora", "qlora"]
+        tuning_index = 0  # lora по умолчанию
+        tuning_help = "Unsloth поддерживает только LoRA и QLoRA (не full fine-tuning)"
+    else:
+        tuning_options = ["full", "lora", "qlora"]
+        tuning_index = 0  # full по умолчанию
+        tuning_help = "full: полный fine-tuning, lora: LoRA, qlora: QLoRA (4-bit + LoRA)"
+    
     tuning_method = st.sidebar.selectbox(
         "Метод",
-        ["full", "lora", "qlora"],
-        index=0,
-        help="full: полный fine-tuning, lora: LoRA, qlora: QLoRA (4-bit + LoRA)"
+        tuning_options,
+        index=tuning_index,
+        help=tuning_help
     )
     
     lora_r = None
@@ -3144,6 +3202,7 @@ def render_model_config():
     # Сборка конфига
     config = {
         "stage": selected_stage,
+        "training_backend": training_backend,  # "models-at-home" или "unsloth"
         "base_model_path": base_model_path,
         "model_name_input": model_name,
         "model_id": model_id if model_id else None,
@@ -3486,7 +3545,7 @@ def get_available_models():
     return models
 
 
-def render_distributed_config(training_config: dict | None = None):
+def render_distributed_config(training_config: dict | None = None, is_grpo: bool = False, grpo_backend: str | None = None):
     """Конфигурация GPU, параллелизма и памяти."""
     st.sidebar.header("🖥️ GPU и Память")
     
@@ -3600,48 +3659,52 @@ def render_distributed_config(training_config: dict | None = None):
     st.sidebar.subheader("🧠 Precision & Memory")
     
     # === Backend selector ===
-    # Выбор между нашим backend и Unsloth
-    backend_options = ["🏠 models-at-home", "🦥 Unsloth (2x faster)"]
-    default_backend = training_config.get("training_backend", "models-at-home") if training_config else "models-at-home"
-    default_idx = 1 if default_backend == "unsloth" else 0
-    
-    selected_backend_display = st.sidebar.radio(
-        "Training Backend",
-        backend_options,
-        index=default_idx,
-        help=(
-            "**🏠 models-at-home**: Наш backend с FlashAttention + Liger Kernels\n\n"
-            "**🦥 Unsloth**: Оптимизированный backend от Unsloth AI:\n"
-            "• 2x быстрее обучение\n"
-            "• До 70% меньше VRAM\n"
-            "• Triton ядра (RMSNorm, RoPE, MLP)\n"
-            "• Умный gradient checkpointing\n\n"
-            "⚠️ Unsloth пока не поддерживает multi-GPU"
-        ),
-    )
-    training_backend = "unsloth" if "Unsloth" in selected_backend_display else "models-at-home"
-    
-    # Показываем информацию о выбранном backend
-    if training_backend == "unsloth":
-        # Проверяем доступность Unsloth
-        try:
-            import unsloth
-            unsloth_available = True
-        except ImportError:
-            unsloth_available = False
+    # Для GRPO backend выбирается в render_grpo_sidebar_config(), здесь не показываем
+    if not is_grpo:
+        backend_options = ["🏠 models-at-home", "🦥 Unsloth (2x faster)"]
+        default_backend = training_config.get("training_backend", "models-at-home") if training_config else "models-at-home"
+        default_idx = 1 if default_backend == "unsloth" else 0
         
-        if unsloth_available:
-            st.sidebar.success("🦥 **Unsloth режим**: ускорение + экономия памяти")
+        selected_backend_display = st.sidebar.radio(
+            "Training Backend",
+            backend_options,
+            index=default_idx,
+            help=(
+                "**🏠 models-at-home**: Наш backend с FlashAttention + Liger Kernels\n\n"
+                "**🦥 Unsloth**: Оптимизированный backend от Unsloth AI:\n"
+                "• 2x быстрее обучение\n"
+                "• До 70% меньше VRAM\n"
+                "• Triton ядра (RMSNorm, RoPE, MLP)\n"
+                "• Умный gradient checkpointing\n\n"
+                "⚠️ Unsloth пока не поддерживает multi-GPU"
+            ),
+        )
+        training_backend = "unsloth" if "Unsloth" in selected_backend_display else "models-at-home"
+        
+        # Показываем информацию о выбранном backend
+        if training_backend == "unsloth":
+            # Проверяем доступность Unsloth
+            try:
+                import unsloth
+                unsloth_available = True
+            except ImportError:
+                unsloth_available = False
+            
+            if unsloth_available:
+                st.sidebar.success("🦥 **Unsloth режим**: ускорение + экономия памяти")
+            else:
+                st.sidebar.error("🦥 **Unsloth не установлен!**")
+                st.sidebar.caption("Пересоберите Docker образ: `docker compose build`")
+            
+            if num_gpus > 1:
+                st.sidebar.warning("⚠️ Unsloth пока не поддерживает multi-GPU. Будет использована 1 GPU.")
         else:
-            st.sidebar.error("🦥 **Unsloth не установлен!**")
-            st.sidebar.caption("Пересоберите Docker образ: `docker compose build`")
+            st.sidebar.info("🏠 **models-at-home режим**: FlashAttn + Liger")
         
-        if num_gpus > 1:
-            st.sidebar.warning("⚠️ Unsloth пока не поддерживает multi-GPU. Будет использована 1 GPU.")
+        st.sidebar.markdown("---")
     else:
-        st.sidebar.info("🏠 **models-at-home режим**: FlashAttn + Liger")
-    
-    st.sidebar.markdown("---")
+        # Для GRPO backend передаётся из model_config (выбран в render_model_config)
+        training_backend = grpo_backend if grpo_backend else "models-at-home"
 
     # Если training_config передан (SFT/Pretrain) — берём дефолт из него, иначе bf16 (GRPO дефолт)
     default_mp = (training_config.get("mixed_precision") if training_config else None) or "bf16"
@@ -5612,11 +5675,13 @@ def main():
             "batch_size": grpo_sidebar_config.get("grpo_train_batch_size", 2),
             "gradient_accumulation": grpo_sidebar_config.get("gradient_accumulation", 4),
         }
-        distributed_config = render_distributed_config(training_config=dummy_training_config)
+        # Передаём training_backend из model_config (выбран до метода тюнинга)
+        grpo_backend = model_config.get("training_backend", "models-at-home")
+        distributed_config = render_distributed_config(training_config=dummy_training_config, is_grpo=True, grpo_backend=grpo_backend)
     else:
         grpo_sidebar_config = {}
         training_config = render_training_config()
-        distributed_config = render_distributed_config(training_config=training_config)
+        distributed_config = render_distributed_config(training_config=training_config, is_grpo=False)
     
     # Передаем stage в dataset_config
     # Для GRPO датасет настраивается в main area
@@ -5695,7 +5760,11 @@ def main():
     full_config["use_flash_attention"] = distributed_config.get("use_flash_attention", True)
     full_config["use_liger"] = distributed_config.get("use_liger", True)
     full_config["liger_fused_ce"] = distributed_config.get("liger_fused_ce", False)  # Fused CE для pretrain/SFT
-    full_config["training_backend"] = distributed_config.get("training_backend", "models-at-home")  # "models-at-home" или "unsloth"
+    # Для GRPO training_backend берётся из grpo_sidebar_config (уже в full_config)
+    # Для остальных режимов — из distributed_config
+    if current_stage != "grpo":
+        full_config["training_backend"] = distributed_config.get("training_backend", "models-at-home")
+    # Для GRPO training_backend уже есть в full_config из grpo_sidebar_config
     
     # Для SFT, Continual Pretrain и GRPO используем токенизатор базовой модели
     if model_config.get("stage") in ("sft", "continual_pretrain", "grpo") and model_config.get("base_model_path"):
