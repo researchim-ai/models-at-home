@@ -1,7 +1,7 @@
 # HomeLLM - FSDP (Fully Sharded Data Parallel)
 # =============================================
 # PyTorch native шардирование модели по GPU
-# Рекомендуется для моделей >1B параметров на нескольких GPU
+# БЕЗ CPU Offload — Liger fused CE работает!
 #
 # Использование:
 #   accelerate launch --config_file configs/accelerate_fsdp.yaml \
@@ -17,15 +17,18 @@ main_training_function: main
 fsdp_config:
   # Стратегия шардирования:
   # - FULL_SHARD: полное шардирование параметров, градиентов и состояния оптимизатора
-  # - SHARD_GRAD_OP: шардирование только градиентов и состояния оптимизатора
+  # - SHARD_GRAD_OP: шардирование только градиентов и состояния оптимизатора (Liger CE работает!)
   # - NO_SHARD: без шардирования (как DDP)
-  fsdp_sharding_strategy: FULL_SHARD
+  # 
+  # SHARD_GRAD_OP: параметры unsharded после forward — Liger fused CE совместим!
+  fsdp_sharding_strategy: SHARD_GRAD_OP
   
   # Автоматическое оборачивание слоёв
+  # Класс определяется автоматически в trainer_worker.py (HomeBlock, Qwen2DecoderLayer, etc.)
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
-  fsdp_transformer_layer_cls_to_wrap: HomeBlock
+  # fsdp_transformer_layer_cls_to_wrap задаётся программно
   
-  # Offload на CPU для экономии VRAM
+  # CPU Offload ОТКЛЮЧЁН — Liger fused CE совместим!
   fsdp_offload_params: false
   fsdp_cpu_ram_efficient_loading: true
   

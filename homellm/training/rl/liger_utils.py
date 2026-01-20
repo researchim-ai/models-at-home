@@ -720,31 +720,168 @@ class LigerFusedCEModule(nn.Module):
             reduction=reduction,
         )
         
-        # Сохраняем ссылку на модель (не на weight!) для поддержки ZeRO-3
+        # Сохраняем ссылку на модель (не на weight!) для поддержки ZeRO-3/FSDP
         self.model = model
         self.accelerator = accelerator
         
-        # Определяем, используется ли ZeRO-3
-        self.is_zero3 = False
-        if accelerator is not None:
-            try:
-                ds_plugin = getattr(accelerator.state, 'deepspeed_plugin', None)
-                if ds_plugin is not None:
-                    zero_stage = getattr(ds_plugin, 'zero_stage', 0)
-                    self.is_zero3 = zero_stage == 3
-                    if self.is_zero3:
-                        logger.info("✅ LigerFusedCEModule: обнаружен ZeRO-3, будем использовать GatheredParameters")
-            except Exception as e:
-                logger.warning(f"⚠️ Не удалось определить ZeRO stage: {e}")
+        # Флаги distributed — определяются в runtime через _check_distributed()
+        self._is_zero3: Optional[bool] = None
+        self._is_fsdp: Optional[bool] = None
+        self._distributed_checked = False
+        self._dtensor_fallback_warned = False  # Для однократного warning о FSDP2/DTensor
         
         logger.info(f"✅ LigerFusedCEModule инициализирован (ignore_index={ignore_index}, causal_shift=True)")
     
+    def _check_distributed(self):
+        """Проверяет тип distributed обёртки (вызывается лениво при первом forward)."""
+        if self._distributed_checked:
+            return
+        self._distributed_checked = True
+        
+        # Проверяем accelerator plugins
+        if self.accelerator is not None:
+            try:
+                ds_plugin = getattr(self.accelerator.state, 'deepspeed_plugin', None)
+                if ds_plugin is not None:
+                    zero_stage = getattr(ds_plugin, 'zero_stage', 0)
+                    self._is_zero3 = zero_stage == 3
+                    if self._is_zero3:
+                        logger.info("✅ LigerFusedCEModule: обнаружен ZeRO-3, будем использовать GatheredParameters")
+                
+                fsdp_plugin = getattr(self.accelerator.state, 'fsdp_plugin', None)
+                if fsdp_plugin is not None:
+                    self._is_fsdp = True
+                    logger.info("✅ LigerFusedCEModule: обнаружен FSDP plugin")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось проверить accelerator plugins: {e}")
+        
+        # Также проверяем тип обёртки модели напрямую
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            model = self.model
+            # Проверяем DDP -> FSDP
+            if hasattr(model, 'module'):
+                model = model.module
+            if isinstance(model, FSDP) or hasattr(model, '_fsdp_wrapped_module'):
+                self._is_fsdp = True
+                logger.info("✅ LigerFusedCEModule: модель обёрнута в FSDP")
+        except ImportError:
+            pass
+        
+        # Fallback на False если не определено
+        if self._is_zero3 is None:
+            self._is_zero3 = False
+        if self._is_fsdp is None:
+            self._is_fsdp = False
+    
+    def _unwrap_model(self):
+        """Unwrap модель из DDP/FSDP/DeepSpeed обёртки."""
+        model = self.model
+        # DDP
+        if hasattr(model, 'module'):
+            model = model.module
+        # FSDP
+        if hasattr(model, '_fsdp_wrapped_module'):
+            model = model._fsdp_wrapped_module
+        return model
+    
     def _get_lm_head_params(self):
-        """Получает weight и bias из lm_head модели."""
-        lm_head = self.model.lm_head
+        """Получает weight и bias из lm_head модели (с unwrap)."""
+        unwrapped = self._unwrap_model()
+        lm_head = unwrapped.lm_head
         weight = lm_head.weight
         bias = getattr(lm_head, 'bias', None)
         return weight, bias
+    
+    def _get_lm_head(self):
+        """Получает lm_head модуль (с unwrap)."""
+        unwrapped = self._unwrap_model()
+        return unwrapped.lm_head
+
+    def set_model(self, model: "PreTrainedModel") -> None:
+        """Обновляет ссылку на модель (нужно после accelerator.prepare/FSDP)."""
+        self.model = model
+        # Сбрасываем флаг чтобы перепроверить distributed обёртку
+        self._distributed_checked = False
+        self._is_zero3 = None
+        self._is_fsdp = None
+        self._is_dtensor = None  # Сбрасываем кеш DTensor проверки
+    
+    def is_supported(self) -> bool:
+        """Проверяет, поддерживается ли Liger fused CE для текущей конфигурации.
+        
+        Returns:
+            True если можно использовать fused CE, False если нужен стандартный path.
+        """
+        if self._is_dtensor is not None:
+            return not self._is_dtensor
+        
+        try:
+            lm_head = self._get_lm_head()
+            weight = lm_head.weight
+            
+            # Проверяем на DTensor (FSDP2)
+            try:
+                from torch.distributed.tensor import DTensor
+                self._is_dtensor = isinstance(weight, DTensor)
+            except ImportError:
+                self._is_dtensor = hasattr(weight, '_local_tensor') or type(weight).__name__ == 'DTensor'
+            
+            if self._is_dtensor:
+                logger.warning(
+                    "⚠️ FSDP2 (DTensor) обнаружен — Liger fused CE несовместим. "
+                    "Будет использован стандартный model forward. "
+                    "(Liger патчи RMSNorm/RoPE/MLP всё ещё активны!)"
+                )
+                return False
+            
+            # Проверяем на FSDP
+            if self.accelerator is not None:
+                fsdp_plugin = getattr(self.accelerator.state, 'fsdp_plugin', None)
+                if fsdp_plugin is not None:
+                    # Получаем стратегию шардирования
+                    sharding_strategy = getattr(fsdp_plugin, 'sharding_strategy', None)
+                    sharding_strategy_name = str(sharding_strategy).split('.')[-1] if sharding_strategy else "UNKNOWN"
+                    
+                    # Получаем ожидаемый vocab_size и hidden_size из модели
+                    unwrapped = self._unwrap_model()
+                    expected_vocab = getattr(unwrapped.config, 'vocab_size', None)
+                    expected_hidden = getattr(unwrapped.config, 'hidden_size', None)
+                    
+                    logger.info(
+                        f"🔍 FSDP check: strategy={sharding_strategy_name}, "
+                        f"weight.shape={weight.shape}, weight.ndim={weight.ndim}, "
+                        f"expected=[{expected_vocab}, {expected_hidden}]"
+                    )
+                    
+                    # SHARD_GRAD_OP: параметры unsharded после forward — Liger совместим
+                    # FULL_SHARD: параметры в FlatParameter — Liger несовместим
+                    if "SHARD_GRAD_OP" in sharding_strategy_name or "NO_SHARD" in sharding_strategy_name:
+                        logger.info(f"✅ FSDP {sharding_strategy_name} совместим с Liger fused CE")
+                        return True
+                    
+                    # Для FULL_SHARD и HYBRID_SHARD проверяем форму weight
+                    is_valid_shape = (
+                        weight.ndim == 2 and
+                        expected_vocab is not None and
+                        expected_hidden is not None and
+                        weight.shape[0] == expected_vocab and
+                        weight.shape[1] == expected_hidden
+                    )
+                    
+                    if not is_valid_shape:
+                        logger.warning(
+                            f"⚠️ FSDP {sharding_strategy_name} — lm_head.weight шардирован "
+                            f"({list(weight.shape)} вместо [{expected_vocab}, {expected_hidden}]). "
+                            "Liger fused CE несовместим. Будет использован стандартный model forward. "
+                            "(Liger патчи RMSNorm/RoPE/MLP всё ещё активны!)"
+                        )
+                        self._is_dtensor = True  # Помечаем как неподдерживаемый
+                        return False
+            
+            return True
+        except Exception:
+            return True  # По умолчанию поддерживается
     
     def forward(
         self,
@@ -783,14 +920,20 @@ class LigerFusedCEModule(nn.Module):
         shift_labels = shift_labels.reshape(-1)
         
         # ============================================================
-        # ZeRO-3: собираем lm_head.weight через GatheredParameters
+        # Проверяем distributed обёртку (лениво, один раз)
         # ============================================================
-        if self.is_zero3:
+        self._check_distributed()
+        
+        # ============================================================
+        # ZeRO-3 / FSDP: собираем параметры перед вызовом Liger
+        # ============================================================
+        if self._is_zero3:
             return self._forward_with_gathered_params(shift_hidden, shift_labels)
-        else:
-            # Стандартный путь: прямой доступ к параметрам
-            weight, bias = self._get_lm_head_params()
-            return self.loss_fn(weight, shift_hidden, shift_labels, bias)
+        if self._is_fsdp:
+            return self._forward_with_fsdp_full_params(shift_hidden, shift_labels)
+        # Стандартный путь: прямой доступ к параметрам
+        weight, bias = self._get_lm_head_params()
+        return self.loss_fn(weight, shift_hidden, shift_labels, bias)
     
     def _forward_with_gathered_params(
         self,
@@ -801,7 +944,7 @@ class LigerFusedCEModule(nn.Module):
         try:
             from deepspeed.runtime.zero.partition_parameters import GatheredParameters
             
-            lm_head = self.model.lm_head
+            lm_head = self._get_lm_head()
             params_to_gather = [lm_head.weight]
             if hasattr(lm_head, 'bias') and lm_head.bias is not None:
                 params_to_gather.append(lm_head.bias)
@@ -816,6 +959,68 @@ class LigerFusedCEModule(nn.Module):
             logger.warning("⚠️ DeepSpeed не найден, используем прямой доступ к параметрам")
             weight, bias = self._get_lm_head_params()
             return self.loss_fn(weight, shift_hidden, shift_labels, bias)
+
+    def _forward_with_fsdp_full_params(
+        self,
+        shift_hidden: torch.Tensor,
+        shift_labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass для FSDP.
+        
+        FSDP1: используем summon_full_params для сбора параметров lm_head.
+        FSDP2 (DTensor): Liger fused CE НЕ поддерживает DTensor — должен быть отключён через is_supported().
+        """
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        except ImportError as e:
+            logger.warning(f"⚠️ FSDP недоступен ({e}), используем прямой доступ к параметрам")
+            weight, bias = self._get_lm_head_params()
+            return self.loss_fn(weight, shift_hidden, shift_labels, bias)
+
+        # Получаем lm_head модуль (unwrapped из DDP)
+        lm_head = self._get_lm_head()
+        weight = lm_head.weight
+        
+        # Проверяем на FSDP2 (DTensor)
+        try:
+            from torch.distributed.tensor import DTensor
+            is_dtensor = isinstance(weight, DTensor)
+        except ImportError:
+            is_dtensor = hasattr(weight, '_local_tensor') or type(weight).__name__ == 'DTensor'
+        
+        if is_dtensor:
+            raise RuntimeError(
+                "FSDP2 (DTensor) несовместим с Liger fused CE. "
+                "Вызовите liger_fused_ce.is_supported() перед использованием."
+            )
+        
+        # Находим корневой FSDP wrapper
+        fsdp_root = self.model
+        # Убираем DDP обёртку если есть
+        if hasattr(fsdp_root, 'module'):
+            fsdp_root = fsdp_root.module
+        
+        # Проверяем что это FSDP
+        if isinstance(fsdp_root, FSDP):
+            # Используем summon_full_params только для lm_head (recurse=False для экономии памяти)
+            # writeback=False — не записываем изменения обратно (только читаем)
+            with FSDP.summon_full_params(lm_head, recurse=False, writeback=False):
+                weight = lm_head.weight
+                bias = getattr(lm_head, 'bias', None)
+                
+                # Переносим на GPU если нужно (CPU offload)
+                target_device = shift_hidden.device
+                if weight.device != target_device:
+                    weight = weight.to(target_device)
+                    if bias is not None:
+                        bias = bias.to(target_device)
+                
+                return self.loss_fn(weight, shift_hidden, shift_labels, bias)
+        
+        # Fallback: прямой доступ (не FSDP-wrapped)
+        bias = getattr(lm_head, 'bias', None)
+        return self.loss_fn(weight, shift_hidden, shift_labels, bias)
+    
 
 
 def create_liger_grpo_loss(

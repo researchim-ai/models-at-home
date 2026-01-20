@@ -1,0 +1,46 @@
+# HomeLLM - FSDP + CPU Offload
+# =============================
+# PyTorch native шардирование с выгрузкой параметров на CPU
+# Экономит VRAM, но Liger fused CE ОТКЛЮЧЁН (нужен меньший batch size)
+#
+# Использование:
+#   accelerate launch --config_file configs/accelerate_fsdp_offload.yaml \
+#       -m homellm.training.pretrain --data_path ...
+
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: "bf16"
+num_processes: 2  # Измените на количество ваших GPU
+num_machines: 1
+main_training_function: main
+
+fsdp_config:
+  # Стратегия шардирования
+  # SHARD_GRAD_OP: параметры unsharded после forward — но с CPU offload всё равно на CPU
+  fsdp_sharding_strategy: SHARD_GRAD_OP
+  
+  # Автоматическое оборачивание слоёв
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  
+  # CPU Offload ВКЛЮЧЁН — экономия VRAM
+  # ⚠️ Liger fused CE отключается автоматически!
+  # ⚠️ Используйте меньший batch size (logits материализуются)
+  fsdp_offload_params: true
+  fsdp_cpu_ram_efficient_loading: true
+  
+  # Backward prefetch для ускорения
+  fsdp_backward_prefetch: BACKWARD_PRE
+  
+  # State dict type для сохранения
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  
+  # Синхронизация буферов между устройствами
+  fsdp_sync_module_states: true
+  
+  # Forward prefetch
+  fsdp_forward_prefetch: false
+  
+  # Использовать оригинальные параметры
+  fsdp_use_orig_params: true
+
+dynamo_backend: "no"

@@ -1,0 +1,42 @@
+# HomeLLM - FSDP2 (Fully Sharded Data Parallel v2)
+# ================================================
+# PyTorch FSDP2 с DTensor — улучшенное шардирование
+# + CPU Offload для экономии VRAM
+#
+# Использование:
+#   accelerate launch --config_file configs/accelerate_fsdp2.yaml \
+#       -m homellm.app.trainer_worker ...
+
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: "bf16"
+num_processes: 2  # Измените на количество ваших GPU
+num_machines: 1
+main_training_function: main
+
+fsdp_config:
+  # ========== FSDP2 ==========
+  fsdp_version: 2
+  
+  # Стратегия шардирования (FSDP2 style):
+  # - true: FULL_SHARD (полное шардирование, reshard после forward)
+  # - false: SHARD_GRAD_OP (шардирование только градиентов)
+  fsdp_reshard_after_forward: true
+  
+  # Автоматическое оборачивание слоёв
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  # Класс определяется автоматически в trainer_worker.py
+  
+  # ========== CPU Offload ==========
+  # Выгружает параметры на CPU — критично для экономии VRAM!
+  fsdp_offload_params: true
+  fsdp_cpu_ram_efficient_loading: true
+  
+  # State dict type для сохранения
+  # SHARDED_STATE_DICT — дефолт для FSDP2, без лишней коммуникации
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  
+  # Использовать оригинальные параметры (FSDP2 всегда использует, но оставим для совместимости)
+  fsdp_use_orig_params: true
+
+dynamo_backend: "no"

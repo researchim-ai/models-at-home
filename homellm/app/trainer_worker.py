@@ -800,6 +800,65 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 sharding_mode_requested=sharding_mode,
                 num_processes=int(accelerator.num_processes),
             )
+
+        # FSDP: проверяем, что заданный transformer layer класс реально есть в модели.
+        # Делать это нужно ДО accelerator.prepare(), независимо от режима шардинга данных.
+        fsdp_plugin = getattr(accelerator.state, "fsdp_plugin", None)
+        if fsdp_plugin is not None:
+            def _model_has_layer_class(class_name: str) -> bool:
+                for _m in model.modules():
+                    if _m.__class__.__name__ == class_name:
+                        return True
+                return False
+
+            def _infer_fsdp_wrap_cls():
+                skip = {
+                    "ModuleList", "ModuleDict", "Sequential", "Embedding", "Linear",
+                    "LayerNorm", "RMSNorm", "Dropout", "SiLU", "GELU", "ReLU",
+                }
+                counts = {}
+                cls_by_name = {}
+                for _m in model.modules():
+                    name = _m.__class__.__name__
+                    if name in skip:
+                        continue
+                    if name.endswith("DecoderLayer") or name.endswith("Block") or name.endswith("Layer"):
+                        counts[name] = counts.get(name, 0) + 1
+                        cls_by_name[name] = _m.__class__
+                if not counts:
+                    return None
+                best_name = max(counts, key=counts.get)
+                if counts[best_name] < 2:
+                    return None
+                return cls_by_name[best_name]
+
+            # Читаем текущее значение из plugin (может быть set/frozenset)
+            cfg_names = []
+            current_wrap = getattr(fsdp_plugin, "transformer_cls_names_to_wrap", None)
+            if current_wrap:
+                if isinstance(current_wrap, (set, frozenset, list, tuple)):
+                    cfg_names = [n for n in current_wrap if isinstance(n, str)]
+                elif isinstance(current_wrap, str):
+                    cfg_names = [current_wrap]
+            # Фильтруем пустые и "auto" значения
+            cfg_names = [n for n in cfg_names if n and n.lower() != "auto"]
+
+            # Если класс не задан, "auto", или не найден в модели — выводим автоматически
+            need_infer = not cfg_names or not any(_model_has_layer_class(n) for n in cfg_names)
+            if need_infer:
+                inferred_cls = _infer_fsdp_wrap_cls()
+                if inferred_cls is not None:
+                    inferred_name = inferred_cls.__name__
+                    # Устанавливаем в правильный атрибут accelerate
+                    fsdp_plugin.transformer_cls_names_to_wrap = {inferred_name}
+                    logger.info(
+                        f"✅ FSDP: автоопределён transformer layer класс: {inferred_name}"
+                    )
+                else:
+                    logger.warning(
+                        "⚠️ FSDP: не удалось определить transformer layer класс. "
+                        "Если prepare() упадёт, укажите fsdp_transformer_layer_cls_to_wrap в конфиге."
+                    )
         if is_streaming_sharded:
             if val_loader is not None:
                 model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
@@ -815,6 +874,26 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 model, optimizer, train_loader, lr_scheduler = accelerator.prepare(
                     model, optimizer, train_loader, lr_scheduler
                 )
+
+        # После accelerator.prepare модель может быть обёрнута (FSDP/DeepSpeed).
+        # Обновляем ссылку в LigerFusedCEModule, чтобы корректно собирать параметры.
+        if liger_fused_ce_loss is not None and hasattr(liger_fused_ce_loss, "set_model"):
+            try:
+                liger_fused_ce_loss.set_model(model)
+                # Проверяем поддержку (FSDP/DTensor не поддерживается)
+                logger.info("🔍 Проверяем is_supported()...")
+                if hasattr(liger_fused_ce_loss, "is_supported"):
+                    is_supported = liger_fused_ce_loss.is_supported()
+                    logger.info(f"🔍 is_supported() вернул: {is_supported}")
+                    if not is_supported:
+                        logger.info("🦁 Liger fused CE отключён (несовместимо с FSDP/DTensor), используем стандартный path")
+                        liger_fused_ce_loss = None  # Отключаем fused CE
+                else:
+                    logger.warning("⚠️ is_supported() метод не найден")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка в set_model/is_supported: {e}")
+                import traceback
+                logger.warning(traceback.format_exc())
         
         # Resume из checkpoint (универсально для всех стадий)
         starting_step = 0
@@ -944,6 +1023,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             
             ВАЖНО: val_loader зашардирован для всех процессов, поэтому каждый процесс
             видит свою часть validation данных. reduce() корректно усредняет loss по всем процессам.
+            
+            Оптимизация памяти:
+            - use_cache=False: не накапливаем KV-cache
+            - Если Liger fused CE доступен — используем его (не материализуем logits)
+            - Иначе стандартный forward (но logits материализуются)
             """
             model.eval()
             losses = []
@@ -954,14 +1038,32 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     # Если DataLoader не был подготовлен accelerate'ом — вручную кладём батч на устройство
                     if is_streaming_sharded:
                         batch = {k: (v.to(accelerator.device) if hasattr(v, "to") else v) for k, v in batch.items()}
+                    
                     with accelerator.autocast():
-                        out = model(**batch)
-                        loss = out.loss.detach()
+                        # Используем Liger fused CE если доступен (не материализует logits)
+                        if liger_fused_ce_loss is not None:
+                            labels = batch.pop("labels", None)
+                            outputs = model(**batch, output_hidden_states=True, use_cache=False)
+                            batch["labels"] = labels
+                            hidden_states = outputs.hidden_states[-1]
+                            loss = liger_fused_ce_loss(hidden_states, labels).detach()
+                        else:
+                            # Стандартный forward — logits материализуются, но память освобождается сразу
+                            out = model(**batch, use_cache=False)
+                            loss = out.loss.detach()
+                            del out  # Явно освобождаем память от logits
+                        
                         # Усредняем loss по всем процессам (каждый процесс видит свою часть val данных)
                         loss = accelerator.reduce(loss, reduction="mean")
                         # Сохраняем только на main process, чтобы избежать дублирования
                         if accelerator.is_main_process:
                             losses.append(loss.item())
+                        del loss  # Освобождаем память
+                
+                # Очищаем CUDA cache после eval
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
             model.train()
             if not losses:
                 return None
