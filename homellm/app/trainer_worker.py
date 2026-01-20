@@ -649,6 +649,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 # 🔥 Fused Linear CrossEntropy — НЕ материализует logits!
                 # Экономит гигабайты памяти при большом vocab_size
                 # ВАЖНО: Fused CE работает для ЛЮБОЙ модели с lm_head, не только HF моделей!
+                # ⚠️ Для ZeRO-3 передаём accelerator для корректного сбора шардированных параметров
                 if liger_fused_ce:
                     # Проверяем есть ли lm_head у модели
                     has_lm_head = hasattr(model, 'lm_head') and model.lm_head is not None
@@ -658,6 +659,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                                 model,
                                 ignore_index=-100,
                                 label_smoothing=config.get("label_smoothing", 0.0),
+                                accelerator=accelerator,  # ✅ Для ZeRO-3 поддержки
                             )
                             if liger_fused_ce_loss:
                                 logger.info("🦁 LigerFusedLinearCrossEntropyLoss активирован!")

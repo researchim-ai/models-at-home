@@ -685,6 +685,9 @@ class LigerFusedCEModule(nn.Module):
     - hidden_states[:-1] предсказывают labels[1:]
     - Это стандартное поведение для language modeling (next-token prediction)
     
+    ⚠️ DeepSpeed ZeRO-3: Используем GatheredParameters для сбора lm_head.weight
+    перед вызовом Liger, так как Triton kernels не работают с шардированными параметрами.
+    
     Использование:
         # Вместо:
         logits = model.lm_head(hidden_states)
@@ -693,7 +696,7 @@ class LigerFusedCEModule(nn.Module):
         loss = F.cross_entropy(shift_logits.view(-1, vocab), shift_labels.view(-1))
         
         # Используйте:
-        loss_module = LigerFusedCEModule(model)
+        loss_module = LigerFusedCEModule(model, accelerator=accelerator)
         loss = loss_module(hidden_states, labels)  # Сдвиг делается внутри!
     """
     
@@ -703,6 +706,7 @@ class LigerFusedCEModule(nn.Module):
         ignore_index: int = -100,
         label_smoothing: float = 0.0,
         reduction: str = "mean",
+        accelerator: Optional[Any] = None,
     ):
         super().__init__()
         
@@ -716,11 +720,31 @@ class LigerFusedCEModule(nn.Module):
             reduction=reduction,
         )
         
-        # Сохраняем ссылку на lm_head
-        self.lm_head_weight = model.lm_head.weight
-        self.lm_head_bias = getattr(model.lm_head, 'bias', None)
+        # Сохраняем ссылку на модель (не на weight!) для поддержки ZeRO-3
+        self.model = model
+        self.accelerator = accelerator
+        
+        # Определяем, используется ли ZeRO-3
+        self.is_zero3 = False
+        if accelerator is not None:
+            try:
+                ds_plugin = getattr(accelerator.state, 'deepspeed_plugin', None)
+                if ds_plugin is not None:
+                    zero_stage = getattr(ds_plugin, 'zero_stage', 0)
+                    self.is_zero3 = zero_stage == 3
+                    if self.is_zero3:
+                        logger.info("✅ LigerFusedCEModule: обнаружен ZeRO-3, будем использовать GatheredParameters")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось определить ZeRO stage: {e}")
         
         logger.info(f"✅ LigerFusedCEModule инициализирован (ignore_index={ignore_index}, causal_shift=True)")
+    
+    def _get_lm_head_params(self):
+        """Получает weight и bias из lm_head модели."""
+        lm_head = self.model.lm_head
+        weight = lm_head.weight
+        bias = getattr(lm_head, 'bias', None)
+        return weight, bias
     
     def forward(
         self,
@@ -758,13 +782,40 @@ class LigerFusedCEModule(nn.Module):
         shift_hidden = shift_hidden.reshape(-1, hidden_size)
         shift_labels = shift_labels.reshape(-1)
         
-        # LigerFusedLinearCrossEntropyLoss.forward(lin_weight, _input, target, bias)
-        return self.loss_fn(
-            self.lm_head_weight,  # [vocab, hidden]
-            shift_hidden,        # [batch*(seq-1), hidden]
-            shift_labels,        # [batch*(seq-1)]
-            self.lm_head_bias,   # [vocab] или None
-        )
+        # ============================================================
+        # ZeRO-3: собираем lm_head.weight через GatheredParameters
+        # ============================================================
+        if self.is_zero3:
+            return self._forward_with_gathered_params(shift_hidden, shift_labels)
+        else:
+            # Стандартный путь: прямой доступ к параметрам
+            weight, bias = self._get_lm_head_params()
+            return self.loss_fn(weight, shift_hidden, shift_labels, bias)
+    
+    def _forward_with_gathered_params(
+        self,
+        shift_hidden: torch.Tensor,
+        shift_labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass с GatheredParameters для ZeRO-3."""
+        try:
+            from deepspeed.runtime.zero.partition_parameters import GatheredParameters
+            
+            lm_head = self.model.lm_head
+            params_to_gather = [lm_head.weight]
+            if hasattr(lm_head, 'bias') and lm_head.bias is not None:
+                params_to_gather.append(lm_head.bias)
+            
+            # modifier_rank=None: все ранки могут читать собранные параметры
+            with GatheredParameters(params_to_gather, modifier_rank=None):
+                weight = lm_head.weight
+                bias = getattr(lm_head, 'bias', None)
+                return self.loss_fn(weight, shift_hidden, shift_labels, bias)
+                
+        except ImportError:
+            logger.warning("⚠️ DeepSpeed не найден, используем прямой доступ к параметрам")
+            weight, bias = self._get_lm_head_params()
+            return self.loss_fn(weight, shift_hidden, shift_labels, bias)
 
 
 def create_liger_grpo_loss(
@@ -814,12 +865,16 @@ def create_liger_fused_ce(
     model: "PreTrainedModel",
     ignore_index: int = -100,
     label_smoothing: float = 0.0,
+    accelerator: Optional[Any] = None,
 ) -> Optional[LigerFusedCEModule]:
     """
     Создаёт LigerFusedCEModule если Liger доступен.
     
+    ⚠️ ВАЖНО: Для DeepSpeed ZeRO-3 необходимо передать accelerator!
+    Без этого Liger не сможет корректно собрать шардированные веса lm_head.
+    
     Использование для pretrain/SFT:
-        loss_fn = create_liger_fused_ce(model)
+        loss_fn = create_liger_fused_ce(model, accelerator=accelerator)
         if loss_fn:
             # Используем fused loss (не материализует logits)
             outputs = model(input_ids, output_hidden_states=True)
@@ -841,6 +896,7 @@ def create_liger_fused_ce(
             model=model,
             ignore_index=ignore_index,
             label_smoothing=label_smoothing,
+            accelerator=accelerator,
         )
     except Exception as e:
         logger.warning(f"⚠️ Не удалось создать LigerFusedCEModule: {e}")
