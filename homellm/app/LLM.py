@@ -1881,8 +1881,12 @@ def render_grpo_main_config(data_path: str = None):
         dataset_options.append(str(f))
     
     # Если data_path передан, используем его
+    # Также проверяем session_state для сохранения выбора между рендерами
     default_idx = 0
-    if data_path and data_path in dataset_options:
+    saved_selection = st.session_state.get("grpo_dataset_selectbox")
+    if saved_selection and saved_selection in dataset_options:
+        default_idx = dataset_options.index(saved_selection)
+    elif data_path and data_path in dataset_options:
         default_idx = dataset_options.index(data_path)
     elif data_path:
         # Проверяем по имени файла
@@ -1895,12 +1899,15 @@ def render_grpo_main_config(data_path: str = None):
         "Выберите датасет",
         options=dataset_options,
         index=default_idx,
+        key="grpo_dataset_selectbox",
         help="Скачайте датасеты на вкладке 'Данные' → 🧠 Reasoning: GSM8K, MATH-RU и др."
     )
     
     # Обрабатываем выбор
     if selected_dataset and not selected_dataset.startswith("--"):
         grpo_dataset_path = selected_dataset
+        # Сохраняем в session_state для render_quick_summary()
+        st.session_state.grpo_dataset_path = grpo_dataset_path
         st.success(f"✅ Выбран: `{Path(selected_dataset).name}`")
         
         # Определяем язык по имени файла
@@ -1909,6 +1916,9 @@ def render_grpo_main_config(data_path: str = None):
         else:
             grpo_dataset_language = "en"
     else:
+        # Очищаем session_state если датасет не выбран
+        if "grpo_dataset_path" in st.session_state:
+            del st.session_state.grpo_dataset_path
         st.warning("⚠️ Выберите датасет или скачайте его на вкладке **💾 Данные** → 🧠 Reasoning")
     
     # Настройки датасета
@@ -5468,6 +5478,163 @@ def calculate_memory_footprint(config, batch_size, distributed_mode="default", n
         return out
 
 
+def render_quick_summary(model_config: dict, dataset_config: dict, distributed_config: dict, full_config: dict = None) -> bool:
+    """
+    Отображает быструю табличку с выбранными параметрами (модель, данные, режим).
+    Возвращает True если все 3 параметра выбраны, иначе False.
+    """
+    # Получаем информацию о модели
+    model_name = model_config.get("model_name_input", "Не выбрано")
+    base_model_path = model_config.get("base_model_path")
+    stage = model_config.get("stage", "pretrain")
+    
+    if base_model_path:
+        model_display = f"{Path(base_model_path).name}"
+    elif model_name and model_name != "Не выбрано":
+        model_display = model_name
+    else:
+        model_display = "❌ Не выбрано"
+    
+    # Получаем информацию о данных
+    # Для GRPO датасет может быть в full_config (grpo_dataset_path), session_state или выбирается в main area
+    data_path = dataset_config.get("data_path")
+    if not data_path and stage == "grpo":
+        # Сначала проверяем selectbox напрямую через его key (самый надежный способ)
+        selectbox_value = st.session_state.get("grpo_dataset_selectbox")
+        if selectbox_value and not selectbox_value.startswith("--"):
+            data_path = selectbox_value
+        # Затем проверяем session_state (обновляется в render_grpo_main_config)
+        if not data_path:
+            data_path = st.session_state.get("grpo_dataset_path")
+        # Затем проверяем full_config (обновляется после render_grpo_main_config)
+        if not data_path and full_config:
+            data_path = full_config.get("grpo_dataset_path")
+            # Инициализируем session_state из full_config если там есть датасет
+            if data_path and "grpo_dataset_path" not in st.session_state:
+                st.session_state.grpo_dataset_path = data_path
+    
+    if data_path:
+        data_display = Path(data_path).name
+    elif stage == "grpo":
+        data_display = "📝 Выберите в настройках ниже"
+    else:
+        data_display = "❌ Не выбрано"
+    
+    # Получаем информацию о режиме тренировки
+    distributed_mode = distributed_config.get("distributed_mode", "default")
+    mode_info = PARALLEL_TYPES.get(distributed_mode, PARALLEL_TYPES["default"])
+    training_mode_display = mode_info.get("name", "Не выбрано")
+    
+    # Проверяем что все выбрано
+    has_model = model_display != "❌ Не выбрано"
+    # Для GRPO датасет может быть выбран позже в main area
+    has_data = data_display != "❌ Не выбрано" and "Выберите в настройках ниже" not in data_display
+    has_mode = distributed_mode != "default" or distributed_config.get("num_gpus", 1) > 0
+    
+    # Для GRPO датасет обязателен, но выбирается в main area (после render_quick_summary)
+    # Проверяем через session_state или full_config
+    if stage == "grpo":
+        # Для GRPO датасет обязателен для запуска
+        all_selected = has_model and has_mode and has_data
+    else:
+        all_selected = has_model and has_data and has_mode
+    
+    # Отображаем табличку
+    st.markdown("""
+    <style>
+    .quick-summary {
+        background: linear-gradient(135deg, #1e1e1e 0%, #2a2a2a 100%);
+        border: 2px solid #444;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 2rem;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+    }
+    .quick-summary-header {
+        color: #ff6b6b;
+        font-size: 1.3rem;
+        font-weight: 700;
+        margin-bottom: 1rem;
+        text-align: center;
+    }
+    .quick-summary-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 1rem;
+        margin-top: 1rem;
+    }
+    .quick-summary-item {
+        background: #1a1a1a;
+        border: 1px solid #333;
+        border-radius: 8px;
+        padding: 1rem;
+        text-align: center;
+    }
+    .quick-summary-number {
+        font-size: 2rem;
+        font-weight: 800;
+        color: #ff6b6b;
+        margin-bottom: 0.5rem;
+    }
+    .quick-summary-label {
+        color: #888;
+        font-size: 0.9rem;
+        margin-bottom: 0.5rem;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+    }
+    .quick-summary-value {
+        color: #fff;
+        font-size: 1.1rem;
+        font-weight: 600;
+        word-break: break-word;
+    }
+    .quick-summary-check {
+        color: #22c55e;
+        font-size: 1.5rem;
+        margin-top: 0.5rem;
+    }
+    .quick-summary-warning {
+        color: #f59e0b;
+        font-size: 0.9rem;
+        margin-top: 0.5rem;
+        font-style: italic;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Определяем иконки и цвета
+    check_icon = "✅" if all_selected else "⚠️"
+    status_color = "#22c55e" if all_selected else "#f59e0b"
+    
+    st.markdown(f"""
+    <div class="quick-summary">
+        <div class="quick-summary-header">
+            Конфигурация тренировки
+        </div>
+        <div class="quick-summary-grid">
+            <div class="quick-summary-item">
+                <div class="quick-summary-label">Модель</div>
+                <div class="quick-summary-value">{model_display}</div>
+                {"<div class='quick-summary-check'>✅</div>" if has_model else "<div class='quick-summary-warning'>⚠️ Выберите модель</div>"}
+            </div>
+            <div class="quick-summary-item">
+                <div class="quick-summary-label">Данные</div>
+                <div class="quick-summary-value">{data_display}</div>
+                {"<div class='quick-summary-check'>✅</div>" if has_data else "<div class='quick-summary-warning'>⚠️ Выберите датасет</div>"}
+            </div>
+            <div class="quick-summary-item">
+                <div class="quick-summary-label">Режим тренировки</div>
+                <div class="quick-summary-value">{training_mode_display}</div>
+                {"<div class='quick-summary-check'>✅</div>" if has_mode else "<div class='quick-summary-warning'>⚠️ Выберите режим</div>"}
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    return all_selected
+
+
 def render_model_preview(config: dict, distributed_config: dict = None):
     """Превью архитектуры модели и настроек параллелизма."""
     st.subheader("📐 Архитектура модели")
@@ -5905,6 +6072,9 @@ def main():
         col1, col2 = st.columns([2, 1])
         
         with col1:
+            # Конфигурация тренировки
+            all_ready = render_quick_summary(model_config, dataset_config, distributed_config, full_config)
+            
             # Передаем full_config, чтобы калькулятор памяти видел batch_size и grad_checkpoint
             render_model_preview(full_config, distributed_config)
             
@@ -6000,7 +6170,8 @@ def main():
             else:
                 # Для GRPO отдельная кнопка и запуск
                 if model_config.get("stage") == "grpo":
-                    if st.button("🧠 Начать GRPO обучение", type="primary"):
+                    button_disabled = not all_ready
+                    if st.button("🧠 Начать GRPO обучение", type="primary", disabled=button_disabled):
                         with st.spinner("Запуск GRPO..."):
                             run_id, process = start_grpo_training(full_config)
                             st.session_state.current_run_id = run_id
@@ -6010,8 +6181,11 @@ def main():
                             st.success(f"GRPO обучение запущено! Run ID: {run_id}")
                             time.sleep(1)
                             st.rerun()
+                    if button_disabled:
+                        st.caption("⚠️ Выберите модель, данные и режим тренировки для запуска")
                 else:
-                    if st.button("▶️ Начать тренировку", type="primary"):
+                    button_disabled = not all_ready
+                    if st.button("▶️ Начать тренировку", type="primary", disabled=button_disabled):
                         with st.spinner("Запуск..."):
                             run_id, process = start_training(full_config)
                             st.session_state.current_run_id = run_id
@@ -6022,6 +6196,8 @@ def main():
                             st.success(f"Тренировка запущена! Run ID: {run_id}")
                             time.sleep(1)
                             st.rerun()
+                    if button_disabled:
+                        st.caption("⚠️ Выберите модель, данные и режим тренировки для запуска")
     
     with tab2:
         # Используем fragment для автоматического обновления без перезагрузки страницы
