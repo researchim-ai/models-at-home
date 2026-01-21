@@ -1214,19 +1214,30 @@ The assistant first thinks about the reasoning process in the mind and then prov
     final_dir = output_dir / "final_model"
     final_dir.mkdir(parents=True, exist_ok=True)
     
+    # merge_lora по умолчанию True — для единообразия с models-at-home backend
+    # final_model/ содержит merged модель для удобного inference
+    merge_lora = config.get("merge_lora", True)
+    
     if use_lora:
-        model.save_pretrained(final_dir)
-        tokenizer.save_pretrained(final_dir)
-        logger.info(f"🦥 Saved LoRA adapters to {final_dir}")
-        
-        if config.get("merge_lora", False):
-            merged_dir = output_dir / "merged_model"
-            merged_dir.mkdir(parents=True, exist_ok=True)
+        if merge_lora:
+            # Сначала сохраняем LoRA адаптеры отдельно (до merge)
+            lora_dir = output_dir / "lora_adapters"
+            lora_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(lora_dir)
+            tokenizer.save_pretrained(lora_dir)
+            logger.info(f"🦥 Saved LoRA adapters to {lora_dir}")
             
-            model = model.merge_and_unload()
-            model.save_pretrained(merged_dir)
-            tokenizer.save_pretrained(merged_dir)
-            logger.info(f"🦥 Saved merged model to {merged_dir}")
+            # Merge LoRA в базовую модель и сохранить в final_model/
+            logger.info("🦥 Merging LoRA adapters into base model...")
+            merged_model = model.merge_and_unload()
+            merged_model.save_pretrained(final_dir)
+            tokenizer.save_pretrained(final_dir)
+            logger.info(f"🦥 Saved merged model to {final_dir}")
+        else:
+            # Сохранить только LoRA адаптеры
+            model.save_pretrained(final_dir)
+            tokenizer.save_pretrained(final_dir)
+            logger.info(f"🦥 Saved LoRA adapters to {final_dir}")
     else:
         model.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)

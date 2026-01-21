@@ -438,6 +438,7 @@ def main():
         config.save_steps = int(ui_config.get("save_every", config.save_steps))
         config.log_steps = int(ui_config.get("log_every", config.log_steps))
         config.export_on_checkpoint = bool(ui_config.get("export_on_checkpoint", config.export_on_checkpoint))
+        config.merge_lora = bool(ui_config.get("merge_lora", True))  # Merge LoRA при сохранении final_model
 
         # Путь до run_dir, который создал UI (для "железного" мониторинга).
         # Если задан, trainer будет дублировать metrics/samples в эту директорию.

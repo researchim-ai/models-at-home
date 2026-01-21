@@ -504,7 +504,13 @@ def load_metrics(run_id: str) -> dict:
                     if "samples" in df.columns:
                         latest["samples_history"] = df["samples"].tolist()
                     
-                    latest["status"] = latest.get("status", "training")
+                    # Статус может быть NaN из pandas, нужно привести к строке
+                    raw_status = latest.get("status")
+                    import math
+                    if raw_status is None or (isinstance(raw_status, float) and math.isnan(raw_status)):
+                        latest["status"] = "training"
+                    else:
+                        latest["status"] = str(raw_status)
                     latest["stage"] = "grpo"
 
                     # Фактические счётчики (если есть в jsonl)
@@ -3553,6 +3559,16 @@ def render_output_config(model_name="training_run"):
         ),
     )
     
+    merge_lora = st.sidebar.checkbox(
+        "Merge LoRA в final_model",
+        value=True,
+        help=(
+            "Если включено, LoRA адаптеры будут объединены с базовой моделью при сохранении final_model. "
+            "Это упрощает inference (модель загружается как обычная HF модель), но увеличивает размер файла. "
+            "Если выключено, сохраняются только LoRA веса (требует PEFT для загрузки)."
+        ),
+    )
+    
     log_every = st.sidebar.number_input(
         "Log Every N Steps",
         min_value=1,
@@ -3577,6 +3593,7 @@ def render_output_config(model_name="training_run"):
         "output_dir": output_dir,
         "save_every": save_every,
         "export_on_checkpoint": export_on_checkpoint,
+        "merge_lora": merge_lora,
         "log_every": log_every,
         "tokenizer_path": "gpt2"
     }
@@ -3976,6 +3993,11 @@ def render_metrics_dashboard(metrics: dict):
     """Дашборд с метриками обучения."""
     
     status = metrics.get("status", "unknown")
+    # Преобразуем в строку (может быть NaN/float из pandas)
+    import math
+    if status is None or (isinstance(status, float) and math.isnan(status)):
+        status = "training"
+    status = str(status)
     
     # Status indicator
     status_emoji = {
@@ -6455,6 +6477,29 @@ def main():
                 with gen_col3:
                     top_p = st.slider("Top-p", 0.1, 1.0, 0.9, 0.05)
 
+                # Inference Backend
+                from homellm.app.vllm_chat import is_vllm_available
+                vllm_available = is_vllm_available()
+                
+                backend_options = ["Transformers"]
+                if vllm_available:
+                    backend_options.append("vLLM (быстрее)")
+                
+                if "chat_inference_backend" not in st.session_state:
+                    st.session_state.chat_inference_backend = "Transformers"
+                
+                inference_backend = st.selectbox(
+                    "Inference Backend",
+                    options=backend_options,
+                    index=backend_options.index(st.session_state.chat_inference_backend) if st.session_state.chat_inference_backend in backend_options else 0,
+                    help="vLLM значительно быстрее для генерации (continuous batching, PagedAttention), но требует больше VRAM при загрузке.",
+                    key="chat_backend_select",
+                )
+                st.session_state.chat_inference_backend = inference_backend
+                
+                if not vllm_available:
+                    st.caption("ℹ️ vLLM недоступен. Установите: `pip install vllm`")
+
                 # Режим промпта (2 режима, но дефолт выбираем автоматически):
                 # - если у модели есть chat_template -> Диалог
                 # - если нет -> Completion
@@ -6477,6 +6522,8 @@ def main():
                 st.session_state.chat_model_path = None
                 st.session_state.chat_has_template = False
                 st.session_state.chat_prompt_mode = "completion"
+                st.session_state.chat_backend = None  # VLLMChatBackend или TransformersChatBackend
+                st.session_state.chat_backend_type = "transformers"  # "transformers" или "vllm"
             
             if "messages" not in st.session_state:
                 st.session_state.messages = []
@@ -6489,69 +6536,143 @@ def main():
                             from transformers import AutoTokenizer, AutoModelForCausalLM
                             from homellm.models.adapters import detect_model_type
                             from homellm.models.home_model import HomeForCausalLM
+                            from homellm.app.vllm_chat import VLLMChatBackend, TransformersChatBackend, is_vllm_available
                             
                             model_path = Path(selected_model["path"])
                             device = "cuda" if torch.cuda.is_available() else "cpu"
                             dtype = torch.float16 if device == "cuda" else torch.float32
+                            dtype_str = "float16" if device == "cuda" else "float32"
                             
-                            # Проверяем наличие config.json
+                            # Проверяем наличие config.json или adapter_config.json
                             config_json = model_path / "config.json"
-                            if not config_json.exists():
-                                raise ValueError(f"config.json не найден в {model_path}")
+                            adapter_config_path = model_path / "adapter_config.json"
+                            is_lora_adapter = adapter_config_path.exists()
+                            
+                            if not config_json.exists() and not is_lora_adapter:
+                                raise ValueError(f"config.json или adapter_config.json не найден в {model_path}")
                             
                             # Определяем тип модели
-                            model_type = detect_model_type(model_path)
-                            st.info(f"Загружаем {model_type.upper()} модель...")
+                            model_type = detect_model_type(model_path) if config_json.exists() else "hf"
                             
-                            # Загружаем токенизатор
-                            try:
-                                tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
-                            except Exception:
-                                # Для accelerate checkpoint'ов токенизатора обычно нет внутри checkpoint_stepXXXX.
-                                # Пробуем взять tokenizer_path/base_model_path из run config.
-                                tokenizer = None
-                                try:
-                                    run_root = model_path.parent if "checkpoint" in model_path.name else model_path
-                                    run_id = run_root.name
-                                    run_cfg_path = RUNS_DIR / run_id / "config.json"
-                                    if run_cfg_path.exists():
-                                        with open(run_cfg_path, "r", encoding="utf-8") as f:
-                                            run_cfg = json.load(f)
-                                        tok_src = run_cfg.get("tokenizer_path") or run_cfg.get("base_model_path")
-                                        if tok_src:
-                                            tokenizer = AutoTokenizer.from_pretrained(str(tok_src), trust_remote_code=True)
-                                except Exception:
-                                    tokenizer = None
-
-                                if tokenizer is None:
-                                    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+                            # Выбранный backend
+                            use_vllm = inference_backend.startswith("vLLM") and is_vllm_available()
                             
-                            # Загружаем модель в зависимости от типа
-                            if model_type == "home":
-                                model = HomeForCausalLM.from_pretrained(str(model_path), torch_dtype=dtype)
+                            st.info(f"Загружаем модель через {'vLLM' if use_vllm else 'Transformers'}...")
+                            
+                            # === vLLM Backend ===
+                            if use_vllm:
+                                # Для LoRA адаптеров с vLLM: загружаем базовую модель + hot-swap LoRA
+                                if is_lora_adapter:
+                                    with open(adapter_config_path) as f:
+                                        adapter_cfg = json.load(f)
+                                    base_model_id = adapter_cfg.get("base_model_name_or_path")
+                                    
+                                    if not base_model_id:
+                                        raise ValueError("base_model_name_or_path не найден в adapter_config.json")
+                                    
+                                    st.info(f"Загружаем базовую модель в vLLM: {base_model_id}")
+                                    
+                                    chat_backend = VLLMChatBackend(
+                                        model_path=base_model_id,
+                                        dtype=dtype_str,
+                                        gpu_memory_utilization=0.9,
+                                        enable_lora=True,
+                                        max_lora_rank=adapter_cfg.get("r", 64),
+                                    )
+                                    chat_backend.set_lora(str(model_path))
+                                    st.success("✅ vLLM загружен с LoRA адаптером")
+                                else:
+                                    chat_backend = VLLMChatBackend(
+                                        model_path=str(model_path),
+                                        dtype=dtype_str,
+                                        gpu_memory_utilization=0.9,
+                                    )
+                                    st.success("✅ vLLM загружен")
+                                
+                                st.session_state.chat_model = None  # vLLM управляет моделью внутри
+                                st.session_state.chat_tokenizer = chat_backend.tokenizer
+                                st.session_state.chat_backend = chat_backend
+                                st.session_state.chat_backend_type = "vllm"
+                                st.session_state.chat_has_template = chat_backend.has_chat_template
+                            
+                            # === Transformers Backend ===
                             else:
-                                model = AutoModelForCausalLM.from_pretrained(
-                                    str(model_path), trust_remote_code=True, torch_dtype=dtype
-                                )
+                                # Загружаем токенизатор
+                                try:
+                                    tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+                                except Exception:
+                                    # Для accelerate checkpoint'ов токенизатора обычно нет внутри checkpoint_stepXXXX.
+                                    tokenizer = None
+                                    try:
+                                        run_root = model_path.parent if "checkpoint" in model_path.name else model_path
+                                        run_id = run_root.name
+                                        run_cfg_path = RUNS_DIR / run_id / "config.json"
+                                        if run_cfg_path.exists():
+                                            with open(run_cfg_path, "r", encoding="utf-8") as f:
+                                                run_cfg = json.load(f)
+                                            tok_src = run_cfg.get("tokenizer_path") or run_cfg.get("base_model_path")
+                                            if tok_src:
+                                                tokenizer = AutoTokenizer.from_pretrained(str(tok_src), trust_remote_code=True)
+                                    except Exception:
+                                        tokenizer = None
+
+                                    if tokenizer is None:
+                                        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+                                
+                                # Загрузка модели
+                                if is_lora_adapter:
+                                    st.info("🔄 Обнаружен LoRA адаптер, загружаем с merge...")
+                                    try:
+                                        from peft import PeftModel
+                                        
+                                        with open(adapter_config_path) as f:
+                                            adapter_cfg = json.load(f)
+                                        base_model_id = adapter_cfg.get("base_model_name_or_path")
+                                        
+                                        if not base_model_id:
+                                            raise ValueError("base_model_name_or_path не найден в adapter_config.json")
+                                        
+                                        st.info(f"Загружаем базовую модель: {base_model_id}")
+                                        
+                                        base_model = AutoModelForCausalLM.from_pretrained(
+                                            base_model_id, torch_dtype=dtype, trust_remote_code=True
+                                        )
+                                        model = PeftModel.from_pretrained(base_model, str(model_path))
+                                        
+                                        st.info("Merging LoRA адаптеры...")
+                                        model = model.merge_and_unload()
+                                        st.success("✅ LoRA адаптеры успешно объединены")
+                                        
+                                    except ImportError:
+                                        st.error("❌ Для загрузки LoRA адаптеров требуется peft. Установите: pip install peft")
+                                        raise
+                                else:
+                                    if model_type == "home":
+                                        model = HomeForCausalLM.from_pretrained(str(model_path), torch_dtype=dtype)
+                                    else:
+                                        model = AutoModelForCausalLM.from_pretrained(
+                                            str(model_path), trust_remote_code=True, torch_dtype=dtype
+                                        )
+                                
+                                model = model.to(device)
+                                model.eval()
+                                
+                                if tokenizer.pad_token is None:
+                                    if tokenizer.eos_token:
+                                        tokenizer.pad_token = tokenizer.eos_token
+                                
+                                chat_backend = TransformersChatBackend(model, tokenizer, device)
+                                
+                                st.session_state.chat_model = model
+                                st.session_state.chat_tokenizer = tokenizer
+                                st.session_state.chat_backend = chat_backend
+                                st.session_state.chat_backend_type = "transformers"
+                                st.session_state.chat_has_template = bool(getattr(tokenizer, "chat_template", None))
+                                st.success("✅ Transformers модель загружена!")
                             
-                            # Переносим на device
-                            model = model.to(device)
-                            model.eval()
-                            
-                            # Подготавливаем токенизатор (pad_token = eos_token)
-                            if tokenizer.pad_token is None:
-                                if tokenizer.eos_token:
-                                    tokenizer.pad_token = tokenizer.eos_token
-                            
-                            st.session_state.chat_model = model
-                            st.session_state.chat_tokenizer = tokenizer
                             st.session_state.chat_model_path = str(model_path)
                             st.session_state.messages = []
-                            # Автоподтягивание режима: если у токенизатора есть chat_template, ставим "Диалог",
-                            # иначе "Completion". Пользователь может переключить вручную после загрузки.
-                            st.session_state.chat_has_template = bool(getattr(tokenizer, "chat_template", None))
                             st.session_state.chat_prompt_mode = "chat" if st.session_state.chat_has_template else "completion"
-                            st.success("✅ Модель загружена!")
                             st.rerun()
                         except Exception as e:
                             import traceback
@@ -6679,17 +6800,15 @@ def main():
                         with st.chat_message("assistant"):
                             with st.spinner("Генерация..."):
                                 try:
+                                    chat_backend = st.session_state.chat_backend
                                     tokenizer = st.session_state.chat_tokenizer
                                     model = st.session_state.chat_model
-                                    device = next(model.parameters()).device
-                                    
-                                    # Формируем полный контекст
-                                    # Пользователь контролирует режим: auto/chat_template/plain
+                                    backend_type = st.session_state.get("chat_backend_type", "transformers")
                                     
                                     # Берем историю + новое сообщение
-                                    conversation = st.session_state.messages.copy() # [{"role": "user", ...}, ...]
+                                    conversation = st.session_state.messages.copy()
                                     
-                                    has_template = bool(getattr(tokenizer, "chat_template", None))
+                                    has_template = st.session_state.chat_has_template
                                     use_chat_template = (prompt_mode == "chat") and has_template
                                     if prompt_mode == "chat" and not has_template:
                                         st.warning("У выбранной модели нет chat_template — использую Completion.")
@@ -6699,107 +6818,30 @@ def main():
                                     if use_chat_template:
                                         system_prompt = st.session_state.get("system_prompt", "").strip()
                                         
-                                        # Удаляем существующее системное сообщение из conversation (если есть)
-                                        # чтобы не было конфликта с введенным системным промптом
                                         if conversation and conversation[0].get("role") == "system":
                                             conversation.pop(0)
                                         
-                                        # Если указан системный промпт, добавляем его в начало
                                         if system_prompt:
                                             conversation.insert(0, {"role": "system", "content": system_prompt})
-                                        # Если системный промпт пустой, шаблон использует дефолтный из модели
                                     
+                                    # Формируем prompt_text
                                     if use_chat_template:
-                                        # Для SFT модели: применяем шаблон с тегами
-                                        prompt_text = tokenizer.apply_chat_template(
+                                        prompt_text = chat_backend.apply_chat_template(
                                             conversation, 
-                                            tokenize=False, 
                                             add_generation_prompt=True
                                         )
                                     else:
-                                        # Для Base/Pretrain модели: просто текст
-                                        # Обычно Base модели не понимают диалог, но попробуем просто слать последний промпт
-                                        # или весь диалог текстом
                                         prompt_text = ""
                                         for m in conversation:
                                             prompt_text += f"{m['role']}: {m['content']}\n"
                                         prompt_text += "assistant: "
                                     
-                                    # ВАЖНО:
-                                    # - inputs должны быть на ТОМ ЖЕ устройстве, что и модель (модель может быть на cuda:1)
-                                    # - заранее проверяем, что token ids не выходят за vocab модели (иначе будет CUDA assert)
-                                    device = next(model.parameters()).device
-                                    device_type = str(device.type)
-
-                                    enc = tokenizer(prompt_text, return_tensors="pt")
-                                    try:
-                                        if hasattr(model, "get_input_embeddings") and model.get_input_embeddings() is not None:
-                                            vocab_size = int(model.get_input_embeddings().weight.shape[0])
-                                            max_id = int(enc["input_ids"].max().item())
-                                            min_id = int(enc["input_ids"].min().item())
-                                            if min_id < 0 or max_id >= vocab_size:
-                                                raise ValueError(
-                                                    f"Tokenizer выдаёт token_id вне vocab модели: min_id={min_id}, max_id={max_id}, "
-                                                    f"vocab_size(model)={vocab_size}. "
-                                                    f"Проверьте, что с моделью загружен правильный tokenizer (тот же, что был при обучении)."
-                                                )
-                                    except Exception as e:
-                                        raise RuntimeError(f"Проблема токенизации/вокаба перед генерацией: {e}")
-
-                                    inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in enc.items()}
-                                    
-                                    # Приводим dtype для стабильной генерации (особенно после SFT checkpoints bf16)
-                                    model_dtype = next(model.parameters()).dtype
-                                    autocast_enabled = (device_type == "cuda")
-                                    autocast_dtype = torch.bfloat16 if model_dtype == torch.bfloat16 else torch.float16
-
-                                    # attention_mask должен оставаться int/bool (не bf16/fp16).
-
-                                    # Ограничиваем контекстное окно (иначе возможен CUDA index out of bounds при позиционных индексах).
-                                    max_ctx = None
-                                    try:
-                                        cfg = getattr(model, "config", None)
-                                        for key in ("max_position_embeddings", "n_positions", "seq_len", "max_seq_len"):
-                                            if cfg is not None and hasattr(cfg, key):
-                                                v = getattr(cfg, key)
-                                                if v is not None:
-                                                    max_ctx = int(v)
-                                                    break
-                                    except Exception:
-                                        max_ctx = None
-
-                                    if max_ctx is not None and max_ctx > 0 and "input_ids" in inputs:
-                                        in_len = int(inputs["input_ids"].shape[1])
-                                        if in_len > max_ctx:
-                                            cut = in_len - max_ctx
-                                            inputs["input_ids"] = inputs["input_ids"][:, cut:]
-                                            if "attention_mask" in inputs and hasattr(inputs["attention_mask"], "shape"):
-                                                inputs["attention_mask"] = inputs["attention_mask"][:, cut:]
-                                            in_len = int(inputs["input_ids"].shape[1])
-
-                                        allowed_new = int(max_ctx - in_len)
-                                        if allowed_new <= 0:
-                                            raise RuntimeError(
-                                                f"Контекст уже достиг максимума модели (max_ctx={max_ctx}). "
-                                                f"Уменьшите историю/системный промпт или используйте модель с большим контекстом."
-                                            )
-                                        if int(max_tokens) > allowed_new:
-                                            max_tokens = allowed_new
-
-                                    with torch.no_grad(), torch.autocast(device_type=device_type, dtype=autocast_dtype, enabled=autocast_enabled):
-                                        outputs = model.generate(
-                                            **inputs,
-                                            max_new_tokens=max_tokens,
-                                            temperature=temperature,
-                                            top_p=top_p,
-                                            do_sample=True,
-                                            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-                                            use_cache=False,  # Отключаем KV-cache для совместимости
-                                        )
-                                    
-                                    response = tokenizer.decode(
-                                        outputs[0][inputs["input_ids"].shape[1]:], 
-                                        skip_special_tokens=True
+                                    # === Генерация через backend ===
+                                    response = chat_backend.generate(
+                                        prompt=prompt_text,
+                                        max_tokens=max_tokens,
+                                        temperature=temperature,
+                                        top_p=top_p,
                                     )
                                     
                                     st.write(response)

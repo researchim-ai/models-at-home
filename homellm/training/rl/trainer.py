@@ -1652,11 +1652,23 @@ class GRPOTrainer:
                 logger.info("Достигнут max_steps, останавливаем обучение")
                 break
         
-        # Финальное сохранение
-        if self.is_main_process:
-            self._save_checkpoint(output_dir / "final", is_final=True)
+        # Финальное сохранение (все ранки должны войти для синхронизации)
+        self._save_checkpoint(output_dir / "final", is_final=True)
         
         logger.info("Обучение завершено!")
+        
+        # Записываем финальный статус в metrics.jsonl для UI
+        if self.is_main_process:
+            world = int(self.accelerator.num_processes) if self.accelerator is not None else 1
+            prompts_processed = int(self.rollout_step) * int(self.config.batch_size) * max(world, 1)
+            final_metrics = {
+                "step": self.global_step,
+                "rollout_step": self.rollout_step,
+                "status": "completed",
+                "total_prompts_processed": prompts_processed,
+            }
+            self._log_metrics(final_metrics, jsonl_only=True)
+            logger.info("📝 Записан финальный статус 'completed' в metrics.jsonl")
         
         if self.wandb_run:
             self.wandb_run.finish()
@@ -2392,10 +2404,11 @@ class GRPOTrainer:
                     "train_batch_size": int(self.config.train_batch_size),
                     "epochs_per_step": int(self.config.epochs_per_step),
             }
-            # Добавляем все остальные метрики
+            # Добавляем все остальные метрики (числа и строки типа status)
             for k, v in metrics.items():
-                if k not in log_entry and isinstance(v, (int, float)):
-                    log_entry[k] = v
+                if k not in log_entry:
+                    if isinstance(v, (int, float, str)):
+                        log_entry[k] = v
             
             with open(metrics_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry) + "\n")
@@ -2512,22 +2525,85 @@ class GRPOTrainer:
                 final_dir = Path(self.config.output_dir) / "final_model"
                 final_tmp = final_dir.with_name(final_dir.name + "_tmp")
 
+                # Определяем, нужно ли мерджить LoRA (по умолчанию True для удобства inference)
+                merge_lora = bool(getattr(self.config, "merge_lora", True))
+                use_lora = bool(getattr(self.config, "use_lora", False))
+                
+                # ВАЖНО: синхронизация ДО сохранения, чтобы все процессы были на одной точке
+                if self.accelerator is not None:
+                    self.accelerator.wait_for_everyone()
+
                 # чистим tmp на main
                 if self.accelerator is None or self.is_main_process:
                     if final_tmp.exists():
                         import shutil
                         shutil.rmtree(final_tmp, ignore_errors=True)
-                final_tmp.mkdir(parents=True, exist_ok=True)
-
+                    final_tmp.mkdir(parents=True, exist_ok=True)
+                
                 if self.accelerator is None:
-                    # single-process
-                    self.model.save_pretrained(final_tmp, safe_serialization=True)
+                    # === Single-process ===
+                    save_model = self.model
+                    
+                    if merge_lora:
+                        try:
+                            from peft import PeftModel
+                            if isinstance(save_model, PeftModel):
+                                logger.info("🔄 Merging LoRA adapters into base model for final_model...")
+                                save_model = save_model.merge_and_unload()
+                                logger.info("✅ LoRA adapters merged successfully")
+                        except ImportError:
+                            pass
+                        except Exception as e:
+                            logger.warning(f"⚠️ Could not merge LoRA: {e}. Saving as-is.")
+                    
+                    save_model.save_pretrained(final_tmp, safe_serialization=True)
+                
+                elif merge_lora and use_lora:
+                    # === Distributed + LoRA + merge ===
+                    # Только main process сохраняет (без NCCL коллективных операций)
+                    # Другие процессы просто ждут
+                    if self.is_main_process:
+                        try:
+                            from peft import PeftModel
+                            
+                            # Unwrap модель для доступа к PEFT
+                            unwrapped = self.model
+                            while hasattr(unwrapped, "module"):
+                                unwrapped = unwrapped.module
+                            
+                            if isinstance(unwrapped, PeftModel):
+                                logger.info("🔄 Merging LoRA adapters for distributed final_model...")
+                                merged_model = unwrapped.merge_and_unload()
+                                merged_model.save_pretrained(final_tmp, safe_serialization=True)
+                                logger.info("✅ LoRA adapters merged and saved")
+                            else:
+                                # Не PEFT модель - сохраняем как есть
+                                unwrapped.save_pretrained(final_tmp, safe_serialization=True)
+                        except ImportError:
+                            logger.warning("⚠️ PEFT not available, saving model as-is")
+                            unwrapped = self.model
+                            while hasattr(unwrapped, "module"):
+                                unwrapped = unwrapped.module
+                            unwrapped.save_pretrained(final_tmp, safe_serialization=True)
+                        except Exception as e:
+                            logger.warning(f"⚠️ Could not merge LoRA: {e}. Saving as-is.")
+                            unwrapped = self.model
+                            while hasattr(unwrapped, "module"):
+                                unwrapped = unwrapped.module
+                            unwrapped.save_pretrained(final_tmp, safe_serialization=True)
                 else:
-                    # distributed: собранный state_dict через accelerate (корректно для FSDP/ZeRO)
+                    # === Distributed без merge (или без LoRA) ===
+                    # Используем accelerate.save_model для корректной работы с FSDP/ZeRO
                     self.accelerator.save_model(self.model, final_tmp, safe_serialization=True)
+
+                # Синхронизация после сохранения модели
+                if self.accelerator is not None:
+                    self.accelerator.wait_for_everyone()
 
                 if self.accelerator is None or self.is_main_process:
                     self.tokenizer.save_pretrained(final_tmp)
+                
+                # Финальная синхронизация перед переименованием
                 if self.accelerator is not None:
                     self.accelerator.wait_for_everyone()
 

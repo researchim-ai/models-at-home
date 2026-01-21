@@ -222,6 +222,8 @@ class GRPOConfig:
     log_steps: int = 10
     # Если True — обновляем `final_model/` при каждом сохранении чекпоинта, чтобы модель можно было сразу использовать.
     export_on_checkpoint: bool = True
+    # Если True — LoRA адаптеры будут объединены с базовой моделью при сохранении final_model.
+    merge_lora: bool = True
     use_wandb: bool = False
     wandb_project: str = "homellm-grpo"
     
@@ -364,6 +366,7 @@ class GRPOConfig:
             "save_steps": self.save_steps,
             "log_steps": self.log_steps,
             "export_on_checkpoint": self.export_on_checkpoint,
+            "merge_lora": self.merge_lora,
             "use_std_normalization": self.use_std_normalization,
             "fixed_length_normalizer": self.fixed_length_normalizer,
             "dynamic_sampling": self.dynamic_sampling,
