@@ -127,8 +127,21 @@ st.markdown("""
         border: 1px solid #30363d !important;
     }
     
+    /* Inline code - более заметный стиль */
     code {
         color: #79c0ff !important;
+        background-color: rgba(255, 159, 67, 0.15) !important;
+        padding: 2px 6px !important;
+        border-radius: 4px !important;
+        font-weight: 500 !important;
+    }
+    
+    /* Code внутри pre блоков - не менять фон */
+    pre code {
+        background-color: transparent !important;
+        padding: 0 !important;
+        color: #c9d1d9 !important;
+        font-weight: normal !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -1467,7 +1480,7 @@ def render_grpo_sidebar_config():
     max_new_tokens = st.sidebar.slider(
         "Max new tokens",
         min_value=128,
-        max_value=4096,
+        max_value=16384,
         value=1024,
         step=128,
         help="Максимальная длина генерируемого ответа"
@@ -3600,59 +3613,151 @@ def render_output_config(model_name="training_run"):
 
 
 def get_available_models():
-    """Получить список доступных обученных моделей (рекурсивный поиск)."""
+    """Получить список доступных обученных моделей (рекурсивный поиск).
+    
+    Поддерживаемые типы:
+    - Pretrain модели (home_pretrain/)
+    - SFT модели (home_sft/)  
+    - GRPO/RL модели (home_grpo/, home_rl/)
+    - LoRA адаптеры (adapter_config.json)
+    - HuggingFace модели (models/)
+    """
     models = []
+    
+    def detect_training_type(model_dir: Path) -> str:
+        """Определяет тип тренировки по пути."""
+        path_str = str(model_dir).lower()
+        if "grpo" in path_str or "_rl" in path_str:
+            return "grpo"
+        elif "sft" in path_str:
+            return "sft"
+        elif "pretrain" in path_str:
+            return "pretrain"
+        return "unknown"
+    
+    def is_lora_model(model_dir: Path) -> bool:
+        """Проверяет, является ли модель LoRA адаптером."""
+        return (model_dir / "adapter_config.json").exists()
+    
+    def get_model_info(model_dir: Path) -> dict:
+        """Читает информацию о модели из конфигов."""
+        info = {"max_context": None, "vocab_size": None, "hidden_size": None, "num_params": None}
+        
+        # Читаем config.json
+        config_path = model_dir / "config.json"
+        if config_path.exists():
+            try:
+                with open(config_path) as f:
+                    cfg = json.load(f)
+                info["max_context"] = cfg.get("max_position_embeddings") or cfg.get("n_positions") or cfg.get("max_seq_len")
+                info["vocab_size"] = cfg.get("vocab_size")
+                info["hidden_size"] = cfg.get("hidden_size") or cfg.get("n_embd")
+                info["model_type"] = cfg.get("model_type", "unknown")
+            except:
+                pass
+        
+        # Для LoRA читаем adapter_config.json
+        adapter_config_path = model_dir / "adapter_config.json"
+        if adapter_config_path.exists():
+            try:
+                with open(adapter_config_path) as f:
+                    adapter_cfg = json.load(f)
+                info["base_model"] = adapter_cfg.get("base_model_name_or_path")
+                info["lora_r"] = adapter_cfg.get("r")
+                info["lora_alpha"] = adapter_cfg.get("lora_alpha")
+            except:
+                pass
+        
+        return info
+    
+    def has_model_weights(model_dir: Path) -> bool:
+        """Проверяет наличие весов модели."""
+        return (
+            (model_dir / "pytorch_model.bin").exists() or 
+            (model_dir / "model.safetensors").exists() or
+            (model_dir / "adapter_model.bin").exists() or
+            (model_dir / "adapter_model.safetensors").exists() or
+            any(model_dir.glob("model-*.safetensors")) or  # Sharded модели
+            any(model_dir.glob("pytorch_model-*.bin"))
+        )
     
     # 1. Ищем рекурсивно в out/ (обученные модели)
     if OUTPUT_DIR.exists():
-        # Ищем любые config.json внутри out/
-        for config_file in OUTPUT_DIR.rglob("config.json"):
+        # Ищем config.json и adapter_config.json
+        config_files = list(OUTPUT_DIR.rglob("config.json")) + list(OUTPUT_DIR.rglob("adapter_config.json"))
+        seen_dirs = set()
+        
+        for config_file in config_files:
             model_dir = config_file.parent
             
-            # Игнорируем папки, которые не похожи на модели (например, логи)
-            # Критерий модели: наличие config.json + (pytorch_model.bin или model.safetensors или adapter_model.bin)
-            has_weights = (
-                (model_dir / "pytorch_model.bin").exists() or 
-                (model_dir / "model.safetensors").exists() or
-                (model_dir / "adapter_model.bin").exists()
-            )
+            # Пропускаем дубликаты
+            if str(model_dir) in seen_dirs:
+                continue
+            seen_dirs.add(str(model_dir))
             
-            if has_weights:
-                # Определяем тип (final или checkpoint)
-                m_type = "checkpoint" if "checkpoint" in model_dir.name else "final"
-                if model_dir.name == "final_model": m_type = "final"
-                
-                # Формируем красивое имя
-                # Берем путь относительно OUTPUT_DIR
-                rel_path = model_dir.relative_to(OUTPUT_DIR)
-                models.append({
-                    "name": str(rel_path),
-                    "path": str(model_dir),
-                    "type": m_type,
-                    "time": model_dir.stat().st_mtime
-                })
+            # Проверяем наличие весов
+            if not has_model_weights(model_dir):
+                continue
+            
+            # Определяем тип
+            is_lora = is_lora_model(model_dir)
+            training_type = detect_training_type(model_dir)
+            
+            # Определяем тип модели (final/checkpoint)
+            m_type = "checkpoint" if "checkpoint" in model_dir.name.lower() else "final"
+            if model_dir.name == "final_model":
+                m_type = "final"
+            elif model_dir.name == "lora_adapters":
+                m_type = "lora"
+            
+            # Получаем информацию о модели
+            model_info = get_model_info(model_dir)
+            
+            # Формируем красивое имя
+            rel_path = model_dir.relative_to(OUTPUT_DIR)
+            
+            # Эмодзи по типу тренировки
+            type_emoji = {
+                "pretrain": "📚",
+                "sft": "💬", 
+                "grpo": "🧠",
+                "unknown": "📦"
+            }.get(training_type, "📦")
+            
+            lora_badge = " [LoRA]" if is_lora else ""
+            
+            models.append({
+                "name": f"{type_emoji} {rel_path}{lora_badge}",
+                "path": str(model_dir),
+                "type": m_type,
+                "training_type": training_type,
+                "is_lora": is_lora,
+                "model_info": model_info,
+                "time": model_dir.stat().st_mtime
+            })
     
     # 2. Ищем в models/ (скачанные с HuggingFace)
     if MODELS_DIR.exists():
         for model_dir in MODELS_DIR.iterdir():
             if model_dir.is_dir():
-                config_file = model_dir / "config.json"
-                if config_file.exists():
-                    # Проверяем наличие весов
-                    has_weights = (
-                        (model_dir / "pytorch_model.bin").exists() or 
-                        (model_dir / "model.safetensors").exists() or
-                        any(model_dir.glob("*.safetensors")) or
-                        any(model_dir.glob("pytorch_model*.bin"))
-                    )
+                if not has_model_weights(model_dir):
+                    continue
                     
-                    if has_weights:
-                        models.append({
-                            "name": f"🤗 {model_dir.name}",
-                            "path": str(model_dir),
-                            "type": "hf",  # HuggingFace модель
-                            "time": model_dir.stat().st_mtime
-                        })
+                # Должен быть config.json
+                if not (model_dir / "config.json").exists():
+                    continue
+                
+                model_info = get_model_info(model_dir)
+                
+                models.append({
+                    "name": f"🤗 {model_dir.name}",
+                    "path": str(model_dir),
+                    "type": "hf",
+                    "training_type": "base",
+                    "is_lora": False,
+                    "model_info": model_info,
+                    "time": model_dir.stat().st_mtime
+                })
     
     # Сортируем по времени (новые сверху)
     models.sort(key=lambda x: x["time"], reverse=True)
@@ -6457,63 +6562,139 @@ def main():
                     st.session_state.selected_chat_model = None
             
             with col2:
-                # Для чата используем только final_model/export (HF формат)
-                # Все модели сохраняются в HF формате, поэтому используем AutoModelForCausalLM
-                model_type = selected_model["type"]
-                if model_type == "final":
-                    st.success("✅ Финальная модель")
-                else:
-                    st.info("📦 Чекпоинт")
-            
-            st.caption(f"Путь: `{selected_model['path']}`")
+                # Информация о модели
+                model_type = selected_model.get("type", "unknown")
+                training_type = selected_model.get("training_type", "unknown")
+                is_lora = selected_model.get("is_lora", False)
+                model_info = selected_model.get("model_info", {})
+                
+                # Карточка информации о модели
+                info_cols = st.columns([2, 1])
+                with info_cols[0]:
+                    # Тип модели
+                    type_labels = {
+                        "final": "✅ Финальная модель",
+                        "checkpoint": "📦 Чекпоинт",
+                        "lora": "🔧 LoRA адаптер",
+                        "hf": "🤗 HuggingFace"
+                    }
+                    st.markdown(f"**{type_labels.get(model_type, '📦 Модель')}**")
+                    
+                    # Тип тренировки
+                    training_labels = {
+                        "pretrain": "Pre-training",
+                        "sft": "SFT (Supervised Fine-Tuning)",
+                        "grpo": "GRPO (Reasoning)",
+                        "base": "Base Model"
+                    }
+                    if training_type != "unknown":
+                        st.caption(f"Тренировка: {training_labels.get(training_type, training_type)}")
+                
+                with info_cols[1]:
+                    # Технические характеристики
+                    if model_info.get("max_context"):
+                        st.metric("Контекст", f"{model_info['max_context']:,}")
+                    if is_lora and model_info.get("lora_r"):
+                        st.caption(f"LoRA r={model_info['lora_r']}")
+                
+                # Показываем базовую модель для LoRA
+                if is_lora and model_info.get("base_model"):
+                    st.info(f"🔗 Базовая модель: {model_info['base_model']}")
+                
+                st.caption(f"📁 {selected_model['path']}")
             
             # Параметры генерации
-            with st.expander("⚙️ Параметры генерации"):
-                gen_col1, gen_col2, gen_col3 = st.columns(3)
+            with st.expander("⚙️ Параметры генерации", expanded=True):
+                # Определяем максимальный контекст из конфига модели
+                max_context = model_info.get("max_context") or 32168
+                default_max_tokens = min(256, max_context // 4)
+                max_tokens_limit = min(max_context, 32168)  # Ограничиваем разумным максимумом
+                
+                gen_col1, gen_col2 = st.columns(2)
                 with gen_col1:
-                    max_tokens = st.slider("Max Tokens", 10, 500, 128)
+                    max_tokens = st.slider(
+                        "Max New Tokens", 
+                        min_value=16, 
+                        max_value=max_tokens_limit, 
+                        value=default_max_tokens,
+                        step=16,
+                        help=f"Максимум новых токенов. Контекст модели: {max_context:,}"
+                    )
+                    temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.05)
+                
                 with gen_col2:
-                    temperature = st.slider("Temperature", 0.1, 2.0, 0.8, 0.1)
-                with gen_col3:
-                    top_p = st.slider("Top-p", 0.1, 1.0, 0.9, 0.05)
+                    top_p = st.slider("Top-p (nucleus)", 0.1, 1.0, 0.9, 0.05)
+                    top_k = st.slider("Top-k", 0, 100, 50, help="0 = отключено")
 
                 # Inference Backend
                 from homellm.app.vllm_chat import is_vllm_available
                 vllm_available = is_vllm_available()
                 
-                backend_options = ["Transformers"]
-                if vllm_available:
-                    backend_options.append("vLLM (быстрее)")
+                st.markdown("---")
+                backend_col1, backend_col2 = st.columns(2)
                 
-                if "chat_inference_backend" not in st.session_state:
-                    st.session_state.chat_inference_backend = "Transformers"
+                with backend_col1:
+                    backend_options = ["Transformers"]
+                    if vllm_available:
+                        backend_options.append("vLLM (быстрее)")
+                    
+                    if "chat_inference_backend" not in st.session_state:
+                        st.session_state.chat_inference_backend = "Transformers"
+                    
+                    inference_backend = st.selectbox(
+                        "Inference Backend",
+                        options=backend_options,
+                        index=backend_options.index(st.session_state.chat_inference_backend) if st.session_state.chat_inference_backend in backend_options else 0,
+                        help="vLLM: быстрее (PagedAttention), но требует больше VRAM",
+                        key="chat_backend_select",
+                    )
+                    st.session_state.chat_inference_backend = inference_backend
+                    
+                    if not vllm_available:
+                        st.caption("ℹ️ vLLM: `pip install vllm`")
                 
-                inference_backend = st.selectbox(
-                    "Inference Backend",
-                    options=backend_options,
-                    index=backend_options.index(st.session_state.chat_inference_backend) if st.session_state.chat_inference_backend in backend_options else 0,
-                    help="vLLM значительно быстрее для генерации (continuous batching, PagedAttention), но требует больше VRAM при загрузке.",
-                    key="chat_backend_select",
-                )
-                st.session_state.chat_inference_backend = inference_backend
-                
-                if not vllm_available:
-                    st.caption("ℹ️ vLLM недоступен. Установите: `pip install vllm`")
-
-                # Режим промпта (2 режима, но дефолт выбираем автоматически):
-                # - если у модели есть chat_template -> Диалог
-                # - если нет -> Completion
-                if "chat_prompt_mode" not in st.session_state:
-                    st.session_state.chat_prompt_mode = "completion"  # до загрузки модели
-                prompt_mode_label = st.selectbox(
-                    "Режим промпта",
-                    options=["Диалог (chat_template)", "Completion (plain text)"],
-                    index=0 if st.session_state.chat_prompt_mode == "chat" else 1,
-                    help="По умолчанию: если у модели есть chat_template — включаем Диалог, иначе Completion. Можно переключить вручную.",
-                    key="chat_prompt_mode_select",
-                )
-                prompt_mode = "chat" if prompt_mode_label.startswith("Диалог") else "completion"
-                st.session_state.chat_prompt_mode = prompt_mode
+                with backend_col2:
+                    # Режим промпта - зависит от наличия chat_template
+                    if "chat_prompt_mode" not in st.session_state:
+                        st.session_state.chat_prompt_mode = "completion"
+                    
+                    # Проверяем наличие chat_template у загруженной модели
+                    has_template = st.session_state.get("chat_has_template", False)
+                    model_loaded = st.session_state.get("chat_backend") is not None
+                    
+                    if model_loaded and has_template:
+                        # Оба режима доступны
+                        prompt_mode_label = st.selectbox(
+                            "Режим",
+                            options=["Chat (template)", "Completion"],
+                            index=0 if st.session_state.chat_prompt_mode == "chat" else 1,
+                            help="Chat: использует chat_template модели для форматирования диалога",
+                            key="chat_prompt_mode_select",
+                        )
+                        prompt_mode = "chat" if "Chat" in prompt_mode_label else "completion"
+                    elif model_loaded and not has_template:
+                        # Только Completion, Chat недоступен
+                        st.selectbox(
+                            "Режим",
+                            options=["Completion (no chat_template)"],
+                            index=0,
+                            disabled=True,
+                            help="У модели нет chat_template - только режим Completion",
+                            key="chat_prompt_mode_select",
+                        )
+                        prompt_mode = "completion"
+                    else:
+                        # Модель не загружена - показываем placeholder
+                        st.selectbox(
+                            "Режим",
+                            options=["Загрузите модель..."],
+                            index=0,
+                            disabled=True,
+                            key="chat_prompt_mode_select",
+                        )
+                        prompt_mode = st.session_state.chat_prompt_mode
+                    
+                    st.session_state.chat_prompt_mode = prompt_mode
             
             # Инициализация чата
             if "chat_model" not in st.session_state:
@@ -6598,11 +6779,31 @@ def main():
                             # === Transformers Backend ===
                             else:
                                 # Загружаем токенизатор
-                                try:
-                                    tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
-                                except Exception:
-                                    # Для accelerate checkpoint'ов токенизатора обычно нет внутри checkpoint_stepXXXX.
-                                    tokenizer = None
+                                tokenizer = None
+                                tokenizer_source = None
+                                
+                                # Для LoRA адаптеров - сначала пробуем базовую модель
+                                if is_lora_adapter:
+                                    try:
+                                        with open(adapter_config_path) as f:
+                                            adapter_cfg = json.load(f)
+                                        base_model_id = adapter_cfg.get("base_model_name_or_path")
+                                        if base_model_id:
+                                            tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
+                                            tokenizer_source = base_model_id
+                                    except Exception:
+                                        pass
+                                
+                                # Пробуем загрузить из папки модели
+                                if tokenizer is None:
+                                    try:
+                                        tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+                                        tokenizer_source = str(model_path)
+                                    except Exception:
+                                        pass
+                                
+                                # Fallback: ищем в run config
+                                if tokenizer is None:
                                     try:
                                         run_root = model_path.parent if "checkpoint" in model_path.name else model_path
                                         run_id = run_root.name
@@ -6613,11 +6814,18 @@ def main():
                                             tok_src = run_cfg.get("tokenizer_path") or run_cfg.get("base_model_path")
                                             if tok_src:
                                                 tokenizer = AutoTokenizer.from_pretrained(str(tok_src), trust_remote_code=True)
+                                                tokenizer_source = tok_src
                                     except Exception:
-                                        tokenizer = None
-
-                                    if tokenizer is None:
-                                        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+                                        pass
+                                
+                                # Последний fallback - GPT2 (но предупреждаем)
+                                if tokenizer is None:
+                                    st.warning("⚠️ Не удалось загрузить токенизатор модели, используется GPT2 (без chat_template)")
+                                    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+                                    tokenizer_source = "gpt2"
+                                else:
+                                    if tokenizer_source:
+                                        st.caption(f"Токенизатор: {tokenizer_source}")
                                 
                                 # Загрузка модели
                                 if is_lora_adapter:
@@ -6747,34 +6955,99 @@ def main():
                                 import traceback
                                 st.code(traceback.format_exc())
             else:
-                st.success(f"✅ Модель загружена: {selected_model_name}")
+                # === Информационная панель загруженной модели ===
+                backend_type = st.session_state.get("chat_backend_type", "transformers")
+                backend_emoji = "⚡" if backend_type == "vllm" else "🔧"
                 
-                # Кнопка экспорта (для чекпоинтов особенно полезна)
-                if st.button("💾 Экспортировать в HF формат", help="Сохранить как полноценную модель (с конфигом и токенизатором)"):
-                    with st.spinner("Экспорт модели..."):
-                        export_path = export_model_to_hf(
-                            st.session_state.chat_model, 
-                            st.session_state.chat_tokenizer, 
-                            st.session_state.chat_model_path
-                        )
-                        if export_path:
-                            st.success(f"Модель успешно экспортирована в:\n`{export_path}`")
-                            time.sleep(2)
-                            st.rerun() # Обновить список моделей чтобы увидеть экспорт
+                st.success(f"{backend_emoji} Модель загружена: **{selected_model_name}**")
+                
+                # Компактная информация о модели
+                info_cols = st.columns([2, 1, 1])
+                with info_cols[0]:
+                    st.caption(f"Backend: {backend_type.upper()}")
+                with info_cols[1]:
+                    if st.session_state.chat_has_template:
+                        st.caption("✅ Chat template")
+                        # Показываем подсказку о шаблоне
+                        tokenizer = st.session_state.chat_tokenizer
+                        if tokenizer and hasattr(tokenizer, 'chat_template'):
+                            template_preview = str(tokenizer.chat_template)[:100]
+                            if len(template_preview) == 100:
+                                template_preview += "..."
+                            st.caption(f"```{template_preview[:50]}...```")
+                    else:
+                        st.caption("⚠️ Нет chat template")
+                        st.caption("Только режим Completion")
+                with info_cols[2]:
+                    if selected_model.get("is_lora"):
+                        st.caption("🔧 LoRA")
+                
+                # Кнопки действий
+                action_cols = st.columns([1, 1, 1])
+                with action_cols[0]:
+                    if st.button("🗑️ Выгрузить", help="Освободить память"):
+                        st.session_state.chat_model = None
+                        st.session_state.chat_backend = None
+                        st.session_state.chat_tokenizer = None
+                        st.session_state.chat_model_path = None
+                        st.session_state.messages = []
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        st.rerun()
+                
+                with action_cols[1]:
+                    if st.button("🔄 Очистить чат"):
+                        st.session_state.messages = []
+                        st.rerun()
+                
+                with action_cols[2]:
+                    # Кнопка экспорта (для чекпоинтов)
+                    if st.session_state.chat_model is not None:
+                        if st.button("💾 Экспорт HF"):
+                            with st.spinner("Экспорт модели..."):
+                                export_path = export_model_to_hf(
+                                    st.session_state.chat_model, 
+                                    st.session_state.chat_tokenizer, 
+                                    st.session_state.chat_model_path
+                                )
+                                if export_path:
+                                    st.success(f"Экспортировано: `{export_path}`")
+                                    time.sleep(2)
+                                    st.rerun()
 
                 # --- НАСТРОЙКИ СИСТЕМНОГО ПРОМПТА ---
-                with st.expander("⚙️ Системный промпт", expanded=False):
-                    system_prompt_input = st.text_area(
-                        "Системный промпт (опционально):",
-                        value=st.session_state.get("system_prompt", ""),
-                        help="Если заполнено, будет использоваться вместо дефолтного системного промпта модели. Оставьте пустым для использования дефолтного.",
-                        key="system_prompt_input"
+                with st.expander("💬 Системный промпт", expanded=False):
+                    # Предустановленные промпты
+                    preset_prompts = {
+                        "Нет": "",
+                        "Ассистент": "Ты — полезный ИИ-ассистент. Отвечай точно и по делу.",
+                        "Reasoning": "Ты — ИИ для решения задач. Сначала рассуждай пошагово в теге <think>, затем дай ответ.",
+                        "Программист": "Ты — опытный программист. Пиши чистый, читаемый код с комментариями.",
+                        "Переводчик": "Ты — профессиональный переводчик. Переводи текст точно, сохраняя стиль.",
+                        "Кастомный": None
+                    }
+                    
+                    preset = st.selectbox(
+                        "Шаблон",
+                        options=list(preset_prompts.keys()),
+                        index=0,
+                        key="system_prompt_preset"
                     )
-                    st.session_state.system_prompt = system_prompt_input.strip()
-                    if system_prompt_input.strip():
-                        st.info("✅ Будет использован введенный системный промпт")
+                    
+                    if preset != "Кастомный" and preset != "Нет":
+                        st.session_state.system_prompt = preset_prompts[preset]
+                        st.code(preset_prompts[preset], language=None)
+                    elif preset == "Кастомный":
+                        system_prompt_input = st.text_area(
+                            "Свой промпт:",
+                            value=st.session_state.get("system_prompt", ""),
+                            height=100,
+                            key="system_prompt_input"
+                        )
+                        st.session_state.system_prompt = system_prompt_input.strip()
                     else:
-                        st.caption("Используется дефолтный системный промпт из модели")
+                        st.session_state.system_prompt = ""
+                        st.caption("Используется дефолтный промпт модели")
                 
                 # --- ИНТЕРФЕЙС ЧАТА С ФИКСИРОВАННЫМ СКРОЛЛОМ ---
                 chat_container = st.container(height=500) # Прокручиваемый контейнер
@@ -6810,8 +7083,8 @@ def main():
                                     
                                     has_template = st.session_state.chat_has_template
                                     use_chat_template = (prompt_mode == "chat") and has_template
+                                    # Если каким-то образом выбран chat режим без template - fallback
                                     if prompt_mode == "chat" and not has_template:
-                                        st.warning("У выбранной модели нет chat_template — использую Completion.")
                                         use_chat_template = False
 
                                     # Обработка системного промпта (только для режима chat_template)
@@ -6842,6 +7115,7 @@ def main():
                                         max_tokens=max_tokens,
                                         temperature=temperature,
                                         top_p=top_p,
+                                        top_k=top_k if top_k > 0 else -1,
                                     )
                                     
                                     st.write(response)
@@ -6851,12 +7125,6 @@ def main():
                                     st.session_state.last_chat_error = traceback.format_exc()
                                     st.error(f"Ошибка генерации: {e}")
                                     st.code(st.session_state.last_chat_error)
-                
-                # Кнопка очистки чата
-                if st.session_state.messages:
-                    if st.button("🗑️ Очистить чат"):
-                        st.session_state.messages = []
-                        st.rerun()
         else:
             st.info("Нет обученных моделей. Запустите тренировку во вкладке 'Запуск'!")
             
