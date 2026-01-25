@@ -206,6 +206,7 @@ class UniversalRuleReward(RewardFunction):
         reference: str,
         prompt: str,
         extracted: Dict[str, str],
+        metadata: Dict[str, Any] = None,
     ) -> str:
         """Подставляет переменные в строку."""
         if not isinstance(text, str):
@@ -215,6 +216,10 @@ class UniversalRuleReward(RewardFunction):
         text = text.replace("{{prompt}}", prompt)
         for k, v in extracted.items():
             text = text.replace(f"{{{{extracted.{k}}}}}", str(v) if v else "")
+        # Подставляем metadata поля
+        if metadata:
+            for k, v in metadata.items():
+                text = text.replace(f"{{{{metadata.{k}}}}}", str(v) if v is not None else "")
         return text
     
     def _evaluate_condition(
@@ -224,22 +229,23 @@ class UniversalRuleReward(RewardFunction):
         reference: str,
         prompt: str,
         extracted: Dict[str, str],
+        metadata: Dict[str, Any] = None,
     ) -> bool:
         """Вычисляет одно условие."""
         cond_type = cond.get("type", "contains")
         
         target = self._substitute_vars(
             cond.get("target") or cond.get("left", "{{response}}"),
-            response, reference, prompt, extracted
+            response, reference, prompt, extracted, metadata
         )
         
         try:
             if cond_type == "contains":
-                value = self._substitute_vars(cond.get("value", ""), response, reference, prompt, extracted)
+                value = self._substitute_vars(cond.get("value", ""), response, reference, prompt, extracted, metadata)
                 return value in target
             
             elif cond_type == "not_contains":
-                value = self._substitute_vars(cond.get("value", ""), response, reference, prompt, extracted)
+                value = self._substitute_vars(cond.get("value", ""), response, reference, prompt, extracted, metadata)
                 return value not in target
             
             elif cond_type == "matches":
@@ -251,11 +257,11 @@ class UniversalRuleReward(RewardFunction):
                 return not bool(re.search(pattern, target))
             
             elif cond_type == "equals":
-                value = self._substitute_vars(cond.get("value", ""), response, reference, prompt, extracted)
+                value = self._substitute_vars(cond.get("value", ""), response, reference, prompt, extracted, metadata)
                 return target.strip() == value.strip()
             
             elif cond_type == "equals_numeric":
-                right = self._substitute_vars(cond.get("right", ""), response, reference, prompt, extracted)
+                right = self._substitute_vars(cond.get("right", ""), response, reference, prompt, extracted, metadata)
                 tolerance = float(cond.get("tolerance", 0.01))
                 try:
                     left_num = float(re.sub(r"[^\d.\-]", "", str(target)))
@@ -304,6 +310,7 @@ class UniversalRuleReward(RewardFunction):
         reference: str,
         prompt: str,
         extracted: Dict[str, str],
+        metadata: Dict[str, Any] = None,
     ) -> float:
         """Вычисляет формулу reward."""
         # Подстановка переменных
@@ -313,6 +320,11 @@ class UniversalRuleReward(RewardFunction):
         for k, v in extracted.items():
             safe_v = str(v).replace("'", "\\'") if v else ""
             formula = formula.replace(f"{{{{extracted.{k}}}}}", f"'''{safe_v}'''")
+        # Подстановка metadata полей
+        if metadata:
+            for k, v in metadata.items():
+                safe_v = str(v).replace("'", "\\'") if v is not None else ""
+                formula = formula.replace(f"{{{{metadata.{k}}}}}", f"'''{safe_v}'''")
         
         try:
             safe_globals = {
@@ -334,8 +346,17 @@ class UniversalRuleReward(RewardFunction):
     ) -> float:
         """
         Вычисляет reward на основе правил.
+        
+        Args:
+            completion: Ответ модели
+            reference_answer: Эталонный ответ
+            prompt: Промпт
+            **kwargs: Дополнительные данные, включая metadata из датасета
         """
         total_reward = 0.0
+        
+        # Извлекаем metadata из kwargs (передаётся из RLSample)
+        metadata = kwargs.get("metadata", {})
         
         for rule in self.rules:
             if not rule.get("enabled", True):
@@ -347,7 +368,7 @@ class UniversalRuleReward(RewardFunction):
             # 1. Экстракторы
             for ext in rule.get("extractors", []):
                 source = ext.get("source", "{{response}}")
-                source_text = self._substitute_vars(source, completion, reference_answer, prompt, {})
+                source_text = self._substitute_vars(source, completion, reference_answer, prompt, {}, metadata)
                 
                 pattern = ext.get("pattern", "")
                 flags = 0
@@ -376,7 +397,7 @@ class UniversalRuleReward(RewardFunction):
                 all_conditions_true = True
             else:
                 results = [
-                    self._evaluate_condition(c, completion, reference_answer, prompt, extracted)
+                    self._evaluate_condition(c, completion, reference_answer, prompt, extracted, metadata)
                     for c in conditions
                 ]
                 if logic == "all":
@@ -390,7 +411,7 @@ class UniversalRuleReward(RewardFunction):
             else:
                 formula = rule.get("else_reward", "0.0")
             
-            rule_reward = self._evaluate_formula(formula, completion, reference_answer, prompt, extracted)
+            rule_reward = self._evaluate_formula(formula, completion, reference_answer, prompt, extracted, metadata)
             total_reward += weight * rule_reward
         
         if self.normalize and self._total_weight > 0:

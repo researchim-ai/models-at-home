@@ -543,28 +543,98 @@ def main():
         from .data.base import RLDataset, RLSample
         from .data.gsm8k import extract_gsm8k_final_answer
         
+        # Получаем настройки маппинга полей из UI конфига
+        field_mapping = {}
+        prompt_template = "{{prompt}}"
+        user_system_prompt = ""
+        
+        if ui_config:
+            field_mapping = ui_config.get("grpo_field_mapping", {})
+            prompt_template = ui_config.get("grpo_prompt_template", "{{prompt}}")
+            user_system_prompt = ui_config.get("grpo_system_prompt", "")
+        
+        # Поля для чтения из датасета
+        prompt_field = field_mapping.get("prompt_field", "question")
+        reference_field = field_mapping.get("reference_field", "answer")
+        metadata_fields = field_mapping.get("metadata_fields", [])
+        
+        # Fallback поля для совместимости
+        prompt_fallbacks = ["question", "prompt", "input", "instruction", "problem", "query", "text"]
+        reference_fallbacks = ["answer", "response", "output", "solution", "target", "completion"]
+        
+        logger.info(f"Маппинг полей: prompt={prompt_field}, reference={reference_field}")
+        if prompt_template != "{{prompt}}":
+            logger.info(f"Шаблон промпта: {prompt_template[:100]}...")
+        if user_system_prompt:
+            logger.info(f"System prompt: {user_system_prompt[:100]}...")
+        
         samples = []
         with open(dataset_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
                     data = json.loads(line)
-                    # Если это GSM8K/GSM8K-RU стиль: answer содержит решение с "#### финал"
-                    raw_answer = data.get("answer", data.get("response", ""))
+                    
+                    # Извлекаем промпт с fallback
+                    raw_prompt = data.get(prompt_field)
+                    if raw_prompt is None:
+                        for fb in prompt_fallbacks:
+                            if fb in data:
+                                raw_prompt = data[fb]
+                                break
+                    raw_prompt = str(raw_prompt) if raw_prompt else ""
+                    
+                    # Извлекаем референсный ответ с fallback
+                    raw_answer = data.get(reference_field)
+                    if raw_answer is None:
+                        for fb in reference_fallbacks:
+                            if fb in data:
+                                raw_answer = data[fb]
+                                break
+                    raw_answer = str(raw_answer) if raw_answer else ""
+                    
+                    # Извлекаем финальный ответ (для GSM8K-стиля с ####)
                     ref_answer = raw_answer
                     if isinstance(raw_answer, str) and "####" in raw_answer:
                         ref_answer = extract_gsm8k_final_answer(raw_answer)
+                    
+                    # Применяем шаблон промпта
+                    formatted_prompt = prompt_template
+                    formatted_prompt = formatted_prompt.replace("{{prompt}}", raw_prompt)
+                    formatted_prompt = formatted_prompt.replace("{{reference}}", ref_answer)
+                    
+                    # Собираем metadata из указанных полей
+                    sample_metadata = {
+                        "full_answer": raw_answer,
+                        "raw_prompt": raw_prompt,
+                    }
+                    
+                    # Добавляем дополнительные поля в metadata
+                    for mf in metadata_fields:
+                        if mf in data:
+                            sample_metadata[mf] = data[mf]
+                            # Также подставляем в шаблон
+                            formatted_prompt = formatted_prompt.replace(f"{{{{metadata.{mf}}}}}", str(data[mf]))
+                    
+                    # Добавляем все поля из исходных данных в metadata для доступа в reward
+                    for key, value in data.items():
+                        if key not in sample_metadata:
+                            sample_metadata[key] = value
+                        formatted_prompt = formatted_prompt.replace(f"{{{{metadata.{key}}}}}", str(value))
+                    
                     samples.append(RLSample(
-                        prompt=data.get("prompt", data.get("question", "")),
+                        prompt=formatted_prompt,
                         reference_answer=ref_answer,
-                        metadata={
-                            **(data.get("metadata", {}) or {}),
-                            "full_answer": raw_answer,
-                        },
+                        metadata=sample_metadata,
                     ))
+        
         if max_samples:
             samples = samples[:max_samples]
         train_dataset = RLDataset(samples)
+        
+        # Сохраняем user_system_prompt в конфиг для использования в trainer
+        if user_system_prompt:
+            config.user_system_prompt = user_system_prompt
     else:
         # Загружаем датасет из HuggingFace
         dataset_names = {

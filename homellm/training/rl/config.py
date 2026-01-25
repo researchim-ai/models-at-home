@@ -247,6 +247,10 @@ class GRPOConfig:
     # Формат reasoning
     reasoning_format: str = "deepseek"  # "deepseek" (<think>), "simple" (<reasoning>)
     
+    # Пользовательский system prompt (из настроек датасета в UI)
+    # Если задан, добавляется к дефолтному system prompt
+    user_system_prompt: str = ""
+    
     # Seed
     seed: int = 42
 

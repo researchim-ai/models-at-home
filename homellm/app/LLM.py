@@ -127,21 +127,25 @@ st.markdown("""
         border: 1px solid #30363d !important;
     }
     
-    /* Inline code - более заметный стиль */
+    /* Inline code - контрастный стиль с чёткой читаемостью */
     code {
-        color: #79c0ff !important;
-        background-color: rgba(255, 159, 67, 0.15) !important;
-        padding: 2px 6px !important;
+        color: #1a1a2e !important;
+        background-color: #e8f4f8 !important;
+        padding: 2px 8px !important;
         border-radius: 4px !important;
-        font-weight: 500 !important;
+        font-weight: 600 !important;
+        border: 1px solid #b8d4e3 !important;
+        font-size: 0.9em !important;
     }
     
-    /* Code внутри pre блоков - не менять фон */
+    /* Code внутри pre блоков - стандартный стиль для code blocks */
     pre code {
+        color: #c9d1d9 !important;
         background-color: transparent !important;
         padding: 0 !important;
-        color: #c9d1d9 !important;
         font-weight: normal !important;
+        border: none !important;
+        font-size: inherit !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -1877,7 +1881,7 @@ def render_grpo_main_config(data_path: str = None):
     import json as json_lib
     
     # =========================================================================
-    # 1. ДАТАСЕТ (первая секция!)
+    # 1. ДАТАСЕТ ДЛЯ REASONING (расширенная настройка)
     # =========================================================================
     st.markdown("### 📚 Датасет для Reasoning")
     
@@ -1887,6 +1891,30 @@ def render_grpo_main_config(data_path: str = None):
     dataset_source = "custom"
     dataset_key = "custom"
     
+    # Инициализация session_state для настроек датасета
+    if "grpo_field_mapping" not in st.session_state:
+        st.session_state.grpo_field_mapping = {
+            "prompt_field": "question",
+            "reference_field": "answer",
+            "metadata_fields": [],
+        }
+    if "grpo_prompt_template" not in st.session_state:
+        st.session_state.grpo_prompt_template = "{{prompt}}"
+    if "grpo_system_prompt" not in st.session_state:
+        # Дефолтный reasoning промпт с тегами
+        st.session_state.grpo_system_prompt = """You are a helpful assistant that solves problems step by step.
+Think through the problem carefully inside <reasoning>...</reasoning> tags.
+Then provide your final answer inside <answer>...</answer> tags.
+
+Example format:
+<reasoning>
+Let me analyze this step by step...
+Step 1: ...
+Step 2: ...
+Therefore, the answer is X.
+</reasoning>
+<answer>X</answer>"""
+    
     # Получаем список локальных датасетов
     local_datasets = []
     if DATASET_DIR.exists():
@@ -1894,13 +1922,12 @@ def render_grpo_main_config(data_path: str = None):
             if f.suffix in (".jsonl", ".json"):
                 local_datasets.append(f)
     
-    # Формируем список для выбора (все датасеты)
+    # Формируем список для выбора
     dataset_options = ["-- Выберите датасет --"]
     for f in local_datasets:
         dataset_options.append(str(f))
     
-    # Если data_path передан, используем его
-    # Также проверяем session_state для сохранения выбора между рендерами
+    # Определяем индекс по умолчанию
     default_idx = 0
     saved_selection = st.session_state.get("grpo_dataset_selectbox")
     if saved_selection and saved_selection in dataset_options:
@@ -1908,7 +1935,6 @@ def render_grpo_main_config(data_path: str = None):
     elif data_path and data_path in dataset_options:
         default_idx = dataset_options.index(data_path)
     elif data_path:
-        # Проверяем по имени файла
         for i, opt in enumerate(dataset_options):
             if data_path in opt:
                 default_idx = i
@@ -1919,26 +1945,296 @@ def render_grpo_main_config(data_path: str = None):
         options=dataset_options,
         index=default_idx,
         key="grpo_dataset_selectbox",
-        help="Скачайте датасеты на вкладке 'Данные' → 🧠 Reasoning: GSM8K, MATH-RU и др."
+        help="Скачайте датасеты на вкладке 'Данные' → 🧠 Reasoning"
     )
     
-    # Обрабатываем выбор
+    # Переменные для хранения данных датасета
+    dataset_samples = []
+    dataset_fields = []
+    
+    # Обрабатываем выбор датасета
     if selected_dataset and not selected_dataset.startswith("--"):
         grpo_dataset_path = selected_dataset
-        # Сохраняем в session_state для render_quick_summary()
         st.session_state.grpo_dataset_path = grpo_dataset_path
-        st.success(f"✅ Выбран: `{Path(selected_dataset).name}`")
         
         # Определяем язык по имени файла
         if "ru" in selected_dataset.lower() or "russian" in selected_dataset.lower():
             grpo_dataset_language = "ru"
         else:
             grpo_dataset_language = "en"
+        
+        # Загружаем семплы для превью и автодетекта полей
+        try:
+            p = Path(grpo_dataset_path)
+            if p.exists():
+                if p.suffix == ".jsonl":
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        for i, line in enumerate(f):
+                            if i >= 100:  # Читаем до 100 для анализа
+                                break
+                            line = line.strip()
+                            if line:
+                                try:
+                                    dataset_samples.append(json_lib.loads(line))
+                                except:
+                                    pass
+                elif p.suffix == ".json":
+                    with open(p, "r", encoding="utf-8") as f:
+                        obj = json_lib.load(f)
+                    if isinstance(obj, list):
+                        dataset_samples = obj[:100]
+                
+                # Собираем все поля из датасета
+                if dataset_samples:
+                    all_fields = set()
+                    for sample in dataset_samples[:20]:
+                        if isinstance(sample, dict):
+                            all_fields.update(sample.keys())
+                    dataset_fields = sorted(list(all_fields))
+        except Exception as e:
+            st.error(f"Ошибка чтения датасета: {e}")
+        
+        st.success(f"✅ Датасет: `{Path(selected_dataset).name}` ({len(dataset_samples)} примеров загружено для превью)")
+        
+        # =====================================================================
+        # ПРЕВЬЮ ДАННЫХ
+        # =====================================================================
+        with st.expander("👀 Превью данных из датасета", expanded=True):
+            if dataset_samples:
+                # Показываем первые 5 семплов
+                preview_count = min(5, len(dataset_samples))
+                
+                # Табличный вид
+                if dataset_fields:
+                    st.caption(f"**Обнаруженные поля:** {', '.join(dataset_fields)}")
+                
+                # Показываем семплы
+                for i, sample in enumerate(dataset_samples[:preview_count]):
+                    with st.container():
+                        st.markdown(f"**Пример {i+1}:**")
+                        # Показываем каждое поле
+                        cols = st.columns(2)
+                        field_list = list(sample.items()) if isinstance(sample, dict) else []
+                        for j, (key, value) in enumerate(field_list):
+                            col_idx = j % 2
+                            with cols[col_idx]:
+                                val_str = str(value)[:300]
+                                if len(str(value)) > 300:
+                                    val_str += "..."
+                                st.text_area(f"`{key}`", value=val_str, height=80, disabled=True, key=f"preview_{i}_{key}")
+                        st.markdown("---")
+            else:
+                st.warning("Не удалось загрузить данные для превью")
+        
+        # =====================================================================
+        # МАППИНГ ПОЛЕЙ
+        # =====================================================================
+        st.markdown("#### 🔗 Маппинг полей датасета")
+        st.caption("Укажите какие поля использовать для промпта и ответа")
+        
+        # Автодетект распространённых полей
+        auto_prompt_field = None
+        auto_reference_field = None
+        
+        prompt_candidates = ["question", "prompt", "input", "instruction", "problem", "query", "text"]
+        reference_candidates = ["answer", "response", "output", "solution", "target", "completion", "label"]
+        
+        for candidate in prompt_candidates:
+            if candidate in dataset_fields:
+                auto_prompt_field = candidate
+                break
+        
+        for candidate in reference_candidates:
+            if candidate in dataset_fields:
+                auto_reference_field = candidate
+                break
+        
+        # Если в session_state есть сохранённые значения и они валидны - используем их
+        saved_prompt_field = st.session_state.grpo_field_mapping.get("prompt_field")
+        saved_reference_field = st.session_state.grpo_field_mapping.get("reference_field")
+        
+        if saved_prompt_field in dataset_fields:
+            auto_prompt_field = saved_prompt_field
+        if saved_reference_field in dataset_fields:
+            auto_reference_field = saved_reference_field
+        
+        mapping_cols = st.columns(2)
+        
+        with mapping_cols[0]:
+            # Поле промпта
+            prompt_options = ["-- не выбрано --"] + dataset_fields
+            prompt_idx = 0
+            if auto_prompt_field and auto_prompt_field in prompt_options:
+                prompt_idx = prompt_options.index(auto_prompt_field)
+            
+            prompt_field = st.selectbox(
+                "📝 Поле промпта (вопрос/задача)",
+                options=prompt_options,
+                index=prompt_idx,
+                key="grpo_prompt_field_select",
+                help="Поле с вопросом/задачей для модели"
+            )
+            if prompt_field and prompt_field != "-- не выбрано --":
+                st.session_state.grpo_field_mapping["prompt_field"] = prompt_field
+        
+        with mapping_cols[1]:
+            # Поле референсного ответа
+            reference_options = ["-- не выбрано --"] + dataset_fields
+            reference_idx = 0
+            if auto_reference_field and auto_reference_field in reference_options:
+                reference_idx = reference_options.index(auto_reference_field)
+            
+            reference_field = st.selectbox(
+                "✅ Поле ответа (эталон)",
+                options=reference_options,
+                index=reference_idx,
+                key="grpo_reference_field_select",
+                help="Поле с правильным ответом для reward функции"
+            )
+            if reference_field and reference_field != "-- не выбрано --":
+                st.session_state.grpo_field_mapping["reference_field"] = reference_field
+        
+        # Дополнительные поля для metadata (могут использоваться в reward)
+        other_fields = [f for f in dataset_fields if f not in [prompt_field, reference_field]]
+        if other_fields:
+            metadata_fields = st.multiselect(
+                "📋 Дополнительные поля (для reward функций)",
+                options=other_fields,
+                default=st.session_state.grpo_field_mapping.get("metadata_fields", []),
+                key="grpo_metadata_fields_select",
+                help="Эти поля будут доступны как {{metadata.имя_поля}} в reward правилах"
+            )
+            st.session_state.grpo_field_mapping["metadata_fields"] = metadata_fields
+        
+        st.markdown("---")
+        
+        # =====================================================================
+        # ШАБЛОН ПРОМПТА
+        # =====================================================================
+        st.markdown("#### 📝 Шаблон промпта")
+        st.caption("Настройте как будет форматироваться промпт для модели")
+        
+        # Пресеты шаблонов (Reasoning по умолчанию)
+        template_presets = {
+            "🤔 Reasoning (теги <reasoning>/<answer>)": {
+                "system": """You are a helpful assistant that solves problems step by step.
+Think through the problem carefully inside <reasoning>...</reasoning> tags.
+Then provide your final answer inside <answer>...</answer> tags.
+
+Example format:
+<reasoning>
+Let me analyze this step by step...
+Step 1: ...
+Step 2: ...
+Therefore, the answer is X.
+</reasoning>
+<answer>X</answer>""",
+                "template": "{{prompt}}"
+            },
+            "🧮 Math (GSM8K стиль)": {
+                "system": "You are a helpful assistant that solves math problems step by step. Show your reasoning, then provide the final numerical answer after ####.",
+                "template": "{{prompt}}"
+            },
+            "🧮 Math RU (русский)": {
+                "system": """Ты — полезный ассистент, который решает задачи пошагово.
+Размышляй внутри тегов <reasoning>...</reasoning>.
+Затем дай финальный ответ внутри тегов <answer>...</answer>.""",
+                "template": "{{prompt}}"
+            },
+            "🤔 DeepSeek R1 стиль": {
+                "system": """A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
+The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.
+The reasoning process and answer are enclosed within <think>...</think> and <answer>...</answer> tags respectively.""",
+                "template": "{{prompt}}"
+            },
+            "📚 QA (вопрос-ответ)": {
+                "system": "Answer the question accurately and concisely.",
+                "template": "Question: {{prompt}}\n\nAnswer:"
+            },
+            "🔢 Простой (без system prompt)": {
+                "system": "",
+                "template": "{{prompt}}"
+            },
+            "🎯 Custom (свой шаблон)": {
+                "system": "",
+                "template": "{{prompt}}"
+            },
+        }
+        
+        selected_preset = st.selectbox(
+            "Выберите пресет",
+            options=list(template_presets.keys()),
+            key="grpo_template_preset",
+        )
+        
+        preset_data = template_presets[selected_preset]
+        
+        # System prompt
+        system_prompt = st.text_area(
+            "System prompt (необязательно)",
+            value=st.session_state.grpo_system_prompt or preset_data["system"],
+            height=80,
+            key="grpo_system_prompt_input",
+            help="Системный промпт для модели. Будет добавлен через chat_template если доступен."
+        )
+        st.session_state.grpo_system_prompt = system_prompt
+        
+        # Шаблон промпта
+        st.markdown("**Шаблон пользовательского промпта:**")
+        st.caption("Доступные переменные: `{{prompt}}` (поле промпта), `{{reference}}` (поле ответа), `{{metadata.имя}}` (доп. поля)")
+        
+        prompt_template = st.text_area(
+            "Шаблон",
+            value=st.session_state.grpo_prompt_template if "Custom" in selected_preset else preset_data["template"],
+            height=100,
+            key="grpo_prompt_template_input",
+            label_visibility="collapsed",
+        )
+        st.session_state.grpo_prompt_template = prompt_template
+        
+        # Превью готового промпта
+        if dataset_samples and prompt_field and prompt_field != "-- не выбрано --":
+            st.markdown("**Превью готового промпта:**")
+            sample = dataset_samples[0]
+            
+            # Подставляем значения
+            preview_prompt = prompt_template
+            if isinstance(sample, dict):
+                # {{prompt}}
+                if prompt_field in sample:
+                    preview_prompt = preview_prompt.replace("{{prompt}}", str(sample[prompt_field]))
+                # {{reference}}
+                if reference_field and reference_field != "-- не выбрано --" and reference_field in sample:
+                    preview_prompt = preview_prompt.replace("{{reference}}", str(sample[reference_field]))
+                # {{metadata.xxx}}
+                for key, value in sample.items():
+                    preview_prompt = preview_prompt.replace(f"{{{{metadata.{key}}}}}", str(value))
+            
+            # Показываем превью
+            preview_full = ""
+            if system_prompt:
+                preview_full = f"[System]: {system_prompt}\n\n[User]: {preview_prompt}"
+            else:
+                preview_full = f"[User]: {preview_prompt}"
+            
+            st.code(preview_full, language=None)
+            
+            # Показываем референсный ответ
+            if reference_field and reference_field != "-- не выбрано --" and reference_field in sample:
+                ref_val = str(sample[reference_field])[:500]
+                if len(str(sample[reference_field])) > 500:
+                    ref_val += "..."
+                st.caption(f"**Эталонный ответ:** {ref_val}")
+        
+        st.markdown("---")
+        
     else:
         # Очищаем session_state если датасет не выбран
         if "grpo_dataset_path" in st.session_state:
             del st.session_state.grpo_dataset_path
         st.warning("⚠️ Выберите датасет или скачайте его на вкладке **💾 Данные** → 🧠 Reasoning")
+        prompt_field = None
+        reference_field = None
     
     # Настройки датасета
     grpo_max_samples = st.number_input(
@@ -1949,32 +2245,26 @@ def render_grpo_main_config(data_path: str = None):
         step=100,
         help="Ограничить количество примеров для обучения"
     )
-    
-    st.markdown("---")
 
     # Оценка размера датасета для лимита "Max prompts" в sidebar
+    effective_size = None
     try:
-        effective_size = None
         if grpo_max_samples and int(grpo_max_samples) > 0:
-            # Если пользователь уже ограничил max_samples — используем это как "эффективный размер"
             effective_size = int(grpo_max_samples)
         elif grpo_dataset_path:
             p = Path(grpo_dataset_path)
             if p.exists() and p.suffix == ".jsonl":
-                # Для reasoning датасетов это обычно не гигабайты — считаем честно
                 with open(p, "r", encoding="utf-8", errors="ignore") as f:
                     effective_size = sum(1 for _ in f if _.strip())
             elif p.exists() and p.suffix == ".json":
-                import json as _json
                 with open(p, "r", encoding="utf-8") as f:
-                    obj = _json.load(f)
+                    obj = json_lib.load(f)
                 if isinstance(obj, list):
                     effective_size = len(obj)
         if isinstance(effective_size, int) and effective_size > 0:
             st.session_state["grpo_effective_dataset_size"] = int(effective_size)
-            st.caption(f"Размер датасета для лимита: **{effective_size} prompts**")
+            st.caption(f"📊 Размер датасета: **{effective_size} примеров**")
     except Exception:
-        # не мешаем запуску UI, даже если не смогли посчитать
         pass
     
     # =========================================================================
@@ -1984,60 +2274,100 @@ def render_grpo_main_config(data_path: str = None):
     st.caption("Создавайте гибкие правила вознаграждения с условиями, паттернами и формулами")
     
     # =========================================================================
-    # Песочница — Тестовые данные
+    # Песочница — Тестовые данные (автозагрузка из датасета)
     # =========================================================================
     st.markdown("#### 🧪 Песочница для проектирования")
     
+    # Получаем данные из датасета для песочницы
+    # НЕ используем fallback значения - показываем реальные данные из датасета
+    default_prompt = ""
+    default_reference = ""
+    reference_is_empty = False
+    
+    # Если датасет загружен - берём данные оттуда
+    if dataset_samples and prompt_field and prompt_field != "-- не выбрано --":
+        sample = dataset_samples[0]
+        if isinstance(sample, dict) and prompt_field in sample:
+            default_prompt = str(sample[prompt_field]) or ""
+        if isinstance(sample, dict) and reference_field and reference_field != "-- не выбрано --" and reference_field in sample:
+            ref_val = sample[reference_field]
+            # Для GSM8K-стиля извлекаем число после ####
+            if isinstance(ref_val, str) and "####" in ref_val:
+                parts = ref_val.split("####")
+                if len(parts) > 1:
+                    default_reference = parts[-1].strip().replace(",", "").split()[0] if parts[-1].strip() else ""
+                else:
+                    default_reference = str(ref_val) if ref_val else ""
+            else:
+                default_reference = str(ref_val) if ref_val else ""
+            
+            # Проверяем пустой ли ответ
+            reference_is_empty = not default_reference.strip()
+    
     with st.expander("📝 Тестовые данные", expanded=True):
-        col_left, col_right = st.columns(2)
+        # Если датасет загружен, показываем селектор примера
+        selected_sample_idx = 0
+        if dataset_samples:
+            sample_options = [f"Пример {i+1}" for i in range(min(10, len(dataset_samples)))]
+            selected_sample_idx = st.selectbox(
+                "Выберите пример из датасета",
+                options=range(len(sample_options)),
+                format_func=lambda x: sample_options[x],
+                key="grpo_sandbox_sample_idx",
+            )
+            
+            # Обновляем default_prompt/reference на основе выбранного примера
+            if selected_sample_idx < len(dataset_samples):
+                sample = dataset_samples[selected_sample_idx]
+                if isinstance(sample, dict) and prompt_field and prompt_field in sample:
+                    default_prompt = str(sample[prompt_field]) or ""
+                if isinstance(sample, dict) and reference_field and reference_field != "-- не выбрано --" and reference_field in sample:
+                    ref_val = sample[reference_field]
+                    if isinstance(ref_val, str) and "####" in ref_val:
+                        parts = ref_val.split("####")
+                        if len(parts) > 1:
+                            default_reference = parts[-1].strip().replace(",", "").split()[0] if parts[-1].strip() else ""
+                        else:
+                            default_reference = str(ref_val) if ref_val else ""
+                    else:
+                        default_reference = str(ref_val) if ref_val else ""
+                    
+                    reference_is_empty = not default_reference.strip()
+            
+            st.caption("💡 Данные автоматически загружены из выбранного датасета")
+        else:
+            st.info("Выберите датасет выше чтобы загрузить примеры")
         
-        with col_left:
-            sample_prompt = st.text_area(
-                "**Промпт** (вопрос/задача)",
-                value="Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?",
-                height=100,
-                key="sample_prompt",
-            )
-            sample_reference = st.text_input(
-                "**Эталонный ответ**",
-                value="72",
-                key="sample_reference",
-            )
+        # Создаём уникальный key на основе датасета и выбранного примера
+        dataset_key_hash = hash(grpo_dataset_path or "none") % 10000
         
-        with col_right:
-            st.markdown("**Ответ модели** (редактируйте для тестов):")
-            # Пресеты ответов
-            response_presets = {
-                "✅ Правильный с тегами": """<reasoning>
-In April, Natalia sold 48 clips.
-In May, she sold half as many: 48 / 2 = 24 clips.
-Total: 48 + 24 = 72 clips.
-</reasoning>
-<answer>72</answer>""",
-                "⚠️ Неправильный ответ": """<reasoning>
-April: 48 clips
-May: 48 / 2 = 24 clips  
-Total: 48 + 24 = 70 clips
-</reasoning>
-<answer>70</answer>""",
-                "❌ Без тегов": "Natalia sold 48 clips in April and 24 in May, so 72 total.",
-                "🔁 С повторами": """<reasoning>
-Let me solve this step by step.
-Step by step I will solve this.
-In April she sold 48 clips.
-In April she sold 48 clips.
-Total is 72.
-</reasoning>
-<answer>72</answer>""",
-            }
-            preset = st.selectbox("Быстрый выбор:", list(response_presets.keys()))
-            current_response = st.text_area(
-                "Ответ модели",
-                value=response_presets[preset],
-                height=180,
-                key="current_test_response",
-                label_visibility="collapsed",
-            )
+        sample_prompt = st.text_area(
+            "**Промпт** (вопрос/задача)",
+            value=default_prompt,
+            height=100,
+            key=f"sample_prompt_{dataset_key_hash}_{selected_sample_idx}",
+        )
+        
+        # Показываем предупреждение если ответ пустой
+        if reference_is_empty:
+            st.warning("⚠️ Поле ответа пустое в датасете! Выберите другое поле или введите вручную.")
+        
+        sample_reference = st.text_input(
+            "**Эталонный ответ**",
+            value=default_reference,
+            key=f"sample_reference_{dataset_key_hash}_{selected_sample_idx}",
+            help="Если пусто - значит в выбранном поле датасета нет ответа"
+        )
+        
+        # Показываем дополнительные поля из датасета
+        if dataset_samples and selected_sample_idx < len(dataset_samples):
+            sample = dataset_samples[selected_sample_idx]
+            metadata_fields_list = st.session_state.grpo_field_mapping.get("metadata_fields", [])
+            if metadata_fields_list and isinstance(sample, dict):
+                st.markdown("**Дополнительные поля:**")
+                for mf in metadata_fields_list:
+                    if mf in sample:
+                        st.caption(f"`{{{{metadata.{mf}}}}}` = {str(sample[mf])[:100]}")
     
     st.markdown("---")
     
@@ -2050,10 +2380,15 @@ Total is 72.
     with st.expander("📖 Справка: переменные и синтаксис", expanded=False):
         st.markdown("""
 **Доступные переменные:**
-- `{{response}}` — ответ модели
-- `{{reference}}` — эталонный ответ  
-- `{{prompt}}` — исходный промпт
+- `{{response}}` — ответ модели (completion)
+- `{{reference}}` — эталонный ответ (из поля ответа датасета)
+- `{{prompt}}` — отформатированный промпт (после применения шаблона)
 - `{{extracted.имя}}` — значение, извлечённое regex-группой
+- `{{metadata.имя_поля}}` — значение из дополнительного поля датасета
+
+**Доступ к данным датасета:**
+Все поля из вашего датасета автоматически доступны через `{{metadata.имя_поля}}`.
+Например, если датасет содержит поле `difficulty`, можно использовать `{{metadata.difficulty}}`.
 
 **Операторы сравнения:**
 - `contains` — содержит подстроку
@@ -2072,6 +2407,11 @@ Total is 72.
 **Формула reward:**
 ```
 1.0 if {{extracted.model_answer}} == {{reference}} else 0.0
+```
+
+**Пример с metadata:**
+```
+weight = float({{metadata.difficulty}}) / 10.0
 ```
         """)
     
@@ -2408,254 +2748,6 @@ Total is 72.
             st.rerun()
     
     # =========================================================================
-    # ТЕСТИРОВАНИЕ
-    # =========================================================================
-    st.markdown("---")
-    st.markdown("#### ▶️ Тестирование правил")
-    
-    def evaluate_rules(response: str, reference: str, prompt: str, rules: list) -> list:
-        """Вычисляет reward для каждого правила."""
-        results = []
-        
-        for rule in rules:
-            if not rule.get("enabled", True):
-                continue
-            
-            result = {
-                "name": rule["name"],
-                "weight": rule["weight"],
-                "extracted": {},
-                "conditions_met": [],
-                "all_conditions_true": False,
-                "raw_reward": 0.0,
-                "weighted_reward": 0.0,
-                "details": "",
-            }
-            
-            # 1. Экстракторы
-            for ext in rule.get("extractors", []):
-                source = ext.get("source", "{{response}}")
-                source_text = source.replace("{{response}}", response).replace("{{reference}}", reference).replace("{{prompt}}", prompt)
-                
-                pattern = ext.get("pattern", "")
-                flags = 0
-                if "DOTALL" in ext.get("flags", ""):
-                    flags |= re.DOTALL
-                if "IGNORECASE" in ext.get("flags", ""):
-                    flags |= re.IGNORECASE
-                
-                try:
-                    match = re.search(pattern, source_text, flags)
-                    if match:
-                        # Поддержка именованных групп и обычных
-                        if match.groups():
-                            result["extracted"][ext["name"]] = match.group(1)
-                        elif match.groupdict():
-                            result["extracted"].update(match.groupdict())
-                        else:
-                            result["extracted"][ext["name"]] = match.group(0)
-                    else:
-                        result["extracted"][ext["name"]] = ""
-                except re.error as e:
-                    result["extracted"][ext["name"]] = f"REGEX_ERROR: {e}"
-            
-            # 2. Условия
-            conditions_results = []
-            for cond in rule.get("conditions", []):
-                cond_type = cond.get("type", "contains")
-                
-                # Подставляем переменные
-                def substitute_vars(text):
-                    if not isinstance(text, str):
-                        return text
-                    text = text.replace("{{response}}", response)
-                    text = text.replace("{{reference}}", reference)
-                    text = text.replace("{{prompt}}", prompt)
-                    for k, v in result["extracted"].items():
-                        text = text.replace(f"{{{{extracted.{k}}}}}", str(v) if v else "")
-                    return text
-                
-                target = substitute_vars(cond.get("target") or cond.get("left", ""))
-                
-                cond_met = False
-                cond_detail = ""
-                
-                try:
-                    if cond_type == "contains":
-                        value = substitute_vars(cond.get("value", ""))
-                        cond_met = value in target
-                        cond_detail = f"'{value[:30]}...' {'✓ найдено' if cond_met else '✗ не найдено'}"
-                    
-                    elif cond_type == "not_contains":
-                        value = substitute_vars(cond.get("value", ""))
-                        cond_met = value not in target
-                        cond_detail = f"'{value[:30]}' {'✓ не содержится' if cond_met else '✗ содержится'}"
-                    
-                    elif cond_type == "matches":
-                        pattern = cond.get("pattern", "")
-                        cond_met = bool(re.search(pattern, target))
-                        cond_detail = f"regex {'✓' if cond_met else '✗'}"
-                    
-                    elif cond_type == "not_matches":
-                        pattern = cond.get("pattern", "")
-                        cond_met = not bool(re.search(pattern, target))
-                        cond_detail = f"not regex {'✓' if cond_met else '✗'}"
-                    
-                    elif cond_type == "equals":
-                        value = substitute_vars(cond.get("value", ""))
-                        cond_met = target.strip() == value.strip()
-                        cond_detail = f"{'✓' if cond_met else '✗'} '{target[:20]}' == '{value[:20]}'"
-                    
-                    elif cond_type == "equals_numeric":
-                        right = substitute_vars(cond.get("right", ""))
-                        tolerance = float(cond.get("tolerance", 0.01))
-                        try:
-                            left_num = float(re.sub(r"[^\d.\-]", "", str(target)))
-                            right_num = float(re.sub(r"[^\d.\-]", "", str(right)))
-                            cond_met = abs(left_num - right_num) <= tolerance
-                            cond_detail = f"{left_num} {'=' if cond_met else '≠'} {right_num} (±{tolerance})"
-                        except:
-                            cond_detail = "✗ не числа"
-                    
-                    elif cond_type == "greater":
-                        value = float(cond.get("value", 0))
-                        try:
-                            num = float(re.sub(r"[^\d.\-]", "", str(target)))
-                            cond_met = num > value
-                            cond_detail = f"{num} {'>' if cond_met else '≤'} {value}"
-                        except:
-                            cond_detail = "✗ не число"
-                    
-                    elif cond_type == "less":
-                        value = float(cond.get("value", 0))
-                        try:
-                            num = float(re.sub(r"[^\d.\-]", "", str(target)))
-                            cond_met = num < value
-                            cond_detail = f"{num} {'<' if cond_met else '≥'} {value}"
-                        except:
-                            cond_detail = "✗ не число"
-                    
-                    elif cond_type == "length_between":
-                        length = len(target)
-                        min_len = int(cond.get("min", 0))
-                        max_len = int(cond.get("max", 99999))
-                        cond_met = min_len <= length <= max_len
-                        cond_detail = f"len={length} {'✓' if cond_met else '✗'} [{min_len}, {max_len}]"
-                    
-                    elif cond_type == "length_min":
-                        length = len(target)
-                        min_len = int(cond.get("min", 0))
-                        cond_met = length >= min_len
-                        cond_detail = f"len={length} >= {min_len} {'✓' if cond_met else '✗'}"
-                    
-                    elif cond_type == "length_max":
-                        length = len(target)
-                        max_len = int(cond.get("max", 99999))
-                        cond_met = length <= max_len
-                        cond_detail = f"len={length} <= {max_len} {'✓' if cond_met else '✗'}"
-                    
-                except Exception as e:
-                    cond_detail = f"✗ ошибка: {e}"
-                
-                conditions_results.append({"met": cond_met, "detail": cond_detail})
-            
-            result["conditions_met"] = conditions_results
-            
-            # Логика объединения
-            logic = rule.get("condition_logic", "all")
-            if not conditions_results:
-                result["all_conditions_true"] = True  # Нет условий = всегда true
-            elif logic == "all":
-                result["all_conditions_true"] = all(c["met"] for c in conditions_results)
-            else:  # any
-                result["all_conditions_true"] = any(c["met"] for c in conditions_results)
-            
-            # 3. Вычисление reward
-            formula = rule.get("reward_formula", "1.0") if result["all_conditions_true"] else rule.get("else_reward", "0.0")
-            
-            # Подстановка переменных в формулу
-            formula = formula.replace("{{response}}", f"'''{response}'''")
-            formula = formula.replace("{{reference}}", f"'''{reference}'''")
-            formula = formula.replace("{{prompt}}", f"'''{prompt}'''")
-            for k, v in result["extracted"].items():
-                safe_v = str(v).replace("'", "\\'") if v else ""
-                formula = formula.replace(f"{{{{extracted.{k}}}}}", f"'''{safe_v}'''")
-            
-            try:
-                # Безопасное вычисление
-                safe_globals = {"__builtins__": {"len": len, "min": min, "max": max, "abs": abs, "float": float, "int": int, "str": str, "bool": bool}}
-                result["raw_reward"] = float(eval(formula, safe_globals))
-            except Exception as e:
-                result["raw_reward"] = 0.0
-                result["details"] = f"Ошибка формулы: {e}"
-            
-            result["weighted_reward"] = result["raw_reward"] * result["weight"]
-            results.append(result)
-        
-        return results
-    
-    if st.button("▶️ Рассчитать Reward", type="primary", use_container_width=True):
-        results = evaluate_rules(
-            current_response, 
-            sample_reference, 
-            sample_prompt, 
-            st.session_state.reward_rules
-        )
-        
-        total_reward = sum(r["weighted_reward"] for r in results)
-        
-        # Показываем результаты
-        st.markdown("##### 📊 Результаты")
-        
-        for r in results:
-            status = "✅" if r["all_conditions_true"] else "❌"
-            
-            with st.container():
-                c1, c2, c3 = st.columns([3, 2, 2])
-                with c1:
-                    st.markdown(f"**{status} {r['name']}**")
-                with c2:
-                    st.write(f"Raw: `{r['raw_reward']:.3f}`")
-                with c3:
-                    color = "green" if r["weighted_reward"] > 0 else ("red" if r["weighted_reward"] < 0 else "gray")
-                    st.markdown(f"×{r['weight']} = **:{color}[{r['weighted_reward']:.3f}]**")
-                
-                # Детали
-                if r["extracted"]:
-                    st.caption(f"📦 Извлечено: {r['extracted']}")
-                
-                for ci, cond in enumerate(r["conditions_met"]):
-                    icon = "✓" if cond["met"] else "✗"
-                    st.caption(f"  {icon} {cond['detail']}")
-                
-                if r["details"]:
-                    st.warning(r["details"])
-        
-        st.markdown("---")
-        color = "green" if total_reward > 0 else "red"
-        st.markdown(f"### 🎯 Итоговый Reward: :{color}[**{total_reward:.3f}**]")
-        
-        # График
-        if results:
-            import plotly.graph_objects as go
-            fig = go.Figure(data=[
-                go.Bar(
-                    x=[r["name"] for r in results],
-                    y=[r["weighted_reward"] for r in results],
-                    marker_color=["#22c55e" if r["weighted_reward"] > 0 else "#ef4444" for r in results],
-                    text=[f"{r['weighted_reward']:.2f}" for r in results],
-                    textposition="outside"
-                )
-            ])
-            fig.update_layout(
-                title="Вклад каждого правила",
-                yaxis_title="Weighted Reward",
-                height=350,
-                showlegend=False,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # =========================================================================
     # Формат reasoning
     # =========================================================================
     st.markdown("---")
@@ -2706,77 +2798,6 @@ Therefore, the answer is 42.
     with st.expander("📋 Пример формата ответа"):
         st.code(format_examples[reasoning_format], language=None)
     
-    # =========================================================================
-    # System Prompt (редактируемый!)
-    # =========================================================================
-    st.markdown("---")
-    st.markdown("#### 💬 System Prompt")
-    st.caption("Системный промпт определяет как модель должна отвечать. Можете изменить по своему желанию.")
-    
-    # Дефолтные system prompts для каждого формата
-    default_system_prompts = {
-        "deepseek": """A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
-The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think>
-<answer> answer here </answer>""",
-        "simple": """Отвечай строго в формате:
-<reasoning>
-(Шаги решения)
-</reasoning>
-<answer>
-(Короткий итоговый ответ)
-</answer>""",
-        "russian": """Ты — умный помощник. Решай задачи пошагово.
-Сначала подробно рассуждай в теге <reasoning>...</reasoning>,
-затем дай краткий ответ в теге <answer>...</answer>.
-
-Пример:
-<reasoning>
-Дано: ...
-Нужно найти: ...
-Решение: ...
-</reasoning>
-<answer>
-42
-</answer>""",
-        "gsm8k": """You are a helpful assistant that solves math problems step by step.
-Show your reasoning process, then provide the final numerical answer after ####.
-
-Example format:
-Let me solve this step by step.
-Step 1: ...
-Step 2: ...
-Therefore, the answer is X.
-#### X""",
-    }
-    
-    # Получаем сохранённый system prompt или используем дефолт для текущего формата
-    saved_prompt_key = f"grpo_system_prompt_{reasoning_format}"
-    if saved_prompt_key not in st.session_state:
-        st.session_state[saved_prompt_key] = default_system_prompts[reasoning_format]
-    
-    # Кнопка сброса к дефолту
-    col1, col2 = st.columns([3, 1])
-    with col2:
-        if st.button("🔄 Сбросить", key="reset_system_prompt", help="Вернуть дефолтный промпт"):
-            st.session_state[saved_prompt_key] = default_system_prompts[reasoning_format]
-            st.rerun()
-    
-    # Текстовое поле для редактирования system prompt
-    system_prompt = st.text_area(
-        "System Prompt",
-        value=st.session_state[saved_prompt_key],
-        height=200,
-        key=f"system_prompt_editor_{reasoning_format}",
-        help="Этот текст будет отправлен модели как системный промпт"
-    )
-    
-    # Сохраняем изменения
-    st.session_state[saved_prompt_key] = system_prompt
-    
-    # Показываем предупреждение если промпт сильно изменён
-    if system_prompt != default_system_prompts[reasoning_format]:
-        st.info("ℹ️ Используется кастомный System Prompt")
-    
     # Собираем конфигурацию reward правил (новый универсальный формат)
     reward_rules = [
         {
@@ -2793,6 +2814,15 @@ Therefore, the answer is X.
         if rule.get("enabled", True)
     ]
     
+    # Получаем настройки маппинга полей из session_state
+    field_mapping = st.session_state.get("grpo_field_mapping", {
+        "prompt_field": "question",
+        "reference_field": "answer",
+        "metadata_fields": [],
+    })
+    prompt_template_value = st.session_state.get("grpo_prompt_template", "{{prompt}}")
+    system_prompt_value = st.session_state.get("grpo_system_prompt", "")
+    
     return {
         "grpo_dataset_source": dataset_source,
         "grpo_dataset_key": dataset_key,
@@ -2801,7 +2831,10 @@ Therefore, the answer is X.
         "grpo_max_samples": grpo_max_samples if grpo_max_samples > 0 else None,
         "grpo_reward_rules": reward_rules,
         "grpo_reasoning_format": reasoning_format,
-        "grpo_system_prompt": system_prompt,  # Кастомный system prompt из UI
+        "grpo_system_prompt": system_prompt_value,  # System prompt из настроек датасета
+        # Настройки маппинга датасета
+        "grpo_field_mapping": field_mapping,
+        "grpo_prompt_template": prompt_template_value,
     }
 
 
@@ -4803,7 +4836,7 @@ def render_data_manager(stage: str = "pretrain"):
             presets = {
                 # English
                 "🧠 GSM8K (math, EN)": ("gsm8k", "main", "train"),
-                "🧠 MATH (competition, EN)": ("lighteval/MATH", "default", "train"),
+                "🧠 OpenR1-Math-220k": ("open-r1/OpenR1-Math-220k", "default", "train"),
                 "🧠 ARC-Challenge (EN)": ("allenai/ai2_arc", "ARC-Challenge", "train"),
                 "🧠 CommonsenseQA (EN)": ("tau/commonsense_qa", "default", "train"),
                 "🧠 HellaSwag (EN)": ("Rowan/hellaswag", "default", "train"),
@@ -4812,10 +4845,8 @@ def render_data_manager(stage: str = "pretrain"):
                 "🧠 WinoGrande (EN)": ("winogrande", "winogrande_xl", "train"),
                 # Russian
                 "🧠 GSM8K-RU (math, RU)": ("d0rj/gsm8k-ru", "default", "train"),
-                "🧠 MATH-RU (олимпиады, RU)": ("d0rj/competition_math_ru", "default", "train"),
+                "🧠 Gromov-MAX (math, RU)": ("attn-signs/gromov-max", "default", "train"),
                 "🧠 MGSM-RU (multilingual)": ("juletxara/mgsm", "ru", "train"),
-                "🧠 OpenBookQA-RU": ("malakhovks/openbookqa_ru", "default", "train"),
-                "🧠 RuMedBench (medical, RU)": ("d0rj/rumedbench", "default", "train"),
                 # Ручной ввод
                 "📝 Ввести вручную...": (None, None, None),
             }

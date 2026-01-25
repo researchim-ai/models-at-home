@@ -375,6 +375,7 @@ def generate_rollouts(
     device: Optional[torch.device] = None,
     accelerator=None,
     prompt_ids: Optional[List[int]] = None,
+    metadata_list: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Rollout]:
     """
     Генерирует rollout'ы для списка промптов.
@@ -394,6 +395,7 @@ def generate_rollouts(
         reference_model: Референсная модель для KL (опционально)
         device: Устройство для вычислений
         accelerator: Accelerator объект для unwrap модели (опционально)
+        metadata_list: Список metadata для каждого промпта (для reward функций)
         
     Returns:
         Список Rollout для каждого промпта
@@ -521,6 +523,8 @@ def generate_rollouts(
                     
                     # Вычисляем rewards
                     rewards = torch.zeros(config.group_size, dtype=torch.float32, device=device)
+                    # Получаем metadata для текущего промпта
+                    prompt_metadata = metadata_list[batch_idx * batch_size + i] if metadata_list else {}
                     for j, completion in enumerate(completions):
                         try:
                             reward = reward_fn(
@@ -528,6 +532,7 @@ def generate_rollouts(
                                 reference_answer=ref_answer,
                                 reasoning_format=config.reasoning_format,
                                 is_truncated=is_truncated[j],
+                                metadata=prompt_metadata,
                             )
                             if not isinstance(reward, (int, float)):
                                 reward = 0.0
@@ -724,6 +729,8 @@ def generate_rollouts(
             
             # Вычисляем rewards
             rewards = torch.zeros(config.group_size, dtype=torch.float32, device=device)
+            # Получаем metadata для текущего промпта
+            prompt_metadata = metadata_list[prompt_idx] if metadata_list else {}
             for i, completion in enumerate(completions):
                 try:
                     reward = reward_fn(
@@ -731,6 +738,7 @@ def generate_rollouts(
                         reference_answer=ref_answer,
                         reasoning_format=config.reasoning_format,
                         is_truncated=is_truncated[i],
+                        metadata=prompt_metadata,
                     )
                     # Проверяем что reward - число
                     if not isinstance(reward, (int, float)):
@@ -778,6 +786,7 @@ def generate_rollouts_vllm(
     reward_fn: Callable,
     config: GRPOConfig,
     prompt_ids: Optional[List[int]] = None,
+    metadata_list: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Rollout]:
     """
     Генерация rollouts через vLLM.
@@ -833,6 +842,8 @@ def generate_rollouts_vllm(
 
         # Rewards
         rewards = torch.zeros(len(completions), dtype=torch.float)
+        # Получаем metadata для текущего промпта
+        prompt_metadata = metadata_list[prompt_idx] if metadata_list else {}
         for i, comp in enumerate(completions):
             try:
                 r = reward_fn(
@@ -840,6 +851,7 @@ def generate_rollouts_vllm(
                     reference_answer=ref_answer,
                     reasoning_format=config.reasoning_format,
                     is_truncated=is_truncated[i],
+                    metadata=prompt_metadata,
                 )
                 rewards[i] = float(r) if isinstance(r, (int, float)) else 0.0
             except Exception as e:

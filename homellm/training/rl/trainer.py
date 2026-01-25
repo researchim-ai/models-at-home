@@ -1702,6 +1702,7 @@ class GRPOTrainer:
                 for s in batch_samples
             ]
             reference_answers = [s.reference_answer for s in batch_samples]
+            metadata_list = [s.metadata if hasattr(s, 'metadata') else {} for s in batch_samples]
             # group_id должен быть уникальным для каждой группы (особенно при dynamic sampling с добором)
             desired_groups = len(batch_samples)
             group_ids = self._next_group_uids(desired_groups)
@@ -1713,6 +1714,7 @@ class GRPOTrainer:
                 prompts=prompts,
                 reference_answers=reference_answers,
                 prompt_ids=group_ids,
+                metadata_list=metadata_list,
             )
             logger.info(f"✅ Batch {batch_idx}: генерация завершена, rewards={len(batch_rewards)}")
             refill_rounds = 0
@@ -1732,11 +1734,13 @@ class GRPOTrainer:
                         for s in extra_samples
                     ]
                     extra_refs = [s.reference_answer for s in extra_samples]
+                    extra_metadata = [s.metadata if hasattr(s, 'metadata') else {} for s in extra_samples]
                     extra_group_ids = self._next_group_uids(len(extra_samples))
                     extra_rewards = self._generate_and_collect(
                         prompts=extra_prompts,
                         reference_answers=extra_refs,
                         prompt_ids=extra_group_ids,
+                        metadata_list=extra_metadata,
                     )
                     batch_rewards.extend(extra_rewards)
                     refill_rounds += 1
@@ -1853,9 +1857,16 @@ class GRPOTrainer:
         prompts: List[str],
         reference_answers: List[str],
         prompt_ids: Optional[List[int]] = None,
+        metadata_list: Optional[List[Dict[str, Any]]] = None,
     ) -> List[float]:
         """
         Генерирует rollout'ы и собирает опыт в буфер.
+        
+        Args:
+            prompts: Список промптов
+            reference_answers: Эталонные ответы
+            prompt_ids: ID для группировки
+            metadata_list: Metadata для каждого промпта (для reward функций)
         
         Returns:
             Список всех rewards
@@ -1871,12 +1882,13 @@ class GRPOTrainer:
         all_rewards = []
         
         # Обёртка для reward функции
-        def reward_wrapper(completion, reference_answer, reasoning_format, is_truncated):
+        def reward_wrapper(completion, reference_answer, reasoning_format, is_truncated, metadata=None):
             return self.reward_fn(
                 completion=completion,
                 reference_answer=reference_answer,
                 reasoning_format=reasoning_format,
                 is_truncated=is_truncated,
+                metadata=metadata or {},
             )
         
         # Генерируем rollout'ы.
@@ -1907,6 +1919,7 @@ class GRPOTrainer:
                     reference_model=None,      # ref logprobs считаем на training стороне, если нужно
                     device=self.rollout_engine.device,
                     prompt_ids=prompt_ids,
+                    metadata_list=metadata_list,
                 )
                 self.rollout_engine.maybe_offload()
             elif backend == "vllm":
@@ -1924,6 +1937,7 @@ class GRPOTrainer:
                     reward_fn=reward_wrapper,
                     config=self.config,
                     prompt_ids=prompt_ids,
+                    metadata_list=metadata_list,
                 )
             else:
                 raise NotImplementedError(f"Unknown rollout_engine_backend='{backend}'")
@@ -1940,6 +1954,7 @@ class GRPOTrainer:
                 reference_model=self.reference_model,
                 device=self.device,
                 prompt_ids=prompt_ids,
+                metadata_list=metadata_list,
             )
         
         # ВАЖНО: Синхронизация после генерации для ZeRO-3
@@ -2341,6 +2356,7 @@ class GRPOTrainer:
                 completion=completion,
                 reference_answer=sample.reference_answer,
                 reasoning_format=self.config.reasoning_format,
+                metadata=sample.metadata if hasattr(sample, 'metadata') else {},
             )
             rewards.append(reward)
             
