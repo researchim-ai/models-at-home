@@ -3589,10 +3589,10 @@ def render_output_config(model_name="training_run"):
     
     save_every = st.sidebar.number_input(
         "Save Checkpoint Every N Steps",
-        min_value=100,
-        max_value=50000,
-        value=200,
-        step=100,
+        min_value=1,
+        max_value=5000,
+        value=100,
+        step=1,
         help="Как часто сохранять чекпоинты"
     )
 
@@ -4857,9 +4857,8 @@ def render_data_manager(stage: str = "pretrain"):
                 # Russian
                 "🔵 OpenOrca-ru": ("d0rj/OpenOrca-ru", "default", "train"),
                 "🔵 ru-instruct": ("d0rj/ru-instruct", "default", "train"),
+                "🔵 Gromov-MAX": ("attn-signs/gromov-max", "default", "train"),
                 "🔵 GrandMaster-PRO-MAX": ("Vikhrmodels/GrandMaster-PRO-MAX", "default", "train"),
-                "🔵 Alpaca-GPT4-ru": ("IlyaGusev/ru_turbo_alpaca", "default", "train"),
-                "🔵 Saiga-ru (Vikhr)": ("Vikhrmodels/Saiga-2-7b", "default", "train"),
                 # English
                 "🔵 OpenOrca (EN)": ("Open-Orca/OpenOrca", "default", "train"),
                 "🔵 Alpaca-GPT4 (EN)": ("vicgalle/alpaca-gpt4", "default", "train"),
