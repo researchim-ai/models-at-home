@@ -1364,33 +1364,36 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                         except Exception as e:
                             logger.warning(f"Failed to save checkpoint metadata: {e}")
                         accelerator.wait_for_everyone()
+                        
+                        # Операции только на main process
                         if accelerator.is_main_process:
                             model_config.save_pretrained(ckpt_path)
                             # Передаем текущий loss в чекпоинт
                             current_loss = metrics.metrics.get("current_loss", 0.0)
                             metrics.log_checkpoint(str(ckpt_path), loss=current_loss)
 
-                            # (Опционально) Экспортируем инференс-модель для чата при каждом checkpoint.
-                            # Это НЕ resume-state, а просто удобный "latest final_model" для загрузки.
-                            if bool(config.get("export_on_checkpoint", True)):
-                                try:
-                                    import shutil
-                                    tmp_dir = output_dir / "final_model.__tmp__"
-                                    final_dir = output_dir / "final_model"
+                        # (Опционально) Экспортируем инференс-модель для чата при каждом checkpoint.
+                        # Это НЕ resume-state, а просто удобный "latest final_model" для загрузки.
+                        # ВАЖНО: Для ZeRO-3/FSDP adapter.save_final ДОЛЖЕН вызываться на ВСЕХ процессах!
+                        if bool(config.get("export_on_checkpoint", True)):
+                            try:
+                                import shutil
+                                tmp_dir = output_dir / "final_model.__tmp__"
+                                final_dir = output_dir / "final_model"
+                                
+                                # Создаём директорию на main process
+                                if accelerator.is_main_process:
                                     if tmp_dir.exists():
                                         shutil.rmtree(tmp_dir, ignore_errors=True)
                                     tmp_dir.mkdir(parents=True, exist_ok=True)
 
                                     # SFT: убедимся, что chat_template попадает в tokenizer_config.json
                                     if stage == "sft":
-                                        # Приоритет: пользовательский chat_template > генерация из sft_template
                                         user_chat_template = config.get("chat_template")
                                         if user_chat_template:
-                                            # Используем пользовательский chat_template
                                             tokenizer.chat_template = user_chat_template
                                             logger.info("Using user-provided chat_template")
                                         elif config.get("sft_template"):
-                                            # Генерируем chat_template из sft_template
                                             tmpl = config["sft_template"]
                                             default_sys = tmpl.get("system", "You are a helpful assistant.")
                                             u_tag = tmpl.get("user_tag", "### User:")
@@ -1416,15 +1419,24 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                                                 "{% endif %}"
                                             )
                                             logger.info("Generated chat_template from sft_template")
-
-                                    adapter.save_final(accelerator, model, tokenizer, tmp_dir)
-
-                                    # Атомарно заменяем final_model
+                                
+                                accelerator.wait_for_everyone()
+                                
+                                # save_final вызывается на ВСЕХ процессах (для ZeRO-3/FSDP)
+                                adapter.save_final(accelerator, model, tokenizer, tmp_dir)
+                                
+                                accelerator.wait_for_everyone()
+                                
+                                # Атомарно заменяем final_model (только на main)
+                                if accelerator.is_main_process:
                                     if final_dir.exists():
                                         shutil.rmtree(final_dir, ignore_errors=True)
                                     tmp_dir.rename(final_dir)
                                     logger.info(f"Updated final_model at checkpoint step {global_step}")
-                                except Exception as e:
+                                
+                                accelerator.wait_for_everyone()
+                            except Exception as e:
+                                if accelerator.is_main_process:
                                     logger.warning(f"Failed to export final_model on checkpoint: {e}")
                     
                     # Validation
@@ -1462,56 +1474,70 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             except Exception:
                 pass
 
-        # Final save - только на main process
+        # Final save - для ZeRO-3/FSDP требуется участие ВСЕХ процессов
         accelerator.wait_for_everyone()
+        
+        # Обновляем статус на main
         if accelerator.is_main_process:
             metrics.update(status="saving_model")
-            final_dir = output_dir / "final_model"
+        
+        final_dir = output_dir / "final_model"
+        
+        # Создаём директорию на main process
+        if accelerator.is_main_process:
             final_dir.mkdir(parents=True, exist_ok=True)
-            
-            # --- (опционально) сохраняем chat_template для SFT ---
-            if stage == "sft":
-                # Приоритет: пользовательский chat_template > генерация из sft_template
-                user_chat_template = config.get("chat_template")
-                if user_chat_template:
-                    # Используем пользовательский chat_template
-                    tokenizer.chat_template = user_chat_template
-                    logger.info("Final save: using user-provided chat_template")
-                elif config.get("sft_template"):
-                    # Генерируем chat_template из sft_template
-                    tmpl = config["sft_template"]
-                    
-                    default_sys = tmpl.get("system", "You are a helpful assistant.")
-                    u_tag = tmpl.get("user_tag", "### User:")
-                    b_tag = tmpl.get("bot_tag", "### Assistant:")
-                    
-                    default_sys_escaped = default_sys.replace("'", "\\'")
-                    u_tag_escaped = u_tag.replace("'", "\\'")
-                    b_tag_escaped = b_tag.replace("'", "\\'")
-                    
-                    tokenizer.chat_template = (
-                        "{% if messages and messages[0]['role'] == 'system' %}"
-                        "{{ messages[0]['content'] }}\n\n"
-                        "{% else %}"
-                        f"{{{{ '{default_sys_escaped}' }}}}\n\n"
-                        "{% endif %}"
-                        "{% for message in messages %}"
-                        "{% if message['role'] == 'user' %}"
-                        f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
-                        "{% elif message['role'] == 'assistant' %}"
-                        f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
-                        "{% endif %}"
-                        "{% endfor %}"
-                        "{% if add_generation_prompt %}"
-                        f"{b_tag_escaped}\n"
-                        "{% endif %}"
-                    )
-                    logger.info(f"Final save: generated chat_template from sft_template (user_tag='{u_tag}', bot_tag='{b_tag}')")
-            
-            # --- ВСЕГДА сохраняем финальную модель (и для pretrain тоже) ---
-            # Используем адаптер для универсального сохранения (работает для Home и HF моделей)
-            adapter.save_final(accelerator, model, tokenizer, final_dir)
-            
+        accelerator.wait_for_everyone()
+        
+        # --- (опционально) сохраняем chat_template для SFT ---
+        # Настраиваем на main, но токенизатор будет сохранён внутри adapter.save_final
+        if accelerator.is_main_process and stage == "sft":
+            # Приоритет: пользовательский chat_template > генерация из sft_template
+            user_chat_template = config.get("chat_template")
+            if user_chat_template:
+                # Используем пользовательский chat_template
+                tokenizer.chat_template = user_chat_template
+                logger.info("Final save: using user-provided chat_template")
+            elif config.get("sft_template"):
+                # Генерируем chat_template из sft_template
+                tmpl = config["sft_template"]
+                
+                default_sys = tmpl.get("system", "You are a helpful assistant.")
+                u_tag = tmpl.get("user_tag", "### User:")
+                b_tag = tmpl.get("bot_tag", "### Assistant:")
+                
+                default_sys_escaped = default_sys.replace("'", "\\'")
+                u_tag_escaped = u_tag.replace("'", "\\'")
+                b_tag_escaped = b_tag.replace("'", "\\'")
+                
+                tokenizer.chat_template = (
+                    "{% if messages and messages[0]['role'] == 'system' %}"
+                    "{{ messages[0]['content'] }}\n\n"
+                    "{% else %}"
+                    f"{{{{ '{default_sys_escaped}' }}}}\n\n"
+                    "{% endif %}"
+                    "{% for message in messages %}"
+                    "{% if message['role'] == 'user' %}"
+                    f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                    "{% elif message['role'] == 'assistant' %}"
+                    f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
+                    "{% endif %}"
+                    "{% endfor %}"
+                    "{% if add_generation_prompt %}"
+                    f"{b_tag_escaped}\n"
+                    "{% endif %}"
+                )
+                logger.info(f"Final save: generated chat_template from sft_template (user_tag='{u_tag}', bot_tag='{b_tag}')")
+        
+        # --- ВСЕГДА сохраняем финальную модель (и для pretrain тоже) ---
+        # ВАЖНО: Для ZeRO-3/FSDP adapter.save_final ДОЛЖЕН вызываться на ВСЕХ процессах
+        # чтобы корректно собрать шардированные веса через accelerator.save_model
+        adapter.save_final(accelerator, model, tokenizer, final_dir)
+        
+        # Ждём завершения сохранения на всех процессах
+        accelerator.wait_for_everyone()
+        
+        # Финальные метрики только на main
+        if accelerator.is_main_process:
             total_time = time.time() - start_time
             hours, rem = divmod(total_time, 3600)
             minutes, seconds = divmod(rem, 60)

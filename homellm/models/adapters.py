@@ -328,8 +328,8 @@ class ModelAdapter:
         """
         Сохраняет финальную модель в HF формате.
         
-        ВАЖНО: Если модель использует LoRA/QLoRA, мерджим адаптер в базу,
-        чтобы чат мог загрузить модель как обычную.
+        ВАЖНО: Корректно обрабатывает ZeRO-3/FSDP - собирает шардированные веса.
+        Если модель использует LoRA/QLoRA, мерджим адаптер в базу.
         
         Args:
             accelerator: Accelerator instance
@@ -340,15 +340,72 @@ class ModelAdapter:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # ВАЖНО: сохраняем только на main process (остальные просто дождутся barrier выше по стеку)
+        # Проверяем используется ли ZeRO-3 или FSDP (шардированные параметры)
+        is_zero3 = False
+        is_fsdp = False
+        
+        if hasattr(accelerator, "state"):
+            # DeepSpeed ZeRO-3
+            ds_plugin = getattr(accelerator.state, "deepspeed_plugin", None)
+            if ds_plugin is not None:
+                zero_stage = getattr(ds_plugin, "zero_stage", 0)
+                is_zero3 = zero_stage == 3
+            
+            # FSDP
+            fsdp_plugin = getattr(accelerator.state, "fsdp_plugin", None)
+            is_fsdp = fsdp_plugin is not None
+        
+        # Для ZeRO-3/FSDP используем accelerator.save_model который корректно собирает веса
+        if is_zero3 or is_fsdp:
+            logger.info(f"🔄 Detected {'ZeRO-3' if is_zero3 else 'FSDP'}, using accelerator.save_model for correct weight gathering")
+            
+            # Сначала сохраняем через accelerator (работает на всех ranks)
+            try:
+                accelerator.save_model(model, str(output_dir), safe_serialization=True)
+            except Exception as e:
+                logger.error(f"accelerator.save_model failed: {e}")
+                raise
+            
+            # Дожидаемся всех процессов
+            accelerator.wait_for_everyone()
+            
+            # Остальное сохраняем только на main process
+            if not accelerator.is_main_process:
+                return
+            
+            # ВАЖНО: accelerator.save_model сохраняет только веса!
+            # Нужно отдельно сохранить config.json и generation_config.json
+            unwrapped_model = model
+            while hasattr(unwrapped_model, "module"):
+                unwrapped_model = unwrapped_model.module
+            
+            # Сохраняем config.json (ОБЯЗАТЕЛЬНО для загрузки модели!)
+            try:
+                unwrapped_model.config.save_pretrained(str(output_dir))
+                logger.info(f"Saved config.json to {output_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to save config.json: {e}")
+            
+            # Сохраняем generation_config.json
+            try:
+                if getattr(unwrapped_model, "generation_config", None) is not None:
+                    unwrapped_model.generation_config.save_pretrained(str(output_dir))
+            except Exception as e:
+                logger.warning(f"Failed to save generation_config.json: {e}")
+            
+            # Сохраняем токенизатор
+            tokenizer.save_pretrained(str(output_dir))
+            logger.info(f"Model and tokenizer saved to {output_dir} (via accelerator)")
+            return
+        
+        # === Обычный режим (DDP или single GPU) ===
+        
+        # ВАЖНО: сохраняем только на main process
         if hasattr(accelerator, "is_main_process") and not accelerator.is_main_process:
             return
 
-        # Unwrap модель БЕЗ accelerate.unwrap_model():
-        # accelerate.unwrap_model() внутри пытается `import deepspeed`, даже если вы не используете DeepSpeed.
-        # В окружениях без `distutils` это падает на этапе сохранения.
+        # Unwrap модель
         unwrapped_model = model
-        # DDP / DataParallel / другие обёртки
         while hasattr(unwrapped_model, "module"):
             unwrapped_model = unwrapped_model.module
         
@@ -362,43 +419,43 @@ class ModelAdapter:
             except Exception as e:
                 logger.warning(f"LoRA merge failed, saving as-is: {e}")
         
-        # Сохраняем в HF формате БЕЗ вызова transformers.save_pretrained(),
-        # потому что transformers внутри делает unwrap_model() -> accelerate -> import deepspeed,
-        # а deepspeed может падать (например, если в runtime нет nvcc).
-        #
-        # Вместо этого сохраняем:
-        # - config.json
-        # - model.safetensors
-        # - (опционально) generation_config.json
+        # Сохраняем config.json
         try:
             unwrapped_model.config.save_pretrained(str(output_dir))
         except Exception as e:
             logger.warning(f"Failed to save config.json: {e}")
 
+        # Сохраняем generation_config.json
         try:
             if getattr(unwrapped_model, "generation_config", None) is not None:
                 unwrapped_model.generation_config.save_pretrained(str(output_dir))
         except Exception as e:
             logger.warning(f"Failed to save generation_config.json: {e}")
 
+        # Сохраняем веса модели
         try:
             from safetensors.torch import save_file as _save_safetensors
 
-            # Сохраняем state_dict на CPU (для детерминированного и независимого сейва)
             state_dict = unwrapped_model.state_dict()
+            
+            # Проверяем что тензоры не пустые (защита от ошибок шардирования)
+            empty_tensors = [k for k, v in state_dict.items() if v.numel() == 0]
+            if empty_tensors:
+                logger.warning(f"⚠️ Found {len(empty_tensors)} empty tensors: {empty_tensors[:5]}...")
+                logger.warning("This may indicate incorrect distributed saving. Consider using accelerator.save_model()")
+            
             cpu_state = {k: v.detach().cpu() for k, v in state_dict.items()}
             _save_safetensors(cpu_state, str(output_dir / "model.safetensors"))
         except Exception as e:
             logger.error(f"Failed to save model.safetensors: {e}")
             raise
         
-        # Если модель построена по blueprint — сохраняем blueprint рядом
+        # Сохраняем blueprint если есть
         bp_dict = getattr(unwrapped_model.config, "blueprint", None)
         if bp_dict:
             try:
                 blueprint_path = output_dir / "blueprint.json"
                 import json as _json
-
                 blueprint_path.write_text(_json.dumps(bp_dict, indent=2, ensure_ascii=False), encoding="utf-8")
                 logger.info(f"Saved blueprint to {blueprint_path}")
             except Exception as e:
