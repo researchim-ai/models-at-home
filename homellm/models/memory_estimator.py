@@ -28,13 +28,17 @@ class ArchitectureProfile:
     # Параметры на слой
     attn_proj_count: int  # Количество проекций в attention (q,k,v,out = 4)
     attn_has_bias: bool  # Есть ли bias в attention проекциях
-    mlp_type: str  # "swiglu" | "gelu" | "relu"
+    mlp_type: str  # "swiglu" | "gelu" | "relu" | "moe_swiglu" | "moe_mlp"
     mlp_has_bias: bool  # Есть ли bias в MLP
     norm_type: str  # "rmsnorm" | "layernorm"
     norm_count_per_layer: int  # Количество норм на слой (обычно 2: attn_norm + ffn_norm)
     has_final_norm: bool  # Есть ли финальная нормализация
     lm_head_tied: bool  # Связан ли lm_head с embed_tokens (weight tying)
     has_pos_embeddings: bool  # Есть ли обучаемые позиционные эмбеддинги (не RoPE)
+    # MoE specific (опционально)
+    is_moe: bool = False  # Является ли MoE архитектурой
+    num_experts: int = 8  # Количество экспертов (для MoE)
+    num_experts_per_tok: int = 2  # Top-K routing (для MoE)
     
     def calculate_parameters(
         self,
@@ -43,9 +47,13 @@ class ArchitectureProfile:
         num_layers: int,
         intermediate_size: int,
         max_position_embeddings: int = 4096,
+        num_experts: Optional[int] = None,  # Override для MoE
     ) -> int:
         """
         Точный расчет количества параметров для данной архитектуры.
+        
+        Args:
+            num_experts: Override количества экспертов (для MoE)
         
         Returns:
             Общее количество параметров
@@ -55,6 +63,9 @@ class ArchitectureProfile:
         v = int(vocab_size)
         i = int(intermediate_size)
         s = int(max_position_embeddings)
+        
+        # MoE параметры
+        n_experts = int(num_experts) if num_experts is not None else self.num_experts
         
         # Embedding
         embed_params = v * h
@@ -67,7 +78,21 @@ class ArchitectureProfile:
         attn_params_per_layer = self.attn_proj_count * (h * h + attn_bias)
         
         # MLP на слой
-        if self.mlp_type == "swiglu":
+        if self.is_moe:
+            # MoE: gate + num_experts * expert_mlp
+            gate_params = h * n_experts  # Router: hidden_size -> num_experts
+            
+            if self.mlp_type in ("swiglu", "moe_swiglu"):
+                # SwiGLU expert: w1(H->I), w2(I->H), w3(H->I) per expert
+                mlp_bias = (i + h + i) if self.mlp_has_bias else 0
+                expert_params = 3 * h * i + mlp_bias
+            else:
+                # Standard MLP expert: fc1(H->I), fc2(I->H) per expert
+                mlp_bias = (i + h) if self.mlp_has_bias else 0
+                expert_params = 2 * h * i + mlp_bias
+            
+            mlp_params_per_layer = gate_params + n_experts * expert_params
+        elif self.mlp_type == "swiglu":
             # SwiGLU: w1(H->I), w2(I->H), w3(H->I)
             mlp_bias = (i + h + i) if self.mlp_has_bias else 0
             mlp_params_per_layer = 3 * h * i + mlp_bias
@@ -276,6 +301,21 @@ ARCHITECTURE_PROFILES = {
         lm_head_tied=False,
         has_pos_embeddings=True,  # Learned positional embeddings
     ),
+    "home_moe": ArchitectureProfile(
+        name="HomeModel MoE",
+        attn_proj_count=4,  # q, k, v, out
+        attn_has_bias=False,
+        mlp_type="moe_swiglu",
+        mlp_has_bias=False,
+        norm_type="rmsnorm",
+        norm_count_per_layer=2,  # attn_norm, ffn_norm
+        has_final_norm=True,
+        lm_head_tied=True,
+        has_pos_embeddings=False,  # RoPE
+        is_moe=True,
+        num_experts=8,
+        num_experts_per_tok=2,
+    ),
 }
 
 
@@ -288,15 +328,22 @@ def get_architecture_profile(
     Получает профиль архитектуры по типу модели.
     
     Args:
-        model_type: "home" | "hf" | "blueprint"
-        arch_preset: "llama" | "mistral" | "gpt2" | None (из UI)
+        model_type: "home" | "home_moe" | "gpt2" | "hf" | "blueprint"
+        arch_preset: "llama" | "mistral" | "gpt2" | "home_moe" | None (из UI)
         model_config: словарь config.json модели (для определения архитектуры HF моделей)
     
     Returns:
         ArchitectureProfile
     """
+    # Прямое соответствие model_type к профилю
     if model_type == "home":
         return ARCHITECTURE_PROFILES["home"]
+    
+    if model_type == "home_moe":
+        return ARCHITECTURE_PROFILES["home_moe"]
+    
+    if model_type == "gpt2":
+        return ARCHITECTURE_PROFILES["gpt2"]
     
     if model_type == "blueprint":
         # Для blueprint используем HomeModel как базовый (можно улучшить позже)

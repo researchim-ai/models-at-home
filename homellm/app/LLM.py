@@ -410,34 +410,44 @@ def estimate_parameters(
     num_layers: int,
     vocab_size: int = 50257,
     intermediate_size: int | None = None,
+    arch_type: str = "home",  # "home" | "gpt2" | "home_moe"
+    num_experts: int = 8,  # Для MoE
+    max_position_embeddings: int = 4096,  # Для GPT-2 (learned pos embeddings)
 ) -> int:
     """
-    Оценка количества параметров для нашей `HomeModel` (см. `homellm/models/home_model.py`).
-
-    ВАЖНО:
-    - У нас RoPE (позиционные эмбеддинги НЕ обучаемые) => `seq_len` на число параметров не влияет.
-    - lm_head weight tied к embed_tokens => не удваиваем vocab*hidden.
+    Оценка количества параметров для разных архитектур.
+    
+    Архитектуры:
+    - "home": HomeModel (LLaMA-style) с RMSNorm, RoPE, SwiGLU
+    - "gpt2": GPT-2 с LayerNorm, Learned Pos, GELU
+    - "home_moe": HomeModel с MoE (num_experts экспертов)
+    
+    Использует профили из homellm.models.memory_estimator для точного расчёта.
     """
+    from homellm.models.memory_estimator import ARCHITECTURE_PROFILES
+    
     h = int(hidden_size)
     l = int(num_layers)
     v = int(vocab_size)
     i = int(intermediate_size) if intermediate_size is not None else int(h * 4)
-
-    # Embedding
-    embed = v * h
-
-    # Per-layer:
-    # - Attention: q/k/v/out, bias=False => 4 * (H*H)
-    attn = 4 * h * h
-    # - SwiGLU MLP: w1(H->I), w2(I->H), w3(H->I), bias=False => 3 * (H*I)
-    mlp = 3 * h * i
-    # - RMSNorm weights: 2 * H
-    norms = 2 * h
-
-    # Final norm
-    final_norm = h
-
-    return int(embed + l * (attn + mlp + norms) + final_norm)
+    s = int(max_position_embeddings)
+    
+    # Получаем профиль архитектуры
+    profile_key = arch_type.lower()
+    if profile_key not in ARCHITECTURE_PROFILES:
+        profile_key = "home"  # fallback
+    
+    profile = ARCHITECTURE_PROFILES[profile_key]
+    
+    # Используем метод calculate_parameters из профиля
+    return profile.calculate_parameters(
+        vocab_size=v,
+        hidden_size=h,
+        num_layers=l,
+        intermediate_size=i,
+        max_position_embeddings=s,
+        num_experts=num_experts if profile.is_moe else None,
+    )
 
 
 def format_params(n: int) -> str:
@@ -2994,14 +3004,47 @@ def render_model_config():
         blueprints_dir.mkdir(exist_ok=True)
         blueprints = list(blueprints_dir.glob("*.json"))
             
-        arch_options = ["HomeModel (GPT-2 style)", "Llama (Custom)", "Mistral (Custom)", "Custom Blueprint (Visual Builder)"]
+        arch_options = [
+            "HomeModel (LLaMA-style)",  # RMSNorm, RoPE, SwiGLU
+            "GPT-2 (Classic)",          # LayerNorm, Learned Pos, GELU
+            "HomeModel MoE",            # MoE с SwiGLU экспертами
+            "Custom Blueprint (Visual Builder)"
+        ]
         
         model_type = st.sidebar.selectbox(
             "Архитектура модели",
             options=arch_options,
             index=0,
-            help="Выберите архитектуру. Custom Blueprint позволяет использовать модели из Visual Builder."
+            help="HomeModel (LLaMA-style): RMSNorm, RoPE, SwiGLU. GPT-2: LayerNorm, Learned Pos, GELU. MoE: Mixture of Experts."
         )
+        
+        # MoE параметры (показываем только при выборе MoE)
+        num_experts = 8
+        num_experts_per_tok = 2
+        expert_type = "swiglu"
+        
+        if model_type == "HomeModel MoE":
+            st.sidebar.markdown("**🔀 MoE параметры**")
+            num_experts = st.sidebar.slider(
+                "Num Experts",
+                min_value=2,
+                max_value=32,
+                value=8,
+                help="Количество экспертов в MoE слое"
+            )
+            num_experts_per_tok = st.sidebar.slider(
+                "Top-K (активных экспертов)",
+                min_value=1,
+                max_value=min(8, num_experts),
+                value=min(2, num_experts),
+                help="Сколько экспертов активируется для каждого токена"
+            )
+            expert_type = st.sidebar.selectbox(
+                "Expert Type",
+                ["swiglu", "mlp"],
+                index=0,
+                help="SwiGLU: больше параметров, лучше качество. MLP: меньше параметров."
+            )
 
     if not loaded_config and model_type == "Custom Blueprint (Visual Builder)":
         blueprints_dir = PROJECT_ROOT / "blueprints"
@@ -3082,7 +3125,7 @@ def render_model_config():
         st.sidebar.markdown("**⚙️ Контекст для обучения**")
         
         # Опции seq_len: стандартные + максимум модели
-        seq_len_opts = [512, 1024, 2048, 4096, 8192]
+        seq_len_opts = [512, 1024, 2048, 4096, 8192, 16384, 32768]
         if max_position_embeddings not in seq_len_opts:
             seq_len_opts.append(max_position_embeddings)
         seq_len_opts = sorted([s for s in seq_len_opts if s <= max_position_embeddings])
@@ -3108,18 +3151,18 @@ def render_model_config():
         if selected_stage == "sft":
             st.sidebar.caption("⚠️ Убедитесь, что параметры совпадают с базовой моделью!")
 
-        # Пресеты
+        # Пресеты (размеры для HomeModel с SwiGLU, vocab=50257)
         preset = st.sidebar.selectbox(
             "Пресет",
-            ["Tiny (25M)", "Small (80M)", "Medium (200M)", "Large (400M)", "Custom"],
+            ["Tiny (46M)", "Small (110M)", "Medium (232M)", "Large (589M)", "Custom"],
             index=0
         )
         
         presets = {
-            "Tiny (25M)": (512, 8, 8),
-            "Small (80M)": (768, 12, 12),
-            "Medium (200M)": (1024, 16, 16),
-            "Large (400M)": (1280, 20, 20),
+            "Tiny (46M)": (512, 8, 8),
+            "Small (110M)": (768, 12, 12),
+            "Medium (232M)": (1024, 16, 16),
+            "Large (589M)": (1280, 20, 20),
         }
         
         if preset != "Custom" and preset in presets:
@@ -3161,7 +3204,7 @@ def render_model_config():
             disabled=disabled_sliders
         )
         
-        seq_len_opts = [512, 1024, 2048, 4096, 6144, 8192]
+        seq_len_opts = [512, 1024, 2048, 4096, 8192, 16384, 32768]
         if default_seq not in seq_len_opts: seq_len_opts.append(default_seq)
         seq_len_opts = sorted(seq_len_opts)
         
@@ -3180,15 +3223,35 @@ def render_model_config():
         if valid_heads:
             st.sidebar.info(f"Рекомендуемые значения n_heads: {', '.join(valid_heads)}")
     
-    # Оценка параметров (HomeModel RoPE/SwiGLU)
+    # Оценка параметров для выбранной архитектуры
     # Используем loaded_config если есть, иначе дефолты
     vocab_size = int(loaded_config.get("vocab_size", 50257)) if loaded_config else 50257
     intermediate_size = int(loaded_config.get("intermediate_size") or (int(hidden_size) * 4)) if loaded_config else (int(hidden_size) * 4)
+    
+    # Определяем тип архитектуры для расчёта параметров
+    if loaded_config:
+        # Для загруженных моделей используем home профиль
+        arch_for_estimate = "home"
+        moe_experts = 8
+    else:
+        # Маппинг UI -> профиль
+        arch_mapping = {
+            "HomeModel (LLaMA-style)": "home",
+            "GPT-2 (Classic)": "gpt2",
+            "HomeModel MoE": "home_moe",
+            "Custom Blueprint (Visual Builder)": "home",
+        }
+        arch_for_estimate = arch_mapping.get(model_type, "home")
+        moe_experts = num_experts if model_type == "HomeModel MoE" else 8
+    
     est_params = estimate_parameters(
         hidden_size,
         num_layers,
         vocab_size=vocab_size,
         intermediate_size=intermediate_size,
+        arch_type=arch_for_estimate,
+        num_experts=moe_experts,
+        max_position_embeddings=seq_len if not loaded_config else int(loaded_config.get("max_position_embeddings", 4096)),
     )
     st.sidebar.metric("Параметры (≈)", format_params(est_params))
     
@@ -3372,10 +3435,18 @@ def render_model_config():
         config["blueprint_path"] = blueprint_path
         if tokenizer_path:
              config["tokenizer_path"] = tokenizer_path
+    elif model_type == "GPT-2 (Classic)":
+        config["model_type"] = "gpt2"
+        config["arch_preset"] = "gpt2"
+    elif model_type == "HomeModel MoE":
+        config["model_type"] = "home_moe"
+        config["arch_preset"] = "home_moe"
+        config["num_experts"] = num_experts
+        config["num_experts_per_tok"] = num_experts_per_tok
+        config["expert_type"] = expert_type
     else:
+        # HomeModel (LLaMA-style) или другие
         config["model_type"] = "home"
-        if "Llama" in model_type: config["arch_preset"] = "llama"
-        if "Mistral" in model_type: config["arch_preset"] = "mistral"
         
     return config
 
@@ -6666,12 +6737,15 @@ def main():
                 backend_col1, backend_col2 = st.columns(2)
                 
                 with backend_col1:
-                    backend_options = ["Transformers"]
+                    # vLLM первым если доступен (быстрее)
+                    backend_options = []
                     if vllm_available:
                         backend_options.append("vLLM (быстрее)")
+                    backend_options.append("Transformers")
                     
                     if "chat_inference_backend" not in st.session_state:
-                        st.session_state.chat_inference_backend = "Transformers"
+                        # По умолчанию vLLM если доступен
+                        st.session_state.chat_inference_backend = "vLLM (быстрее)" if vllm_available else "Transformers"
                     
                     inference_backend = st.selectbox(
                         "Inference Backend",

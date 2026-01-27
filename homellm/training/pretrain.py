@@ -40,8 +40,10 @@ from transformers import (
     DataCollatorForLanguageModeling,
 )
 
-# Локальная модель
+# Локальные модели
 from homellm.models.home_model import HomeConfig, HomeForCausalLM
+from homellm.models.gpt2_model import GPT2HomeConfig, GPT2HomeForCausalLM
+from homellm.models.home_model_moe import HomeMoEConfig, HomeMoEForCausalLM
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -376,7 +378,13 @@ def parse_args():
     parser.add_argument("--n_heads", type=int, default=8, help="Количество голов внимания")
     parser.add_argument("--seq_len", type=int, default=512, help="Максимальная длина входа")
 
-    parser.add_argument("--arch", type=str, default="gpt2", choices=["gpt2", "home"], help="Какая архитектура используется")
+    parser.add_argument("--arch", type=str, default="home", choices=["gpt2", "gpt2_home", "home", "home_moe"], 
+                        help="Архитектура: home (LLaMA-style), gpt2_home (GPT-2 Classic), home_moe (MoE), gpt2 (HF GPT-2)")
+    
+    # MoE параметры
+    parser.add_argument("--num_experts", type=int, default=8, help="Количество экспертов для MoE архитектуры")
+    parser.add_argument("--num_experts_per_tok", type=int, default=2, help="Top-K: сколько экспертов активируется на токен")
+    parser.add_argument("--expert_type", type=str, default="swiglu", choices=["swiglu", "mlp"], help="Тип экспертов: swiglu или mlp")
 
     # Training params
     parser.add_argument("--batch_size", type=int, default=32)
@@ -474,7 +482,10 @@ def main():
     )
 
     # Выбор архитектуры
-    if getattr(args, "arch", "gpt2") == "home":
+    arch = getattr(args, "arch", "home")
+    
+    if arch == "home":
+        # HomeModel (LLaMA-style): RMSNorm, RoPE, SwiGLU
         config = HomeConfig(
             vocab_size=len(tokenizer),
             hidden_size=args.hidden_size,
@@ -484,7 +495,41 @@ def main():
             use_sdpa=use_flash_attention,
         )
         model = HomeForCausalLM(config)
+        if is_main:
+            logger.info("🏠 Архитектура: HomeModel (LLaMA-style) — RMSNorm, RoPE, SwiGLU")
+    
+    elif arch == "gpt2_home":
+        # GPT-2 Classic: LayerNorm, Learned Pos, GELU
+        config = GPT2HomeConfig(
+            vocab_size=len(tokenizer),
+            hidden_size=args.hidden_size,
+            num_hidden_layers=args.num_layers,
+            num_attention_heads=args.n_heads,
+            max_position_embeddings=args.seq_len,
+        )
+        model = GPT2HomeForCausalLM(config)
+        if is_main:
+            logger.info("🤖 Архитектура: GPT-2 Classic — LayerNorm, Learned Pos, GELU")
+    
+    elif arch == "home_moe":
+        # HomeModel MoE: RMSNorm, RoPE, SwiGLU experts
+        config = HomeMoEConfig(
+            vocab_size=len(tokenizer),
+            hidden_size=args.hidden_size,
+            num_hidden_layers=args.num_layers,
+            num_attention_heads=args.n_heads,
+            max_position_embeddings=args.seq_len,
+            use_sdpa=use_flash_attention,
+            num_experts=args.num_experts,
+            num_experts_per_tok=args.num_experts_per_tok,
+            expert_type=args.expert_type,
+        )
+        model = HomeMoEForCausalLM(config)
+        if is_main:
+            logger.info(f"🔀 Архитектура: HomeModel MoE — {args.num_experts} экспертов, Top-{args.num_experts_per_tok}")
+    
     else:
+        # Fallback: HuggingFace GPT-2
         config = GPT2Config(
             vocab_size=len(tokenizer),
             n_embd=args.hidden_size,
@@ -493,6 +538,8 @@ def main():
             n_positions=args.seq_len,
         )
         model = GPT2LMHeadModel(config)
+        if is_main:
+            logger.info("🤗 Архитектура: HuggingFace GPT-2 (стандартная)")
 
     if args.grad_checkpoint:
         model.gradient_checkpointing_enable()
