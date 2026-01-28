@@ -101,6 +101,15 @@ def run_unsloth_sft(
         trust_remote_code=True,
     )
     
+    # Проверяем max_position_embeddings модели и ограничиваем seq_len
+    model_max_pos = getattr(model.config, "max_position_embeddings", max_seq_length)
+    if max_seq_length > model_max_pos:
+        logger.warning(
+            f"⚠️ seq_len ({max_seq_length}) > model max_position_embeddings ({model_max_pos}). "
+            f"Truncating to {model_max_pos} to avoid index errors."
+        )
+        max_seq_length = model_max_pos
+    
     # === Добавляем LoRA адаптеры ===
     if use_lora:
         logger.info(f"🦥 Unsloth: Adding LoRA adapters (r={lora_r}, alpha={lora_alpha})")
@@ -204,19 +213,16 @@ def run_unsloth_sft(
                 except Exception as e:
                     logger.warning(f"apply_chat_template failed: {e}")
             
-            # Fallback к простому форматированию через теги
-            user_tag = sft_template.get("user_tag", "### User:")
-            bot_tag = sft_template.get("bot_tag", "### Assistant:")
-            sep = sft_template.get("separator", "\n\n")
+            # Fallback к Qwen-style форматированию
+            im_start = sft_template.get("im_start", "<|im_start|>")
+            im_end = sft_template.get("im_end", "<|im_end|>")
+            sep = sft_template.get("separator", "\n")
             
             text = ""
             for msg in std_messages:
-                if msg["role"] == "system":
-                    text = f"{msg['content']}{sep}"
-                elif msg["role"] == "user":
-                    text += f"{user_tag}\n{msg['content']}{sep}"
-                elif msg["role"] == "assistant":
-                    text += f"{bot_tag}\n{msg['content']}{sep}"
+                role = msg["role"]
+                content = msg["content"]
+                text += f"{im_start}{role}{sep}{content}{im_end}{sep}"
             
             return {"text": text}
         else:
@@ -253,17 +259,18 @@ def run_unsloth_sft(
                 except Exception:
                     pass  # Fallback below
             
-            # Fallback к тегам
-            user_tag = sft_template.get("user_tag", "### User:")
-            bot_tag = sft_template.get("bot_tag", "### Assistant:")
-            separator = sft_template.get("separator", "\n\n")
+            # Fallback к Qwen-style тегам
+            im_start = sft_template.get("im_start", "<|im_start|>")
+            im_end = sft_template.get("im_end", "<|im_end|>")
+            sep = sft_template.get("separator", "\n")
             
-            text = f"{system}{separator}"
-            if inp:
-                text += f"{user_tag}{separator}{instruction}\n\nInput: {inp}{separator}"
-            else:
-                text += f"{user_tag}{separator}{instruction}{separator}"
-            text += f"{bot_tag}{separator}{output}"
+            # System
+            text = f"{im_start}system{sep}{system}{im_end}{sep}"
+            # User
+            user_content = f"{instruction}\n\nInput: {inp}" if inp else instruction
+            text += f"{im_start}user{sep}{user_content}{im_end}{sep}"
+            # Assistant
+            text += f"{im_start}assistant{sep}{output}{im_end}"
             
             return {"text": text}
     

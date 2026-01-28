@@ -53,7 +53,7 @@ def detect_model_type(model_path: Path) -> str:
     Определяет тип модели по config.json.
     
     Returns:
-        "home" | "hf" | "unknown"
+        "home" | "home_moe" | "gpt2_home" | "hf" | "unknown"
     """
     config_path = model_path / "config.json"
     if not config_path.exists():
@@ -66,8 +66,15 @@ def detect_model_type(model_path: Path) -> str:
         model_type = config.get("model_type", "")
         architectures = config.get("architectures", [])
         
+        # Наши кастомные архитектуры
         if model_type == "homellm" or "HomeForCausalLM" in architectures:
             return "home"
+        
+        if model_type == "homellm_moe" or "HomeMoEForCausalLM" in architectures:
+            return "home_moe"
+        
+        if model_type == "gpt2_home" or "GPT2HomeForCausalLM" in architectures:
+            return "gpt2_home"
         
         # Любая другая модель с model_type - это HF модель
         if model_type:
@@ -78,9 +85,115 @@ def detect_model_type(model_path: Path) -> str:
             return "hf"
         
         return "unknown"
+
+
     except Exception as e:
         logger.warning(f"Failed to detect model type: {e}")
         return "unknown"
+
+
+def is_custom_architecture(model_type: str) -> bool:
+    """Проверяет, является ли архитектура кастомной (наша, не стандартная HF)."""
+    return model_type in ("home", "home_moe", "gpt2_home")
+
+
+def prepare_model_for_vllm(model_path: Path) -> bool:
+    """
+    Подготавливает кастомную модель для загрузки в vLLM.
+    
+    Добавляет auto_map в config.json и копирует файлы модели в папку чекпоинта.
+    Это позволяет vLLM загрузить модель через trust_remote_code=True.
+    
+    Args:
+        model_path: Путь к папке с моделью
+        
+    Returns:
+        True если модель была подготовлена, False если не требуется
+    """
+    import shutil
+    
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        logger.warning(f"config.json не найден в {model_path}")
+        return False
+    
+    # Читаем config
+    with open(config_path) as f:
+        config = json.load(f)
+    
+    model_type = config.get("model_type", "")
+    
+    # Определяем какие файлы, auto_map и architectures нужны
+    extra_files = []
+    
+    if model_type == "homellm":
+        source_file = "home_model.py"
+        architectures = ["HomeForCausalLM"]
+        auto_map = {
+            "AutoConfig": "home_model.HomeConfig",
+            "AutoModel": "home_model.HomeModel",  # Base model for vLLM
+            "AutoModelForCausalLM": "home_model.HomeForCausalLM"
+        }
+    elif model_type == "homellm_moe":
+        source_file = "home_model_moe.py"
+        architectures = ["HomeMoEForCausalLM"]
+        auto_map = {
+            "AutoConfig": "home_model_moe.HomeMoEConfig",
+            "AutoModel": "home_model_moe.HomeMoEModel",  # Base model for vLLM
+            "AutoModelForCausalLM": "home_model_moe.HomeMoEForCausalLM"
+        }
+        # Для MoE нужен и базовый home_model.py (импортируется)
+        extra_files = ["home_model.py"]
+    elif model_type == "gpt2_home":
+        source_file = "gpt2_model.py"
+        architectures = ["GPT2HomeForCausalLM"]
+        auto_map = {
+            "AutoConfig": "gpt2_model.GPT2HomeConfig",
+            "AutoModel": "gpt2_model.GPT2HomeModel",  # Base model for vLLM
+            "AutoModelForCausalLM": "gpt2_model.GPT2HomeForCausalLM"
+        }
+    else:
+        # Не наша модель, ничего не делаем
+        return False
+    
+    # Проверяем, нужно ли обновлять
+    if config.get("auto_map") == auto_map and config.get("architectures") == architectures:
+        target_file = model_path / source_file
+        if target_file.exists():
+            logger.debug(f"Модель {model_path} уже подготовлена для vLLM")
+            return True
+    
+    # Добавляем architectures и auto_map в config
+    config["architectures"] = architectures
+    config["auto_map"] = auto_map
+    # vLLM expects tie_word_embeddings for proper lm_head handling
+    config["tie_word_embeddings"] = True
+    
+    # Сохраняем обновленный config
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    
+    # Копируем файлы модели
+    models_dir = Path(__file__).parent
+    
+    # Основной файл
+    src = models_dir / source_file
+    dst = model_path / source_file
+    if src.exists() and not dst.exists():
+        shutil.copy2(src, dst)
+        logger.info(f"Скопирован {source_file} в {model_path}")
+    
+    # Дополнительные файлы для MoE
+    if model_type == "homellm_moe":
+        for extra_file in extra_files:
+            src = models_dir / extra_file
+            dst = model_path / extra_file
+            if src.exists() and not dst.exists():
+                shutil.copy2(src, dst)
+                logger.info(f"Скопирован {extra_file} в {model_path}")
+    
+    logger.info(f"✅ Модель {model_path} подготовлена для vLLM (auto_map добавлен)")
+    return True
 
 
 def resolve_adapter(config: Dict[str, Any]) -> "ModelAdapter":

@@ -461,6 +461,66 @@ def format_params(n: int) -> str:
     return str(n)
 
 
+def get_preset_configs():
+    """Базовые конфигурации пресетов (hidden, layers, heads)."""
+    return {
+        "Tiny": (512, 8, 8),
+        "Small": (768, 12, 12),
+        "Medium": (1024, 16, 16),
+        "Large": (1280, 20, 20),
+    }
+
+
+def generate_preset_labels(
+    arch_type: str,
+    num_experts: int = 8,
+    num_experts_per_tok: int = 2,
+    vocab_size: int = 50257,
+) -> dict:
+    """
+    Генерирует названия пресетов с реальными размерами для выбранной архитектуры.
+    
+    Returns:
+        dict: {"Label": (hidden, layers, heads), ...}
+    """
+    base_configs = get_preset_configs()
+    result = {}
+    
+    for name, (h, l, n) in base_configs.items():
+        intermediate = h * 4
+        
+        params = estimate_parameters(
+            hidden_size=h,
+            num_layers=l,
+            vocab_size=vocab_size,
+            intermediate_size=intermediate,
+            arch_type=arch_type,
+            num_experts=num_experts,
+        )
+        
+        if arch_type == "home_moe":
+            # Для MoE вычисляем активные параметры (сколько работает на токен)
+            # Active = Total - (неактивные эксперты)
+            # Неактивные = (num_experts - num_experts_per_tok) / num_experts * MLP_params
+            
+            # Считаем размер одного эксперта
+            expert_params = 3 * h * intermediate  # SwiGLU: 3 * H * I
+            total_expert_params = l * num_experts * expert_params
+            active_expert_params = l * num_experts_per_tok * expert_params
+            
+            # Active params = Total - неактивные эксперты
+            non_expert_params = params - total_expert_params - l * h * num_experts  # убираем gate тоже? нет, gate всегда активен
+            active_params = non_expert_params + active_expert_params + l * h * num_experts  # gate активен
+            
+            label = f"{name} ({format_params(params)} total, {format_params(active_params)} active)"
+        else:
+            label = f"{name} ({format_params(params)})"
+        
+        result[label] = (h, l, n)
+    
+    return result
+
+
 def format_time(seconds: float) -> str:
     """Форматирование времени."""
     if seconds < 60:
@@ -1303,18 +1363,29 @@ def render_sft_main_config(data_path: str):
         st.markdown("---")
         with st.expander("🏷️ Теги и системный промпт", expanded=False):
             default_system = st.text_input("System prompt (по умолч.):", "You are a helpful assistant.", key="sft_def_sys")
-            tc1, tc2 = st.columns(2)
-            user_tag = tc1.text_input("User tag:", "### User:", key="sft_tag_user")
-            assistant_tag = tc2.text_input("Assistant tag:", "### Assistant:", key="sft_tag_asst")
+            
+            # Qwen-style теги по умолчанию
+            tc1, tc2, tc3 = st.columns(3)
+            im_start = tc1.text_input("Start tag:", "<|im_start|>", key="sft_im_start")
+            im_end = tc2.text_input("End tag:", "<|im_end|>", key="sft_im_end")
+            separator = tc3.text_input("Separator:", "\n", key="sft_separator")
+            
+            st.caption("💡 Qwen-style формат: `<|im_start|>role\\ncontent<|im_end|>`")
         
         if 'default_system' not in dir():
-            default_system, user_tag, assistant_tag = "You are a helpful assistant.", "### User:", "### Assistant:"
+            default_system = "You are a helpful assistant."
+        if 'im_start' not in dir():
+            im_start, im_end, separator = "<|im_start|>", "<|im_end|>", "\n"
         
         sft_template = {
             "system": default_system,
-            "separator": "\n\n",
-            "user_tag": user_tag,
-            "bot_tag": assistant_tag
+            "separator": separator,
+            "im_start": im_start,
+            "im_end": im_end,
+            # Legacy fallback
+            "user_tag": f"{im_start}user{separator}",
+            "bot_tag": f"{im_start}assistant{separator}",
+            "end_tag": im_end,
         }
         
         # ===== ПРЕВЬЮ =====
@@ -1374,9 +1445,8 @@ def render_sft_main_config(data_path: str):
                         st.warning(f"Ошибка apply_chat_template: {e}. Используем fallback.")
                         use_model_chat_template = False
                 
-                # Fallback: простой формат с тегами
+                # Fallback: Qwen-style формат с тегами
                 if not use_model_chat_template or not preview:
-                    sep = "\n\n"
                     sys_text = default_system
                     preview = ""
                     
@@ -1387,11 +1457,14 @@ def render_sft_main_config(data_path: str):
                         if role == sft_columns["role_system"]:
                             sys_text = content
                         elif role == sft_columns["role_user"]:
-                            preview += f"{user_tag}\n{content[:200]}{'...' if len(content) > 200 else ''}{sep}"
+                            content_preview = content[:200] + ('...' if len(content) > 200 else '')
+                            preview += f"{im_start}user{separator}{content_preview}{im_end}{separator}"
                         elif role == sft_columns["role_assistant"]:
-                            preview += f"{assistant_tag}\n{content[:200]}{'...' if len(content) > 200 else ''}{sep}"
+                            content_preview = content[:200] + ('...' if len(content) > 200 else '')
+                            preview += f"{im_start}assistant{separator}{content_preview}{im_end}{separator}"
                     
-                    preview = f"{sys_text}{sep}" + preview + "<|endoftext|>"
+                    # System в начале
+                    preview = f"{im_start}system{separator}{sys_text}{im_end}{separator}" + preview
                     st.caption("ℹ️ Превью сформировано через **теги** (chat_template не используется)")
             else:
                 # Instruct формат
@@ -1428,10 +1501,13 @@ def render_sft_main_config(data_path: str):
                         st.warning(f"Ошибка apply_chat_template: {e}. Используем fallback.")
                         use_model_chat_template = False
                 
-                # Fallback
+                # Fallback: Qwen-style формат
                 if not use_model_chat_template or not preview:
-                    sep = "\n\n"
-                    preview = f"{sys_val}{sep}{user_tag}\n{user_val}{sep}{assistant_tag}\n{asst_val}<|endoftext|>"
+                    preview = (
+                        f"{im_start}system{separator}{sys_val}{im_end}{separator}"
+                        f"{im_start}user{separator}{user_val}{im_end}{separator}"
+                        f"{im_start}assistant{separator}{asst_val}{im_end}"
+                    )
                     st.caption("ℹ️ Превью сформировано через **теги** (chat_template не используется)")
             
             with st.container(height=400):
@@ -3151,19 +3227,31 @@ def render_model_config():
         if selected_stage == "sft":
             st.sidebar.caption("⚠️ Убедитесь, что параметры совпадают с базовой моделью!")
 
-        # Пресеты (размеры для HomeModel с SwiGLU, vocab=50257)
-        preset = st.sidebar.selectbox(
-            "Пресет",
-            ["Tiny (46M)", "Small (110M)", "Medium (232M)", "Large (589M)", "Custom"],
-            index=0
+        # Определяем тип архитектуры для генерации пресетов
+        arch_for_presets = {
+            "HomeModel (LLaMA-style)": "home",
+            "GPT-2 (Classic)": "gpt2",
+            "HomeModel MoE": "home_moe",
+            "Custom Blueprint (Visual Builder)": "home",
+        }.get(model_type, "home")
+        
+        # Генерируем пресеты с реальными размерами для выбранной архитектуры
+        presets = generate_preset_labels(
+            arch_type=arch_for_presets,
+            num_experts=num_experts if model_type == "HomeModel MoE" else 8,
+            num_experts_per_tok=num_experts_per_tok if model_type == "HomeModel MoE" else 2,
         )
         
-        presets = {
-            "Tiny (46M)": (512, 8, 8),
-            "Small (110M)": (768, 12, 12),
-            "Medium (232M)": (1024, 16, 16),
-            "Large (589M)": (1280, 20, 20),
-        }
+        preset_options = list(presets.keys()) + ["Custom"]
+        preset = st.sidebar.selectbox(
+            "Пресет",
+            preset_options,
+            index=0,
+            help="Размеры рассчитаны для выбранной архитектуры" + (
+                ". Для MoE: total = все параметры, active = работающие на токен" 
+                if model_type == "HomeModel MoE" else ""
+            )
+        )
         
         if preset != "Custom" and preset in presets:
             default_h, default_l, default_n = presets[preset]
@@ -3253,7 +3341,24 @@ def render_model_config():
         num_experts=moe_experts,
         max_position_embeddings=seq_len if not loaded_config else int(loaded_config.get("max_position_embeddings", 4096)),
     )
-    st.sidebar.metric("Параметры (≈)", format_params(est_params))
+    
+    # Для MoE показываем два значения: Total и Active
+    if not loaded_config and model_type == "HomeModel MoE":
+        # Вычисляем активные параметры
+        expert_params = 3 * hidden_size * intermediate_size  # SwiGLU эксперт
+        total_expert_params = num_layers * num_experts * expert_params
+        active_expert_params = num_layers * num_experts_per_tok * expert_params
+        gate_params = num_layers * hidden_size * num_experts
+        
+        non_expert_params = est_params - total_expert_params - gate_params
+        active_params = non_expert_params + active_expert_params + gate_params
+        
+        col1, col2 = st.sidebar.columns(2)
+        col1.metric("Total (≈)", format_params(est_params), help="Общее количество параметров модели")
+        col2.metric("Active (≈)", format_params(active_params), help=f"Параметры, работающие на токен (Top-{num_experts_per_tok})")
+        st.sidebar.caption(f"🔀 {num_experts} экспертов × {format_params(expert_params)} = {format_params(total_expert_params)} в MLP")
+    else:
+        st.sidebar.metric("Параметры (≈)", format_params(est_params))
     
     # Model ID для pretrain from scratch (опционально, для HF моделей)
     model_id = None
@@ -6351,18 +6456,38 @@ def main():
                 st.session_state.sft_user_chat_template = user_chat_template
                 
                 # Кнопки управления
-                col_btn1, col_btn2, col_btn3 = st.columns(3)
+                col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
                 with col_btn1:
-                    if model_chat_template and st.button("↩️ Вернуть из модели", key="sft_restore_template"):
-                        st.session_state.sft_user_chat_template = model_chat_template
+                    if st.button("✨ Qwen-style", key="sft_qwen_template", help="Генерировать Qwen-style chat template"):
+                        # Qwen-style chat template (упрощённый, без tools)
+                        qwen_template = """{%- if messages[0]['role'] == 'system' -%}
+{{ '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}
+{%- else -%}
+{{ '<|im_start|>system\\nYou are a helpful assistant.<|im_end|>\\n' }}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message.role == 'user' or (message.role == 'system' and not loop.first) -%}
+{{ '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}
+{%- elif message.role == 'assistant' -%}
+{{ '<|im_start|>assistant\\n' + message.content + '<|im_end|>\\n' }}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{ '<|im_start|>assistant\\n' }}
+{%- endif -%}"""
+                        st.session_state.sft_user_chat_template = qwen_template
                         st.rerun()
                 with col_btn2:
+                    if model_chat_template and st.button("↩️ Из модели", key="sft_restore_template"):
+                        st.session_state.sft_user_chat_template = model_chat_template
+                        st.rerun()
+                with col_btn3:
                     if st.button("🗑️ Очистить", key="sft_clear_template"):
                         st.session_state.sft_user_chat_template = ""
                         st.rerun()
-                with col_btn3:
+                with col_btn4:
                     if user_chat_template.strip():
-                        st.caption(f"Длина: {len(user_chat_template)} символов")
+                        st.caption(f"📏 {len(user_chat_template)} симв.")
                 
                 # Добавляем chat_template в конфиг
                 full_config["chat_template"] = user_chat_template.strip() if user_chat_template.strip() else None
@@ -6723,11 +6848,12 @@ def main():
                         step=16,
                         help=f"Максимум новых токенов. Контекст модели: {max_context:,}"
                     )
-                    temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.05)
+                    temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.05, help="0 = greedy decoding")
                 
                 with gen_col2:
-                    top_p = st.slider("Top-p (nucleus)", 0.1, 1.0, 0.9, 0.05)
-                    top_k = st.slider("Top-k", 0, 100, 50, help="0 = отключено")
+                    # По умолчанию top_p=1.0 и top_k=0 (отключены) — только temperature влияет
+                    top_p = st.slider("Top-p (nucleus)", 0.1, 1.0, 1.0, 0.05, help="1.0 = отключено")
+                    top_k = st.slider("Top-k", 0, 100, 0, help="0 = отключено")
 
                 # Inference Backend
                 from homellm.app.vllm_chat import is_vllm_available
@@ -6848,6 +6974,12 @@ def main():
                             
                             # === vLLM Backend ===
                             if use_vllm:
+                                # Для кастомных моделей: подготавливаем для vLLM (auto_map + файлы)
+                                from homellm.models.adapters import is_custom_architecture, prepare_model_for_vllm
+                                if is_custom_architecture(model_type):
+                                    st.info("🔧 Подготовка кастомной модели для vLLM...")
+                                    prepare_model_for_vllm(model_path)
+                                
                                 # Для LoRA адаптеров с vLLM: загружаем базовую модель + hot-swap LoRA
                                 if is_lora_adapter:
                                     with open(adapter_config_path) as f:
@@ -7220,8 +7352,8 @@ def main():
                                         prompt=prompt_text,
                                         max_tokens=max_tokens,
                                         temperature=temperature,
-                                        top_p=top_p,
-                                        top_k=top_k if top_k > 0 else -1,
+                                        top_p=top_p if top_p < 1.0 else None,  # 1.0 = отключено
+                                        top_k=top_k if top_k > 0 else None,    # 0 = отключено
                                     )
                                     
                                     st.write(response)

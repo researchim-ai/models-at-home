@@ -274,8 +274,8 @@ class TransformersChatBackend:
         prompt: str,
         max_tokens: int = 256,
         temperature: float = 0.7,
-        top_p: float = 0.9,
-        top_k: int = 50,
+        top_p: Optional[float] = None,  # None = не использовать
+        top_k: Optional[int] = None,    # None = не использовать
         stop: Optional[List[str]] = None,
         stream: bool = False,
     ) -> str:
@@ -283,16 +283,38 @@ class TransformersChatBackend:
         import torch
         
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        prompt_len = inputs["input_ids"].shape[1]
+        
+        # Ограничиваем max_tokens чтобы не превысить max_position_embeddings
+        max_pos = getattr(self.model.config, "max_position_embeddings", 2048)
+        available_tokens = max(1, max_pos - prompt_len)
+        if max_tokens > available_tokens:
+            logger.warning(
+                f"⚠️ Prompt ({prompt_len} tokens) + max_tokens ({max_tokens}) > "
+                f"max_position_embeddings ({max_pos}). Truncating to {available_tokens}."
+            )
+            max_tokens = available_tokens
+        
+        # Базовые параметры генерации
+        gen_kwargs = {
+            "max_new_tokens": max_tokens,
+            "do_sample": temperature > 0,
+            "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+        }
+        
+        # Temperature (только если do_sample=True)
+        if temperature > 0:
+            gen_kwargs["temperature"] = temperature
+            # Top-p и Top-k только если явно указаны
+            if top_p is not None and top_p < 1.0:
+                gen_kwargs["top_p"] = top_p
+            if top_k is not None and top_k > 0:
+                gen_kwargs["top_k"] = top_k
         
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k if top_k > 0 else None,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                **gen_kwargs,
             )
         
         # Декодируем только новые токены

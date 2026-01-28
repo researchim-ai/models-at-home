@@ -267,13 +267,23 @@ class HomeMoEBlock(nn.Module):
 # -----------------------------------------------------------------------------
 
 
-class HomeMoEModel(nn.Module):
+class HomeMoEModel(PreTrainedModel):
     """
     HomeModel backbone с MoE.
     """
+    config_class = HomeMoEConfig
+    base_model_prefix = "model"
+    
+    # vLLM compatibility attributes
+    tp_plan = {}  # Tensor parallelism plan (empty for single GPU)
+    _supports_attention_backend = True
+    _supports_cache_class = True
+    _supports_static_cache = True
+    _supports_sdpa = True
+    _supports_flash_attn_2 = True
+    
     def __init__(self, config: HomeMoEConfig):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([HomeMoEBlock(config) for _ in range(config.num_hidden_layers)])
         use_liger = getattr(config, 'use_liger', True)
@@ -298,25 +308,43 @@ class HomeMoEModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
+        # vLLM compatibility arguments
+        inputs_embeds: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        attention_instances: Optional[dict] = None,
+        return_dict: bool = True,
+        **kwargs,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]], float]:
+        # Use inputs_embeds if provided, otherwise use input_ids
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+            seq_len = inputs_embeds.shape[1]
+            device = inputs_embeds.device
+        else:
+            hidden_states = self.embed_tokens(input_ids)
+            seq_len = input_ids.shape[1]
+            device = input_ids.device
+        
         if position_ids is None:
             past_len = 0
             if past_key_values is not None and len(past_key_values) > 0 and past_key_values[0] is not None:
                 pk, _ = past_key_values[0]
                 past_len = int(pk.size(2))
             position_ids = torch.arange(
-                past_len, past_len + input_ids.shape[1],
-                device=input_ids.device
+                past_len, past_len + seq_len,
+                device=device
             ).unsqueeze(0)
 
-        hidden_states = self.embed_tokens(input_ids)
-        
         presents = [] if use_cache else None
-        cos_sin = (self.rope_cos, self.rope_sin)
+        # Ensure RoPE buffers are on the same device as hidden_states
+        cos_sin = (
+            self.rope_cos.to(hidden_states.device),
+            self.rope_sin.to(hidden_states.device),
+        )
         
         # Accumulate aux loss from all MoE layers
         total_aux_loss = 0.0
@@ -366,46 +394,52 @@ class HomeMoEForCausalLM(PreTrainedModel, GenerationMixin):
     Aux loss добавляется к основному loss с коэффициентом aux_loss_coef.
     """
     config_class = HomeMoEConfig
-    base_model_prefix = "home_moe_model"
+    base_model_prefix = "model"
     _tied_weights_keys = ["lm_head.weight"]
     _supports_gradient_checkpointing = True
+    # Атрибуты для совместимости с vLLM TransformersForCausalLM
+    _supports_cache_class = True
+    _supports_static_cache = True
+    _supports_sdpa = True
+    _supports_flash_attn_2 = True
+    _supports_attention_backend = True
 
     def __init__(self, config: HomeMoEConfig):
         super().__init__(config)
-        self.home_moe_model = HomeMoEModel(config)
+        self.model = HomeMoEModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Weight tying
-        self.lm_head.weight = self.home_moe_model.embed_tokens.weight
+        self.lm_head.weight = self.model.embed_tokens.weight
 
         self.post_init()
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Включает gradient checkpointing."""
-        self.home_moe_model.gradient_checkpointing = True
+        self.model.gradient_checkpointing = True
         if gradient_checkpointing_kwargs is None:
             gradient_checkpointing_kwargs = {"use_reentrant": False}
         
         def ckpt_func(fn, *args):
             return torch.utils.checkpoint.checkpoint(fn, *args, **gradient_checkpointing_kwargs)
         
-        self.home_moe_model._gradient_checkpointing_func = ckpt_func
+        self.model._gradient_checkpointing_func = ckpt_func
 
     def gradient_checkpointing_disable(self):
         """Выключает gradient checkpointing."""
-        self.home_moe_model.gradient_checkpointing = False
-        if hasattr(self.home_moe_model, '_gradient_checkpointing_func'):
-            delattr(self.home_moe_model, '_gradient_checkpointing_func')
+        self.model.gradient_checkpointing = False
+        if hasattr(self.model, '_gradient_checkpointing_func'):
+            delattr(self.model, '_gradient_checkpointing_func')
 
     def tie_weights(self):
         """Привязать веса lm_head к embed_tokens."""
-        self.lm_head.weight = self.home_moe_model.embed_tokens.weight
+        self.lm_head.weight = self.model.embed_tokens.weight
 
     def get_input_embeddings(self):
-        return self.home_moe_model.embed_tokens
+        return self.model.embed_tokens
 
     def set_input_embeddings(self, value):
-        self.home_moe_model.embed_tokens = value
+        self.model.embed_tokens = value
 
     def forward(
         self,
@@ -425,7 +459,7 @@ class HomeMoEForCausalLM(PreTrainedModel, GenerationMixin):
             elif isinstance(past_key_values, (list, tuple)):
                 legacy_past = past_key_values
         
-        hidden_states, presents, aux_loss = self.home_moe_model(
+        hidden_states, presents, aux_loss = self.model(
             input_ids,
             past_key_values=legacy_past,
             use_cache=use_cache,

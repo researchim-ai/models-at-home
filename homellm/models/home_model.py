@@ -210,19 +210,28 @@ class Attention(nn.Module):
         q, k = apply_rope(q, k, cos, sin, position_ids)
 
         # Append past
+        has_past_cache = False
         if past_key_value is not None:
             pk, pv = past_key_value
-            k = torch.cat([pk, k], dim=2)
-            v = torch.cat([pv, v], dim=2)
+            if pk is not None and pv is not None:
+                # Приводим к одному dtype перед конкатенацией
+                k = torch.cat([pk.to(k.dtype), k], dim=2)
+                v = torch.cat([pv.to(v.dtype), v], dim=2)
+                has_past_cache = True
         present = (k, v) if use_cache else None
 
         kv_len = k.size(2)  # Полная длина KV (с учётом past_key_value)
+        
+        # Приводим q, k, v к одному dtype (RoPE может вернуть float32)
+        target_dtype = v.dtype
+        q = q.to(target_dtype)
+        k = k.to(target_dtype)
         
         if self.flash:
             # PyTorch SDPA сам выберет лучший backend (flash/mem_efficient/math) при fp16/bf16.
             # Важно: для генерации с KV-кэшем обычно seq_len=1, и мы можем безопасно считать attention без causal-маски:
             # в k/v уже только "прошлое", будущих токенов там нет.
-            if past_key_value is None:
+            if not has_past_cache:
                 output = F.scaled_dot_product_attention(
                     q, k, v,
                     dropout_p=self.dropout.p if self.training else 0.0,
@@ -322,10 +331,20 @@ class HomeBlock(nn.Module):
 # -----------------------------------------------------------------------------
 
 
-class HomeModel(nn.Module):
+class HomeModel(PreTrainedModel):
+    config_class = HomeConfig
+    base_model_prefix = "model"
+    _supports_attention_backend = True
+    _supports_cache_class = True
+    _supports_static_cache = True
+    _supports_sdpa = True
+    _supports_flash_attn_2 = True
+    
+    # Tensor parallelism plan for vLLM (empty for single GPU)
+    tp_plan = {}
+    
     def __init__(self, config: HomeConfig):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([HomeBlock(config) for _ in range(config.num_hidden_layers)])
         use_liger = getattr(config, 'use_liger', True)
@@ -353,26 +372,47 @@ class HomeModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
+        # vLLM compatibility arguments
+        inputs_embeds: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        attention_instances: Optional[dict] = None,
+        return_dict: bool = True,
+        **kwargs,  # Catch any other arguments
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        # Use inputs_embeds if provided, otherwise use input_ids
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+            seq_len = inputs_embeds.shape[1]
+            device = inputs_embeds.device
+        else:
+            hidden_states = self.embed_tokens(input_ids)
+            seq_len = input_ids.shape[1]
+            device = input_ids.device
+        
         if position_ids is None:
             past_len = 0
-            if past_key_values is not None and len(past_key_values) > 0 and past_key_values[0] is not None:
-                pk, _ = past_key_values[0]
-                # pk: [bs, heads, past_len, head_dim]
-                past_len = int(pk.size(2))
+            if past_key_values is not None and len(past_key_values) > 0:
+                first_past = past_key_values[0]
+                if first_past is not None:
+                    pk, _ = first_past
+                    if pk is not None:
+                        # pk: [bs, heads, past_len, head_dim]
+                        past_len = int(pk.size(2))
             position_ids = torch.arange(
-                past_len, past_len + input_ids.shape[1],
-                device=input_ids.device
+                past_len, past_len + seq_len,
+                device=device
             ).unsqueeze(0)
-
-        hidden_states = self.embed_tokens(input_ids)
         
         presents = [] if use_cache else None
-        cos_sin = (self.rope_cos, self.rope_sin)
+        # Ensure RoPE buffers are on the same device as hidden_states
+        cos_sin = (
+            self.rope_cos.to(hidden_states.device),
+            self.rope_sin.to(hidden_states.device),
+        )
         
         for i, layer in enumerate(self.layers):
             past = past_key_values[i] if past_key_values is not None else None
@@ -414,24 +454,30 @@ class HomeModel(nn.Module):
 
 class HomeForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = HomeConfig
-    base_model_prefix = "home_model"
+    base_model_prefix = "model"
     _tied_weights_keys = ["lm_head.weight"]
-    _supports_gradient_checkpointing = True  # Новый формат
+    _supports_gradient_checkpointing = True
+    # Атрибуты для совместимости с vLLM TransformersForCausalLM
+    _supports_cache_class = True
+    _supports_static_cache = True
+    _supports_sdpa = True
+    _supports_flash_attn_2 = True
+    _supports_attention_backend = True  # Ключевой атрибут для vLLM!
 
     def __init__(self, config: HomeConfig):
         super().__init__(config)
-        self.home_model = HomeModel(config)
+        self.model = HomeModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Weight tying
-        self.lm_head.weight = self.home_model.embed_tokens.weight
+        self.lm_head.weight = self.model.embed_tokens.weight
 
         self.post_init()
     
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Включает gradient checkpointing для модели."""
         # Устанавливаем флаг на HomeModel
-        self.home_model.gradient_checkpointing = True
+        self.model.gradient_checkpointing = True
         # Сохраняем kwargs для checkpointing
         if gradient_checkpointing_kwargs is None:
             gradient_checkpointing_kwargs = {"use_reentrant": False}
@@ -439,23 +485,23 @@ class HomeForCausalLM(PreTrainedModel, GenerationMixin):
         def ckpt_func(fn, *args):
             return torch.utils.checkpoint.checkpoint(fn, *args, **gradient_checkpointing_kwargs)
         
-        self.home_model._gradient_checkpointing_func = ckpt_func
+        self.model._gradient_checkpointing_func = ckpt_func
     
     def gradient_checkpointing_disable(self):
         """Выключает gradient checkpointing."""
-        self.home_model.gradient_checkpointing = False
-        if hasattr(self.home_model, '_gradient_checkpointing_func'):
-            delattr(self.home_model, '_gradient_checkpointing_func')
+        self.model.gradient_checkpointing = False
+        if hasattr(self.model, '_gradient_checkpointing_func'):
+            delattr(self.model, '_gradient_checkpointing_func')
     
     def tie_weights(self):
         """Привязать веса lm_head к embed_tokens."""
-        self.lm_head.weight = self.home_model.embed_tokens.weight
+        self.lm_head.weight = self.model.embed_tokens.weight
 
     def get_input_embeddings(self):
-        return self.home_model.embed_tokens
+        return self.model.embed_tokens
 
     def set_input_embeddings(self, value):
-        self.home_model.embed_tokens = value
+        self.model.embed_tokens = value
 
     def forward(
         self,
@@ -476,7 +522,7 @@ class HomeForCausalLM(PreTrainedModel, GenerationMixin):
             elif isinstance(past_key_values, (list, tuple)):
                 legacy_past = past_key_values
         
-        hidden_states, presents = self.home_model(
+        hidden_states, presents = self.model(
             input_ids,
             past_key_values=legacy_past,
             use_cache=use_cache,

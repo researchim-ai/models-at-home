@@ -617,6 +617,16 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             trust_remote_code=True,
         )
         
+        # Проверяем max_position_embeddings и ограничиваем seq_len если нужно
+        model_max_pos = getattr(model.config, "max_position_embeddings", config.get("seq_len", 2048))
+        user_seq_len = config.get("seq_len", 2048)
+        if user_seq_len > model_max_pos:
+            logger.warning(
+                f"⚠️ seq_len ({user_seq_len}) > model max_position_embeddings ({model_max_pos}). "
+                f"Truncating to {model_max_pos} to avoid index out of bounds errors."
+            )
+            config["seq_len"] = model_max_pos
+        
         # Подготавливаем модель для обучения (resize, LoRA, use_cache, etc.)
         model = adapter.prepare_for_training(model, tokenizer, config)
         
@@ -1498,35 +1508,43 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 tokenizer.chat_template = user_chat_template
                 logger.info("Final save: using user-provided chat_template")
             elif config.get("sft_template"):
-                # Генерируем chat_template из sft_template
+                # Генерируем Qwen-style chat_template из sft_template
                 tmpl = config["sft_template"]
                 
                 default_sys = tmpl.get("system", "You are a helpful assistant.")
-                u_tag = tmpl.get("user_tag", "### User:")
-                b_tag = tmpl.get("bot_tag", "### Assistant:")
+                im_start = tmpl.get("im_start", "<|im_start|>")
+                im_end = tmpl.get("im_end", "<|im_end|>")
+                sep = tmpl.get("separator", "\n")
                 
                 default_sys_escaped = default_sys.replace("'", "\\'")
-                u_tag_escaped = u_tag.replace("'", "\\'")
-                b_tag_escaped = b_tag.replace("'", "\\'")
                 
+                # Qwen-style chat template
                 tokenizer.chat_template = (
-                    "{% if messages and messages[0]['role'] == 'system' %}"
-                    "{{ messages[0]['content'] }}\n\n"
-                    "{% else %}"
-                    f"{{{{ '{default_sys_escaped}' }}}}\n\n"
-                    "{% endif %}"
-                    "{% for message in messages %}"
-                    "{% if message['role'] == 'user' %}"
-                    f"{u_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
-                    "{% elif message['role'] == 'assistant' %}"
-                    f"{b_tag_escaped}\n{{{{ message['content'] }}}}\n\n"
-                    "{% endif %}"
-                    "{% endfor %}"
-                    "{% if add_generation_prompt %}"
-                    f"{b_tag_escaped}\n"
-                    "{% endif %}"
+                    "{%- if messages[0]['role'] == 'system' -%}"
+                    f"{{{{ '{im_start}system{sep}' + messages[0]['content'] + '{im_end}{sep}' }}}}"
+                    "{%- else -%}"
+                    f"{{{{ '{im_start}system{sep}{default_sys_escaped}{im_end}{sep}' }}}}"
+                    "{%- endif -%}"
+                    "{%- for message in messages -%}"
+                    "{%- if message.role == 'user' or (message.role == 'system' and not loop.first) -%}"
+                    f"{{{{ '{im_start}' + message.role + '{sep}' + message.content + '{im_end}{sep}' }}}}"
+                    "{%- elif message.role == 'assistant' -%}"
+                    f"{{{{ '{im_start}assistant{sep}' + message.content + '{im_end}{sep}' }}}}"
+                    "{%- endif -%}"
+                    "{%- endfor -%}"
+                    "{%- if add_generation_prompt -%}"
+                    f"{{{{ '{im_start}assistant{sep}' }}}}"
+                    "{%- endif -%}"
                 )
-                logger.info(f"Final save: generated chat_template from sft_template (user_tag='{u_tag}', bot_tag='{b_tag}')")
+                logger.info(f"Final save: generated Qwen-style chat_template (im_start='{im_start}', im_end='{im_end}')")
+        
+        # Синхронизируем tokenizer.model_max_length с max_position_embeddings модели
+        # чтобы избежать confusing warnings при инференсе
+        if accelerator.is_main_process:
+            model_max_pos = getattr(model.config, "max_position_embeddings", None)
+            if model_max_pos and tokenizer.model_max_length != model_max_pos:
+                logger.info(f"Syncing tokenizer.model_max_length: {tokenizer.model_max_length} -> {model_max_pos}")
+                tokenizer.model_max_length = model_max_pos
         
         # --- ВСЕГДА сохраняем финальную модель (и для pretrain тоже) ---
         # ВАЖНО: Для ZeRO-3/FSDP adapter.save_final ДОЛЖЕН вызываться на ВСЕХ процессах

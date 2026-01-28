@@ -229,7 +229,7 @@ class GPT2Block(nn.Module):
 # -----------------------------------------------------------------------------
 
 
-class GPT2HomeModel(nn.Module):
+class GPT2HomeModel(PreTrainedModel):
     """
     GPT-2 backbone model (без lm_head).
     
@@ -238,9 +238,19 @@ class GPT2HomeModel(nn.Module):
     - wpe: position embeddings (learned, не RoPE!)
     - LayerNorm вместо RMSNorm
     """
+    config_class = GPT2HomeConfig
+    base_model_prefix = "model"
+    
+    # vLLM compatibility attributes
+    tp_plan = {}  # Tensor parallelism plan (empty for single GPU)
+    _supports_attention_backend = True
+    _supports_cache_class = True
+    _supports_static_cache = True
+    _supports_sdpa = True
+    _supports_flash_attn_2 = True
+    
     def __init__(self, config: GPT2HomeConfig):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         
         # Embeddings
         self.wte = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -257,13 +267,27 @@ class GPT2HomeModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
+        # vLLM compatibility arguments
+        inputs_embeds: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        attention_instances: Optional[dict] = None,
+        return_dict: bool = True,
+        **kwargs,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
-        bsz, seq_len = input_ids.shape
-        device = input_ids.device
+        # Use inputs_embeds if provided
+        if inputs_embeds is not None:
+            bsz, seq_len = inputs_embeds.shape[:2]
+            device = inputs_embeds.device
+            # Skip token embedding, use provided embeddings
+            token_emb = inputs_embeds
+        else:
+            bsz, seq_len = input_ids.shape
+            device = input_ids.device
+            token_emb = self.wte(input_ids)
         
         # Position IDs
         if position_ids is None:
@@ -275,8 +299,7 @@ class GPT2HomeModel(nn.Module):
                 past_len, past_len + seq_len, dtype=torch.long, device=device
             ).unsqueeze(0).expand(bsz, -1)
         
-        # Token + Position embeddings
-        token_emb = self.wte(input_ids)
+        # Position embeddings
         pos_emb = self.wpe(position_ids)
         hidden_states = self.drop(token_emb + pos_emb)
         
@@ -316,46 +339,52 @@ class GPT2HomeForCausalLM(PreTrainedModel, GenerationMixin):
     Совместим с HuggingFace Transformers API.
     """
     config_class = GPT2HomeConfig
-    base_model_prefix = "transformer"
+    base_model_prefix = "model"
     _tied_weights_keys = ["lm_head.weight"]
     _supports_gradient_checkpointing = True
+    # Атрибуты для совместимости с vLLM TransformersForCausalLM
+    _supports_cache_class = True
+    _supports_static_cache = True
+    _supports_sdpa = True
+    _supports_flash_attn_2 = True
+    _supports_attention_backend = True
 
     def __init__(self, config: GPT2HomeConfig):
         super().__init__(config)
-        self.transformer = GPT2HomeModel(config)
+        self.model = GPT2HomeModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
         # Weight tying
-        self.lm_head.weight = self.transformer.wte.weight
+        self.lm_head.weight = self.model.wte.weight
         
         self.post_init()
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Включает gradient checkpointing."""
-        self.transformer.gradient_checkpointing = True
+        self.model.gradient_checkpointing = True
         if gradient_checkpointing_kwargs is None:
             gradient_checkpointing_kwargs = {"use_reentrant": False}
         
         def ckpt_func(fn, *args):
             return torch.utils.checkpoint.checkpoint(fn, *args, **gradient_checkpointing_kwargs)
         
-        self.transformer._gradient_checkpointing_func = ckpt_func
+        self.model._gradient_checkpointing_func = ckpt_func
 
     def gradient_checkpointing_disable(self):
         """Выключает gradient checkpointing."""
-        self.transformer.gradient_checkpointing = False
-        if hasattr(self.transformer, '_gradient_checkpointing_func'):
-            delattr(self.transformer, '_gradient_checkpointing_func')
+        self.model.gradient_checkpointing = False
+        if hasattr(self.model, '_gradient_checkpointing_func'):
+            delattr(self.model, '_gradient_checkpointing_func')
 
     def tie_weights(self):
         """Привязать веса lm_head к wte."""
-        self.lm_head.weight = self.transformer.wte.weight
+        self.lm_head.weight = self.model.wte.weight
 
     def get_input_embeddings(self):
-        return self.transformer.wte
+        return self.model.wte
 
     def set_input_embeddings(self, value):
-        self.transformer.wte = value
+        self.model.wte = value
 
     def forward(
         self,
@@ -376,7 +405,7 @@ class GPT2HomeForCausalLM(PreTrainedModel, GenerationMixin):
             elif isinstance(past_key_values, (list, tuple)):
                 legacy_past = past_key_values
         
-        hidden_states, presents = self.transformer(
+        hidden_states, presents = self.model(
             input_ids,
             position_ids=position_ids,
             past_key_values=legacy_past,
