@@ -1541,7 +1541,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         # Синхронизируем tokenizer.model_max_length с max_position_embeddings модели
         # чтобы избежать confusing warnings при инференсе
         if accelerator.is_main_process:
-            model_max_pos = getattr(model.config, "max_position_embeddings", None)
+            unwrapped = accelerator.unwrap_model(model)
+            model_max_pos = getattr(unwrapped.config, "max_position_embeddings", None)
             if model_max_pos and tokenizer.model_max_length != model_max_pos:
                 logger.info(f"Syncing tokenizer.model_max_length: {tokenizer.model_max_length} -> {model_max_pos}")
                 tokenizer.model_max_length = model_max_pos

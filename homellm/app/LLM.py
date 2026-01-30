@@ -7264,13 +7264,26 @@ def main():
                         "Переводчик": "Ты — профессиональный переводчик. Переводи текст точно, сохраняя стиль.",
                         "Кастомный": None
                     }
+                    preset_keys = list(preset_prompts.keys())
+                    
+                    # Инициализация системного промпта если не существует
+                    if "system_prompt" not in st.session_state:
+                        st.session_state.system_prompt = ""
+                    if "chat_system_prompt_preset" not in st.session_state:
+                        st.session_state.chat_system_prompt_preset = "Нет"
+                    
+                    # Определяем текущий индекс из session_state (сохраняется при очистке чата)
+                    current_preset = st.session_state.get("chat_system_prompt_preset", "Нет")
+                    current_index = preset_keys.index(current_preset) if current_preset in preset_keys else 0
                     
                     preset = st.selectbox(
                         "Шаблон",
-                        options=list(preset_prompts.keys()),
-                        index=0,
-                        key="system_prompt_preset"
+                        options=preset_keys,
+                        index=current_index,
+                        key="system_prompt_preset_widget"
                     )
+                    # Сохраняем выбор в отдельный ключ (не виджетный)
+                    st.session_state.chat_system_prompt_preset = preset
                     
                     if preset != "Кастомный" and preset != "Нет":
                         st.session_state.system_prompt = preset_prompts[preset]
@@ -7284,7 +7297,9 @@ def main():
                         )
                         st.session_state.system_prompt = system_prompt_input.strip()
                     else:
-                        st.session_state.system_prompt = ""
+                        # "Нет" - НЕ сбрасываем если был Кастомный с текстом
+                        if st.session_state.get("chat_system_prompt_preset") != "Кастомный":
+                            st.session_state.system_prompt = ""
                         st.caption("Используется дефолтный промпт модели")
                 
                 # --- ИНТЕРФЕЙС ЧАТА С ФИКСИРОВАННЫМ СКРОЛЛОМ ---
