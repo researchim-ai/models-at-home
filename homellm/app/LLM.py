@@ -36,6 +36,12 @@ try:
 except ImportError:
     from docs import render_docs
 
+# Internationalization (i18n)
+try:
+    from homellm.i18n import t, language_selector, load_translations
+except ImportError:
+    from ..i18n import t, language_selector, load_translations
+
 # Пути
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 CONFIGS_DIR = PROJECT_ROOT / "configs"
@@ -56,6 +62,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Load translations for i18n
+load_translations()
 
 # Custom CSS — чистая тёмная тема с хорошим контрастом
 st.markdown("""
@@ -352,54 +361,54 @@ def get_available_configs():
     return configs
 
 
-# Описания типов параллелизма
+# Parallelism type descriptions (i18n keys)
 PARALLEL_TYPES = {
     "default": {
         "name": "Single GPU / CPU",
         "type": "None",
-        "description": "Обучение на одном устройстве без параллелизма",
+        "description_key": "parallel.description.default",
         "icon": "🖥️",
     },
     "multi_gpu": {
         "name": "Multi-GPU (DDP)",
         "type": "Data Parallel",
-        "description": "Distributed Data Parallel — каждая GPU получает копию модели и часть батча",
+        "description_key": "parallel.description.multi_gpu",
         "icon": "🔄",
     },
     "fsdp": {
         "name": "FSDP",
         "type": "Model Parallel",
-        "description": "Fully Sharded Data Parallel (PyTorch native). Liger fused CE работает!",
+        "description_key": "parallel.description.fsdp",
         "icon": "⚡",
     },
     "fsdp_offload": {
         "name": "FSDP + CPU Offload",
         "type": "Model Parallel + CPU Offload",
-        "description": "FSDP + выгрузка параметров на CPU. Экономит VRAM, но Liger fused CE отключён.",
+        "description_key": "parallel.description.fsdp_offload",
         "icon": "💾",
     },
     "fsdp2": {
         "name": "FSDP2 + CPU Offload",
         "type": "Model Parallel + CPU Offload",
-        "description": "FSDP v2 с DTensor + CPU. Экономит VRAM, но Liger fused CE отключён.",
+        "description_key": "parallel.description.fsdp2",
         "icon": "🔥",
     },
     "deepspeed_zero2": {
         "name": "DeepSpeed ZeRO-2",
         "type": "Data Parallel + Optimizer Parallel",
-        "description": "Шардирование оптимизатора и градиентов между GPU",
+        "description_key": "parallel.description.deepspeed_zero2",
         "icon": "🚀",
     },
     "deepspeed_zero3": {
         "name": "DeepSpeed ZeRO-3",
         "type": "Full Model Parallel",
-        "description": "Полное шардирование: модель + оптимизатор + градиенты",
+        "description_key": "parallel.description.deepspeed_zero3",
         "icon": "💪",
     },
     "deepspeed_zero3_offload": {
         "name": "ZeRO-3 + CPU Offload",
         "type": "Model Parallel + CPU Offload",
-        "description": "Полное шардирование + выгрузка на CPU для экономии VRAM",
+        "description_key": "parallel.description.deepspeed_zero3_offload",
         "icon": "🧊",
     },
 }
@@ -1018,8 +1027,13 @@ def is_process_running(run_id: str) -> bool:
 # ============================================================================
 
 def render_header():
-    st.markdown("# 🏠 Models at Home Training Studio")
-    st.caption("Визуальный интерфейс для тренировки языковых моделей дома")
+    # Header with language selector on the right
+    col_title, col_lang = st.columns([6, 1])
+    with col_title:
+        st.markdown(f"# 🏠 {t('app.title')}")
+        st.caption(t("app.subtitle"))
+    with col_lang:
+        language_selector()
 
 
 def get_nested_value(data: dict, path: str):
@@ -1124,7 +1138,7 @@ def get_dataset_columns(file_path: str):
             return [], sample_data
             
     except Exception as e:
-        st.error(f"Ошибка чтения файла: {e}")
+        st.error(t("error.file_read", error=str(e)))
         return [], {}
     
     return [], {}
@@ -1205,12 +1219,12 @@ def render_sft_main_config(data_path: str):
     Args:
         data_path: Путь к датасету
     """
-    st.markdown("### 🛠️ Настройка данных для SFT")
+    st.markdown(f"### 🛠️ {t('sft.data_config')}")
     
     columns, sample = get_dataset_columns(data_path)
     
     if not sample:
-        st.error("Не удалось прочитать файл или он пуст.")
+        st.error(t("error.file_empty"))
         return {}
     
     # ===== АВТОДЕТЕКТ ФОРМАТА =====
@@ -1237,7 +1251,7 @@ def render_sft_main_config(data_path: str):
     
     # ===== ЛЕВАЯ КОЛОНКА: JSON превью =====
     with col_json:
-        st.markdown("#### 📄 Пример записи:")
+        st.markdown(f"#### 📄 {t('sft.example_record')}:")
         with st.container(height=500):
             st.json(sample, expanded=True)
     
@@ -1245,9 +1259,9 @@ def render_sft_main_config(data_path: str):
     with col_config:
         # Показываем что автодетект нашел
         if detected_format == "chat":
-            st.success(f"🔍 **Автодетект:** найден Chat-формат в поле `{chat_field}`")
+            st.success(f"🔍 **{t('sft.detected_chat')}** `{chat_field}`")
         else:
-            st.info("🔍 **Автодетект:** Instruct-формат (отдельные поля)")
+            st.info(f"🔍 **{t('sft.detected_instruct')}**")
         
         # Переключатель режима
         format_choice = st.radio(
@@ -1266,13 +1280,13 @@ def render_sft_main_config(data_path: str):
         
         if is_chat:
             # ===== CHAT РЕЖИМ =====
-            st.markdown("#### 💬 Настройка Chat-формата")
+            st.markdown(f"#### 💬 {t('sft.chat_config')}")
             
             # Выбор поля со списком сообщений
             list_fields = [k for k, v in sample.items() if isinstance(v, list) and v and isinstance(v[0], dict)]
             
             if not list_fields:
-                st.error("❌ Не найдено полей со списком сообщений!")
+                st.error(f"❌ {t('warning.no_messages_field')}")
                 return {}
             
             messages_field = st.selectbox(
@@ -1338,18 +1352,18 @@ def render_sft_main_config(data_path: str):
             
         else:
             # ===== INSTRUCT РЕЖИМ =====
-            st.markdown("#### 📝 Настройка Instruct-формата")
-            st.caption("Выберите поля для каждой роли:")
+            st.markdown(f"#### 📝 {t('sft.instruct_config')}")
+            st.caption(t("sft.select_role_fields"))
             
             # Все доступные пути
             field_options = ["(не выбрано)"] + all_paths
             
-            system_path = st.selectbox("⚙️ **System** (опционально):", field_options, index=0, key="sft_inst_sys")
-            user_path = st.selectbox("👤 **User** (вопрос/инструкция):", field_options, index=0, key="sft_inst_user")
-            assistant_path = st.selectbox("🤖 **Assistant** (ответ):", field_options, index=0, key="sft_inst_asst")
+            system_path = st.selectbox(f"⚙️ **System** ({t('common.optional')}):", field_options, index=0, key="sft_inst_sys")
+            user_path = st.selectbox(f"👤 **User** ({t('sft.input_instruction')}):", field_options, index=0, key="sft_inst_user")
+            assistant_path = st.selectbox(f"🤖 **Assistant** ({t('sft.output_answer')}):", field_options, index=0, key="sft_inst_asst")
             
             if user_path == "(не выбрано)" or assistant_path == "(не выбрано)":
-                st.warning("👆 Выберите поля **User** и **Assistant**")
+                st.warning(f"👆 {t('warning.select_fields')}")
                 return {}
             
             sft_columns = {
@@ -1361,8 +1375,8 @@ def render_sft_main_config(data_path: str):
         
         # ===== НАСТРОЙКИ ШАБЛОНА =====
         st.markdown("---")
-        with st.expander("🏷️ Теги и системный промпт", expanded=False):
-            default_system = st.text_input("System prompt (по умолч.):", "You are a helpful assistant.", key="sft_def_sys")
+        with st.expander(f"🏷️ {t('sft.tags_system')}", expanded=False):
+            default_system = st.text_input(f"{t('sft.default_system')}:", "You are a helpful assistant.", key="sft_def_sys")
             
             # Qwen-style теги по умолчанию
             tc1, tc2, tc3 = st.columns(3)
@@ -1390,7 +1404,7 @@ def render_sft_main_config(data_path: str):
         
         # ===== ПРЕВЬЮ =====
         st.markdown("---")
-        st.markdown("#### 👁️ Превью:")
+        st.markdown(f"#### 👁️ {t('sft.preview')}:")
         
         try:
             # Получаем токенизатор из session_state (если загружен для SFT)
@@ -1513,10 +1527,10 @@ def render_sft_main_config(data_path: str):
             with st.container(height=400):
                 st.code(preview, language=None)
             
-            st.success("✅ Готово!")
+            st.success(f"✅ {t('success.ready')}")
             
         except Exception as e:
-            st.error(f"Ошибка: {e}")
+            st.error(f"{t('error.generic')}: {e}")
 
     return {"sft_columns": sft_columns, "sft_template": sft_template}
 
@@ -1531,7 +1545,7 @@ def render_grpo_sidebar_config():
     Training Backend теперь выбирается в render_model_config() (до выбора модели),
     вместе с методом тюнинга (lora/qlora/full).
     """
-    st.sidebar.subheader("🧠 Параметры GRPO")
+    st.sidebar.subheader(f"🧠 {t('grpo.params')}")
     
     # Алгоритм
     algorithm = st.sidebar.selectbox(
@@ -1969,7 +1983,7 @@ def render_grpo_main_config(data_path: str = None):
     # =========================================================================
     # 1. ДАТАСЕТ ДЛЯ REASONING (расширенная настройка)
     # =========================================================================
-    st.markdown("### 📚 Датасет для Reasoning")
+    st.markdown(f"### 📚 {t('grpo.dataset_reasoning')}")
     
     grpo_dataset_path = None
     grpo_max_samples = None
@@ -2027,7 +2041,7 @@ Therefore, the answer is X.
                 break
     
     selected_dataset = st.selectbox(
-        "Выберите датасет",
+        t("data.select_dataset"),
         options=dataset_options,
         index=default_idx,
         key="grpo_dataset_selectbox",
@@ -2085,7 +2099,7 @@ Therefore, the answer is X.
         # =====================================================================
         # ПРЕВЬЮ ДАННЫХ
         # =====================================================================
-        with st.expander("👀 Превью данных из датасета", expanded=True):
+        with st.expander(f"👀 {t('data.preview')}", expanded=True):
             if dataset_samples:
                 # Показываем первые 5 семплов
                 preview_count = min(5, len(dataset_samples))
@@ -2110,13 +2124,13 @@ Therefore, the answer is X.
                                 st.text_area(f"`{key}`", value=val_str, height=80, disabled=True, key=f"preview_{i}_{key}")
                         st.markdown("---")
             else:
-                st.warning("Не удалось загрузить данные для превью")
+                st.warning(t("warning.preview_load_failed"))
         
         # =====================================================================
         # МАППИНГ ПОЛЕЙ
         # =====================================================================
         st.markdown("#### 🔗 Маппинг полей датасета")
-        st.caption("Укажите какие поля использовать для промпта и ответа")
+        st.caption(t("grpo.field_mapping_desc"))
         
         # Автодетект распространённых полей
         auto_prompt_field = None
@@ -2198,7 +2212,7 @@ Therefore, the answer is X.
         # ШАБЛОН ПРОМПТА
         # =====================================================================
         st.markdown("#### 📝 Шаблон промпта")
-        st.caption("Настройте как будет форматироваться промпт для модели")
+        st.caption(t("grpo.prompt_template_desc"))
         
         # Пресеты шаблонов (Reasoning по умолчанию)
         template_presets = {
@@ -2318,7 +2332,7 @@ The reasoning process and answer are enclosed within <think>...</think> and <ans
         # Очищаем session_state если датасет не выбран
         if "grpo_dataset_path" in st.session_state:
             del st.session_state.grpo_dataset_path
-        st.warning("⚠️ Выберите датасет или скачайте его на вкладке **💾 Данные** → 🧠 Reasoning")
+        st.warning(f"⚠️ {t('warning.select_dataset')}")
         prompt_field = None
         reference_field = None
     
@@ -2356,13 +2370,13 @@ The reasoning process and answer are enclosed within <think>...</think> and <ans
     # =========================================================================
     # 2. REWARD DESIGNER
     # =========================================================================
-    st.markdown("### 🎯 Reward Designer")
-    st.caption("Создавайте гибкие правила вознаграждения с условиями, паттернами и формулами")
+    st.markdown(f"### 🎯 {t('grpo.reward_designer')}")
+    st.caption(t("grpo.reward_designer_desc"))
     
     # =========================================================================
     # Песочница — Тестовые данные (автозагрузка из датасета)
     # =========================================================================
-    st.markdown("#### 🧪 Песочница для проектирования")
+    st.markdown(f"#### 🧪 {t('grpo.sandbox')}")
     
     # Получаем данные из датасета для песочницы
     # НЕ используем fallback значения - показываем реальные данные из датасета
@@ -2390,7 +2404,7 @@ The reasoning process and answer are enclosed within <think>...</think> and <ans
             # Проверяем пустой ли ответ
             reference_is_empty = not default_reference.strip()
     
-    with st.expander("📝 Тестовые данные", expanded=True):
+    with st.expander(f"📝 {t('grpo.test_data')}", expanded=True):
         # Если датасет загружен, показываем селектор примера
         selected_sample_idx = 0
         if dataset_samples:
@@ -2420,9 +2434,9 @@ The reasoning process and answer are enclosed within <think>...</think> and <ans
                     
                     reference_is_empty = not default_reference.strip()
             
-            st.caption("💡 Данные автоматически загружены из выбранного датасета")
+            st.caption(t("grpo.data_loaded_from_dataset"))
         else:
-            st.info("Выберите датасет выше чтобы загрузить примеры")
+            st.info(t("info.select_dataset_above"))
         
         # Создаём уникальный key на основе датасета и выбранного примера
         dataset_key_hash = hash(grpo_dataset_path or "none") % 10000
@@ -2436,7 +2450,7 @@ The reasoning process and answer are enclosed within <think>...</think> and <ans
         
         # Показываем предупреждение если ответ пустой
         if reference_is_empty:
-            st.warning("⚠️ Поле ответа пустое в датасете! Выберите другое поле или введите вручную.")
+            st.warning(f"⚠️ {t('warning.field_empty')}")
         
         sample_reference = st.text_input(
             "**Эталонный ответ**",
@@ -2460,10 +2474,10 @@ The reasoning process and answer are enclosed within <think>...</think> and <ans
     # =========================================================================
     # Универсальный конструктор правил
     # =========================================================================
-    st.markdown("#### 🏗️ Конструктор Reward-правил")
+    st.markdown(f"#### 🏗️ {t('grpo.rule_constructor')}")
     
     # Справка по переменным
-    with st.expander("📖 Справка: переменные и синтаксис", expanded=False):
+    with st.expander(f"📖 {t('grpo.help_vars')}", expanded=False):
         st.markdown("""
 **Доступные переменные:**
 - `{{response}}` — ответ модели (completion)
@@ -2561,9 +2575,9 @@ weight = float({{metadata.difficulty}}) / 10.0
             # Заголовок правила
             c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
             with c1:
-                rule["name"] = st.text_input("Название", value=rule["name"], key=f"rule_name_{rule['id']}")
+                rule["name"] = st.text_input(t("common.name"), value=rule["name"], key=f"rule_name_{rule['id']}")
             with c2:
-                rule["weight"] = st.number_input("Вес", 0.0, 10.0, float(rule["weight"]), 0.1, key=f"rule_weight_{rule['id']}")
+                rule["weight"] = st.number_input(t("common.weight"), 0.0, 10.0, float(rule["weight"]), 0.1, key=f"rule_weight_{rule['id']}")
             with c3:
                 rule["enabled"] = st.checkbox("Вкл", value=rule["enabled"], key=f"rule_enabled_{rule['id']}")
             with c4:
@@ -2573,7 +2587,7 @@ weight = float({{metadata.difficulty}}) / 10.0
             
             # === EXTRACTORS (regex для извлечения значений) ===
             st.markdown("##### 🔍 Экстракторы (regex)")
-            st.caption("Извлекают значения из текста в переменные `{{extracted.имя}}`")
+            st.caption(t("grpo.extractors_desc"))
             
             if "extractors" not in rule:
                 rule["extractors"] = []
@@ -2581,7 +2595,7 @@ weight = float({{metadata.difficulty}}) / 10.0
             for ei, ext in enumerate(rule["extractors"]):
                 ec1, ec2, ec3, ec4 = st.columns([2, 4, 2, 1])
                 with ec1:
-                    ext["name"] = st.text_input("Имя", value=ext.get("name", f"var{ei}"), key=f"ext_name_{rule['id']}_{ei}")
+                    ext["name"] = st.text_input(t("common.name"), value=ext.get("name", f"var{ei}"), key=f"ext_name_{rule['id']}_{ei}")
                 with ec2:
                     ext["pattern"] = st.text_input("Regex", value=ext.get("pattern", ""), key=f"ext_pattern_{rule['id']}_{ei}")
                 with ec3:
@@ -2596,7 +2610,7 @@ weight = float({{metadata.difficulty}}) / 10.0
                         rule["extractors"].pop(ei)
                         st.rerun()
             
-            if st.button("➕ Добавить экстрактор", key=f"add_ext_{rule['id']}"):
+            if st.button(f"➕ {t('button.add_extractor')}", key=f"add_ext_{rule['id']}"):
                 rule["extractors"].append({"name": f"var{len(rule['extractors'])}", "pattern": r"(.*)", "source": "{{response}}"})
                 st.rerun()
             
@@ -2670,7 +2684,7 @@ weight = float({{metadata.difficulty}}) / 10.0
                     with ccc3:
                         # Правый операнд зависит от типа
                         if new_type in ["contains", "not_contains", "equals"]:
-                            cond["value"] = st.text_input("Значение", value=cond.get("value", ""), key=f"cond_val_{rule['id']}_{ci}", label_visibility="collapsed")
+                            cond["value"] = st.text_input(t("common.value"), value=cond.get("value", ""), key=f"cond_val_{rule['id']}_{ci}", label_visibility="collapsed")
                         elif new_type in ["matches", "not_matches"]:
                             cond["pattern"] = st.text_input("Regex", value=cond.get("pattern", ""), key=f"cond_pat_{rule['id']}_{ci}", label_visibility="collapsed")
                         elif new_type == "equals_numeric":
@@ -2678,18 +2692,18 @@ weight = float({{metadata.difficulty}}) / 10.0
                             right_val = cond.get("right", "{{reference}}")
                             if right_val not in right_opts:
                                 right_opts.append(right_val)
-                            cond["right"] = st.selectbox("Сравнить с", right_opts, index=right_opts.index(right_val) if right_val in right_opts else 0, key=f"cond_right_{rule['id']}_{ci}", label_visibility="collapsed")
+                            cond["right"] = st.selectbox(t("common.compare_with"), right_opts, index=right_opts.index(right_val) if right_val in right_opts else 0, key=f"cond_right_{rule['id']}_{ci}", label_visibility="collapsed")
                             cond["tolerance"] = st.number_input("±", 0.0, 100.0, float(cond.get("tolerance", 0.01)), 0.01, key=f"cond_tol_{rule['id']}_{ci}", label_visibility="collapsed")
                         elif new_type in ["greater", "less"]:
-                            cond["value"] = st.number_input("Число", value=float(cond.get("value", 0)), key=f"cond_num_{rule['id']}_{ci}", label_visibility="collapsed")
+                            cond["value"] = st.number_input(t("common.number"), value=float(cond.get("value", 0)), key=f"cond_num_{rule['id']}_{ci}", label_visibility="collapsed")
                         elif new_type == "length_between":
                             lc1, lc2 = st.columns(2)
                             cond["min"] = lc1.number_input("Мин", 0, 100000, int(cond.get("min", 10)), key=f"cond_min_{rule['id']}_{ci}")
                             cond["max"] = lc2.number_input("Макс", 0, 100000, int(cond.get("max", 5000)), key=f"cond_max_{rule['id']}_{ci}")
                         elif new_type == "length_min":
-                            cond["min"] = st.number_input("Мин длина", 0, 100000, int(cond.get("min", 10)), key=f"cond_minl_{rule['id']}_{ci}", label_visibility="collapsed")
+                            cond["min"] = st.number_input(t("common.min_length"), 0, 100000, int(cond.get("min", 10)), key=f"cond_minl_{rule['id']}_{ci}", label_visibility="collapsed")
                         elif new_type == "length_max":
-                            cond["max"] = st.number_input("Макс длина", 0, 100000, int(cond.get("max", 5000)), key=f"cond_maxl_{rule['id']}_{ci}", label_visibility="collapsed")
+                            cond["max"] = st.number_input(t("common.max_length"), 0, 100000, int(cond.get("max", 5000)), key=f"cond_maxl_{rule['id']}_{ci}", label_visibility="collapsed")
                     
                     with ccc4:
                         if st.button("✖", key=f"cond_del_{rule['id']}_{ci}"):
@@ -2708,7 +2722,7 @@ weight = float({{metadata.difficulty}}) / 10.0
                     horizontal=True
                 )
             with lc2:
-                if st.button("➕ Добавить условие", key=f"add_cond_{rule['id']}"):
+                if st.button(f"➕ {t('button.add_condition')}", key=f"add_cond_{rule['id']}"):
                     rule["conditions"].append({"type": "contains", "target": "{{response}}", "value": ""})
                     st.rerun()
             
@@ -2742,7 +2756,7 @@ weight = float({{metadata.difficulty}}) / 10.0
     col_add1, col_add2, col_add3 = st.columns(3)
     
     with col_add1:
-        if st.button("➕ Пустое правило", type="secondary"):
+        if st.button(f"➕ {t('button.empty_rule')}", type="secondary"):
             new_id = st.session_state.next_rule_id
             st.session_state.next_rule_id += 1
             st.session_state.reward_rules.append({
@@ -2774,7 +2788,7 @@ weight = float({{metadata.difficulty}}) / 10.0
         )
     
     with col_add3:
-        if st.button("➕ Добавить шаблон", type="primary"):
+        if st.button(f"➕ {t('button.add_template')}", type="primary"):
             new_id = st.session_state.next_rule_id
             st.session_state.next_rule_id += 1
             
@@ -2830,14 +2844,14 @@ weight = float({{metadata.difficulty}}) / 10.0
                     "else_reward": "0.0",
                 })
             else:
-                st.warning("Выберите шаблон")
+                st.warning(t("warning.select_template"))
             st.rerun()
     
     # =========================================================================
     # Формат reasoning
     # =========================================================================
     st.markdown("---")
-    st.markdown("#### 📝 Формат Reasoning")
+    st.markdown(f"#### 📝 {t('grpo.reasoning_format')}")
     
     reasoning_format = st.selectbox(
         "Формат тегов",
@@ -2881,7 +2895,7 @@ Therefore, the answer is 42.
 #### 42""",
     }
     
-    with st.expander("📋 Пример формата ответа"):
+    with st.expander(f"📋 {t('grpo.response_format_example')}"):
         st.code(format_examples[reasoning_format], language=None)
     
     # Собираем конфигурацию reward правил (новый универсальный формат)
@@ -2925,21 +2939,23 @@ Therefore, the answer is 42.
 
 
 def render_model_config():
-    """Конфигуратор модели в сайдбаре."""
-    st.sidebar.header("🧠 Архитектура и Режим")
+    """Model configuration in sidebar."""
+    st.sidebar.header(f"🧠 {t('sidebar.architecture')}")
     
-    # Режим обучения
-    stage_options = {
-        "pretrain": "Pretraining (с нуля)",
-        "continual_pretrain": "Continual Pretraining (продолжение)",
-        "sft": "SFT (Fine-Tuning)",
-        "grpo": "🧠 GRPO (RL для Reasoning)"
-    }
+    # Training mode - use i18n keys
+    def get_stage_label(stage):
+        return {
+            "pretrain": t("stage.pretrain"),
+            "continual_pretrain": t("stage.continual_pretrain"),
+            "sft": t("stage.sft"),
+            "grpo": f"🧠 {t('stage.grpo')}"
+        }.get(stage, stage)
+    
     selected_stage = st.sidebar.selectbox(
-        "Этап обучения",
-        options=list(stage_options.keys()),
-        format_func=lambda x: stage_options[x],
-        help="Выберите этап: обучение с нуля, продолжение pretrain, дообучение (SFT) или RL обучение (GRPO)"
+        t("sidebar.training_stage"),
+        options=["pretrain", "continual_pretrain", "sft", "grpo"],
+        format_func=get_stage_label,
+        help=t("help.training_stage")
     )
     
     # Имя модели (для папки эксперимента)
@@ -2951,13 +2967,13 @@ def render_model_config():
         model_name_default = "home_grpo"
     else:
         model_name_default = "home_sft"
-    model_name = st.sidebar.text_input("Название эксперимента", value=model_name_default, help="Имя папки для сохранения")
+    model_name = st.sidebar.text_input(t("sidebar.experiment_name"), value=model_name_default, help=t("help.experiment_folder"))
     
     base_model_path = None
     
     if selected_stage in ("sft", "continual_pretrain", "grpo"):
         stage_label = {"sft": "SFT", "continual_pretrain": "Continual Pretraining", "grpo": "GRPO"}.get(selected_stage, selected_stage)
-        st.sidebar.subheader("📦 Базовая модель")
+        st.sidebar.subheader(f"📦 {t('sidebar.base_model')}")
         available = get_available_models()
         
         if selected_stage == "continual_pretrain":
@@ -3000,7 +3016,7 @@ def render_model_config():
             model_options = [get_model_label(m) for m in available_filtered]
             
             selected_base_name = st.sidebar.selectbox(
-                "Выберите модель", 
+                t("model.select"), 
                 options=model_options,
                 help="🤗 — модели с HuggingFace, ✅ final — обученные модели, ⚠️ checkpoint — для resume"
             )
@@ -3017,7 +3033,7 @@ def render_model_config():
                     "Для начала нового continual pretraining лучше использовать final_model или 🤗 HF модель."
                 )
             elif selected_model["type"] == "hf":
-                st.sidebar.success("✅ HuggingFace модель")
+                st.sidebar.success(f"✅ {t('info.hf_model')}")
             
             st.sidebar.caption(f"Путь: `{base_model_path}`")
     
@@ -3049,7 +3065,7 @@ def render_model_config():
                 with open(cfg_path) as f:
                     loaded_config = json.load(f)
                 if cfg_type == "run":
-                    st.sidebar.success("✅ Параметры загружены из run_config.json")
+                    st.sidebar.success(f"✅ {t('info.params_loaded')} run_config.json")
                 else:
                     # config.json содержит только параметры модели, нужно адаптировать ключи
                     # transformers config -> наш формат
@@ -3061,11 +3077,11 @@ def render_model_config():
                         loaded_config["seq_len"] = loaded_config["max_position_embeddings"]
                     st.sidebar.info("ℹ️ Параметры модели загружены из config.json (training params не найдены)")
             else:
-                st.sidebar.warning("⚠️ Конфиг не найден, введите параметры вручную")
+                st.sidebar.warning(f"⚠️ {t('warning.config_not_found')}")
         except Exception as e:
              st.sidebar.error(f"Ошибка чтения config: {e}")
 
-    st.sidebar.subheader("⚙️ Параметры модели")
+    st.sidebar.subheader(f"⚙️ {t('sidebar.model_params')}")
 
     blueprint_path = ""
     model_type = "HomeModel (GPT-2 style)"  # default
@@ -3194,7 +3210,7 @@ def render_model_config():
         c1.metric("Heads", n_heads)
         c2.metric("Max Context", f"{max_position_embeddings:,}")
         
-        st.sidebar.info("🔒 Архитектура зафиксирована (от базовой модели)")
+        st.sidebar.info(f"🔒 {t('info.architecture_fixed')}")
         
         # seq_len МОЖНО менять - тренировать на меньшем контексте
         st.sidebar.markdown("---")
@@ -3225,7 +3241,7 @@ def render_model_config():
         d_hid, d_layers = 512, 8
         
         if selected_stage == "sft":
-            st.sidebar.caption("⚠️ Убедитесь, что параметры совпадают с базовой моделью!")
+            st.sidebar.caption(f"⚠️ {t('warning.check_params_match')}")
 
         # Определяем тип архитектуры для генерации пресетов
         arch_for_presets = {
@@ -3358,7 +3374,7 @@ def render_model_config():
         col2.metric("Active (≈)", format_params(active_params), help=f"Параметры, работающие на токен (Top-{num_experts_per_tok})")
         st.sidebar.caption(f"🔀 {num_experts} экспертов × {format_params(expert_params)} = {format_params(total_expert_params)} в MLP")
     else:
-        st.sidebar.metric("Параметры (≈)", format_params(est_params))
+        st.sidebar.metric(t("model.params_approx"), format_params(est_params))
     
     # Model ID для pretrain from scratch (опционально, для HF моделей)
     model_id = None
@@ -3425,7 +3441,7 @@ def render_model_config():
         training_backend = "models-at-home"
     
     # Метод тюнинга (full/LoRA/QLoRA)
-    st.sidebar.subheader("🎯 Метод тюнинга")
+    st.sidebar.subheader(f"🎯 {t('sidebar.tuning_method')}")
     
     # При Unsloth (только GRPO) доступны только lora/qlora
     if training_backend == "unsloth":
@@ -3557,8 +3573,8 @@ def render_model_config():
 
 
 def render_training_config():
-    """Конфигуратор гиперпараметров обучения."""
-    st.sidebar.header("📈 Гиперпараметры")
+    """Training hyperparameters configuration."""
+    st.sidebar.header(f"📈 {t('sidebar.hyperparams')}")
     
     batch_size = st.sidebar.slider(
         "Batch Size",
@@ -3632,14 +3648,14 @@ def render_training_config():
         ),
     )
     
-    # Выбор: epochs или max_steps
+    # Choice: epochs or max_steps
     training_mode = st.sidebar.radio(
-        "Режим тренировки",
-        ["По эпохам", "По шагам"],
-        help="Выберите как определять длительность тренировки"
+        t("training.mode"),
+        [t("training.mode_epochs"), t("training.mode_steps")],
+        help=t("help.training_mode")
     )
     
-    if training_mode == "По эпохам":
+    if training_mode == t("training.mode_epochs"):
         epochs = st.sidebar.number_input(
             "Epochs",
             min_value=1,
@@ -3682,23 +3698,23 @@ def render_training_config():
 
 
 def render_dataset_config(stage="pretrain"):
-    """Выбор датасета и настройки валидации."""
-    st.sidebar.header("📁 Данные")
+    """Dataset selection and validation settings."""
+    st.sidebar.header(f"📁 {t('sidebar.data')}")
     
     datasets = get_available_datasets()
     
     if datasets:
         dataset_options = [f"{name} ({size})" for name, size in datasets]
-        selected = st.sidebar.selectbox("Выберите датасет", dataset_options)
+        selected = st.sidebar.selectbox(t("data.select_dataset"), dataset_options)
         selected_name = selected.split(" (")[0]
         data_path = str(DATASET_DIR / selected_name)
     else:
-        st.sidebar.warning("Датасеты не найдены в datasets/")
+        st.sidebar.warning(t("data.no_datasets"))
         data_path = st.sidebar.text_input("Путь к датасету", "datasets/data.jsonl")
 
     # Sharding mode: гарантирует отсутствие двойного шардинга и корректную семантику resume
     st.sidebar.divider()
-    st.sidebar.subheader("🧩 Шардирование")
+    st.sidebar.subheader(f"🧩 {t('data.sharding')}")
     sharding_mode = st.sidebar.selectbox(
         "Sharding mode",
         options=["auto", "dataset", "accelerate"],
@@ -3712,7 +3728,7 @@ def render_dataset_config(stage="pretrain"):
     
     # Validation / Eval
     st.sidebar.divider()
-    st.sidebar.subheader("📊 Валидация")
+    st.sidebar.subheader(f"📊 {t('data.validation')}")
     
     val_ratio = st.sidebar.slider(
         "Validation fraction",
@@ -3751,8 +3767,8 @@ def render_dataset_config(stage="pretrain"):
 
 
 def render_output_config(model_name="training_run"):
-    """Конфигурация вывода."""
-    st.sidebar.header("💾 Сохранение")
+    """Output configuration."""
+    st.sidebar.header(f"💾 {t('sidebar.save')}")
     
     # Автоматический путь: out/{model_name}
     default_dir = f"out/{model_name}"
@@ -3809,7 +3825,7 @@ def render_output_config(model_name="training_run"):
         if checkpoints or final_model:
             st.sidebar.caption(f"📦 Найдено чекпоинтов: {len(checkpoints)}")
             if final_model and final_model.exists():
-                st.sidebar.caption("✅ Финальная модель сохранена")
+                st.sidebar.caption(f"✅ {t('chat.final_model_saved')}")
     
     return {
         "output_dir": output_dir,
@@ -3974,14 +3990,14 @@ def get_available_models():
 
 
 def render_distributed_config(training_config: dict | None = None, is_grpo: bool = False, grpo_backend: str | None = None):
-    """Конфигурация GPU, параллелизма и памяти."""
-    st.sidebar.header("🖥️ GPU и Память")
+    """GPU, parallelism and memory configuration."""
+    st.sidebar.header(f"🖥️ {t('sidebar.gpu_memory')}")
     
     # Информация о GPU
     gpus = get_gpu_info()
     
     if gpus:
-        st.sidebar.success(f"✅ Найдено GPU: {len(gpus)}")
+        st.sidebar.success(f"✅ {t('gpu.found')}: {len(gpus)}")
         
         # Показываем карточки GPU
         for gpu in gpus:
@@ -4005,7 +4021,7 @@ def render_distributed_config(training_config: dict | None = None, is_grpo: bool
         else:
             num_gpus = 1
             gpu_ids = [0]
-            st.sidebar.info("Используется единственная GPU")
+            st.sidebar.info(t("gpu.single_gpu"))
     else:
         st.sidebar.warning("⚠️ GPU не найдены, будет использован CPU")
         num_gpus = 0
@@ -4014,7 +4030,7 @@ def render_distributed_config(training_config: dict | None = None, is_grpo: bool
     st.sidebar.markdown("---")
     
     # Выбор типа параллелизма
-    st.sidebar.subheader("⚡ Тип параллелизма")
+    st.sidebar.subheader(f"⚡ {t('parallel.type')}")
     
     # Определяем доступные опции и рекомендуемый режим
     if num_gpus == 0:
@@ -4052,8 +4068,8 @@ def render_distributed_config(training_config: dict | None = None, is_grpo: bool
     # Показываем информацию о выбранном режиме
     st.sidebar.markdown(f"""
     <div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 8px; margin: 10px 0;">
-    <b>Тип:</b> {mode_info['type']}<br>
-    <small>{mode_info['description']}</small>
+    <b>{t('parallel.type')}:</b> {mode_info['type']}<br>
+    <small>{t(mode_info['description_key'])}</small>
     </div>
     """, unsafe_allow_html=True)
     
@@ -4071,7 +4087,7 @@ def render_distributed_config(training_config: dict | None = None, is_grpo: bool
     
     # Показываем итоговую конфигурацию запуска
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🚀 Конфигурация запуска")
+    st.sidebar.subheader(f"🚀 {t('parallel.mode')}")
     
     if num_gpus == 0:
         launch_info = "**Устройство:** CPU"
@@ -4084,7 +4100,7 @@ def render_distributed_config(training_config: dict | None = None, is_grpo: bool
 
     # Compute / precision (нужно и для GRPO, потому что training_config для GRPO пустой)
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🧠 Precision & Memory")
+    st.sidebar.subheader(f"🧠 {t('sidebar.precision_memory')}")
     
     # === Backend selector ===
     # Для GRPO backend выбирается в render_grpo_sidebar_config(), здесь не показываем
@@ -4270,7 +4286,7 @@ except (AttributeError, Exception):
 def live_metrics_fragment():
     """Fragment для живого обновления метрик без перезагрузки всей страницы."""
     if not st.session_state.current_run_id:
-        st.info("Выберите run для просмотра метрик")
+        st.info(t("status.select_run"))
         return
     
     run_id = st.session_state.current_run_id
@@ -4279,28 +4295,28 @@ def live_metrics_fragment():
     
     # Статус
     if process_alive:
-        st.success(f"🟢 Процесс запущен (Run: {run_id})")
+        st.success(f"🟢 {t('status.running')} (Run: {run_id})")
     else:
         if metrics and metrics.get("status") == "completed":
             duration = metrics.get("training_duration", "unknown")
-            st.success(f"✅ Тренировка завершена за {duration} (Run: {run_id})")
+            st.success(f"✅ {t('status.completed')} {duration} (Run: {run_id})")
             clear_active_run()  # Очищаем active_run.json при завершении
             _close_run_log_files(run_id)  # Закрываем файловые дескрипторы
         elif metrics and metrics.get("status") == "error":
-            st.error(f"❌ Ошибка (Run: {run_id})")
+            st.error(f"❌ {t('status.error')} (Run: {run_id})")
             clear_active_run()  # Очищаем active_run.json при ошибке
             _close_run_log_files(run_id)  # Закрываем файловые дескрипторы
         elif metrics and metrics.get("status") == "stopped":
-            st.warning(f"⏹️ Тренировка остановлена (Run: {run_id})")
+            st.warning(f"⏹️ {t('status.stopped')} (Run: {run_id})")
             clear_active_run()  # Очищаем active_run.json при остановке
             _close_run_log_files(run_id)  # Закрываем файловые дескрипторы
         else:
-            st.info(f"📋 Просмотр метрик (Run: {run_id})")
+            st.info(f"📋 {t('status.viewing_metrics')} (Run: {run_id})")
     
     if metrics:
         render_metrics_dashboard(metrics)
     else:
-        st.info("Метрики не найдены")
+        st.info(t("status.no_metrics"))
 
 
 def render_metrics_dashboard(metrics: dict):
@@ -4325,7 +4341,7 @@ def render_metrics_dashboard(metrics: dict):
         "saving_model": "💾",
     }.get(status, "⏳")
     
-    st.subheader(f"{status_emoji} Статус: {status.upper()}")
+    st.subheader(f"{status_emoji} {t('common.status')}: {status.upper()}")
     
     # Параметры модели из metrics.json (если есть) или из config
     model_params = None
@@ -4367,7 +4383,7 @@ def render_metrics_dashboard(metrics: dict):
         suffix = f"Step {current_step}/{total_steps}" if isinstance(total_steps, (int, float)) and total_steps else f"Step {current_step} (без лимита)"
         if planned_total is not None and int(planned_total) != int(total_steps):
             suffix = f"{suffix} (план: {planned_total})"
-        st.metric("Прогресс", f"{progress:.1f}%", suffix)
+        st.metric(t("status.progress"), f"{progress:.1f}%", suffix)
 
     # Дополнительный прогресс для GRPO: по датасету (сколько промптов прошло)
     if metrics.get("stage") == "grpo":
@@ -4482,9 +4498,9 @@ def render_metrics_dashboard(metrics: dict):
     
     with col5:
         if model_params:
-            st.metric("Параметры", format_params(model_params))
+            st.metric(t("model.params"), format_params(model_params))
         else:
-            st.metric("Параметры", "—")
+            st.metric(t("model.params"), "—")
 
     # Доп. пояснения: план vs факт, причина остановки, LR floor
     planned_total = metrics.get("planned_total_steps", None)
@@ -4501,7 +4517,7 @@ def render_metrics_dashboard(metrics: dict):
     with col6:
         eta = metrics.get("eta_seconds", 0)
         elapsed = metrics.get("elapsed_seconds", 0)
-        st.metric("Время", f"{format_time(elapsed)}", delta=f"Ост: {format_time(eta)}", delta_color="normal")
+        st.metric(t("status.time"), f"{format_time(elapsed)}", delta=f"{t('status.remaining')}: {format_time(eta)}", delta_color="normal")
     
     # Progress bar
     st.progress(min(progress / 100, 1.0))
@@ -4513,7 +4529,7 @@ def render_metrics_dashboard(metrics: dict):
     # Специальная секция для GRPO
     if metrics.get("stage") == "grpo":
         st.markdown("---")
-        st.subheader("🧠 GRPO Мониторинг")
+        st.subheader(f"🧠 {t('grpo.monitoring')}")
         
         # Метрики GRPO
         col_grpo1, col_grpo2, col_grpo3, col_grpo4 = st.columns(4)
@@ -4597,11 +4613,11 @@ def render_metrics_dashboard(metrics: dict):
                     )
                     st.plotly_chart(fig_loss, key=f"grpo_loss_chart_{rid}")
                 else:
-                    st.info("Ожидание данных о loss...")
+                    st.info(t("info.waiting_loss"))
         
         # Окошко с семплами
         st.markdown("---")
-        st.subheader("📝 Примеры генераций")
+        st.subheader(f"📝 {t('grpo.samples')}")
         
         # Загружаем семплы из файла если есть
         run_id = st.session_state.get("current_run_id")
@@ -4709,9 +4725,9 @@ def render_metrics_dashboard(metrics: dict):
                                     st.markdown(f"{reward_color} **Ответ {i+1}** (Reward: {reward:.4f})")
                                     st.code(completion[:500] + ("..." if len(completion) > 500 else ""), language=None)
                         else:
-                            st.info("Ожидание генераций...")
+                            st.info(t("info.waiting_generations"))
             else:
-                st.info("Семплы будут отображаться здесь после начала генераций. Проверьте файл `samples.jsonl` в директории run.")
+                st.info(t("info.samples_will_appear"))
         
         st.markdown("---")
     
@@ -4850,7 +4866,7 @@ def render_metrics_dashboard(metrics: dict):
     # GPU статистика
     gpu_stats = metrics.get("gpu_stats", [])
     if gpu_stats:
-        st.subheader("🖥️ Нагрузка GPU")
+        st.subheader(f"🖥️ {t('metrics.gpu_load')}")
         
         cols = st.columns(len(gpu_stats))
         for i, (col, gpu) in enumerate(zip(cols, gpu_stats)):
@@ -4870,8 +4886,8 @@ def render_metrics_dashboard(metrics: dict):
     
     # Error
     if metrics.get("error"):
-        st.error("❌ Произошла ошибка во время тренировки")
-        with st.expander("Подробности ошибки (Traceback)", expanded=True):
+        st.error(f"❌ {t('error.training')}")
+        with st.expander(f"{t('error.traceback')}", expanded=True):
             st.code(metrics['error'], language="python")
     
     # Логи процесса
@@ -4880,7 +4896,7 @@ def render_metrics_dashboard(metrics: dict):
         stderr_path = run_dir / "stderr.log"
         stdout_path = run_dir / "stdout.log"
         
-        with st.expander("📋 Логи процесса"):
+        with st.expander(f"📋 {t('training.logs')}"):
             col1, col2 = st.columns(2)
             
             with col1:
@@ -4951,10 +4967,10 @@ def download_hf_dataset(repo_id, subset, split, limit_type, limit_val, limit_byt
                 line = json.dumps(item, ensure_ascii=False) + "\n"
                 line_bytes = len(line.encode('utf-8'))
                 
-                # Проверка лимитов
-                if limit_type == "Строки (Количество)" and count >= limit_val:
+                # Check limits
+                if limit_type == t("data.limit_rows") and count >= limit_val:
                     break
-                if limit_type == "ГБ (Размер)" and (current_bytes + line_bytes) > limit_bytes:
+                if limit_type == t("data.limit_gb") and (current_bytes + line_bytes) > limit_bytes:
                     break
                     
                 f.write(line)
@@ -4964,11 +4980,11 @@ def download_hf_dataset(repo_id, subset, split, limit_type, limit_val, limit_byt
                 if count % 1000 == 0:
                     print(f"Downloaded {count} lines, {current_bytes / 1024**2:.2f} MB")
 
-        st.success(f"Готово! Сохранено {count} строк ({current_bytes / 1024**2:.2f} MB) в {save_path}")
+        st.success(f"{t('success.saved')} {count} rows ({current_bytes / 1024**2:.2f} MB) → {save_path}")
         return True
 
     except Exception as e:
-        st.error(f"Ошибка: {e}")
+        st.error(f"{t('error.generic')}: {e}")
         import traceback
         print(traceback.format_exc())
         return False
@@ -4980,13 +4996,13 @@ def render_data_manager(stage: str = "pretrain"):
     Args:
         stage: Текущий режим ('pretrain', 'sft', 'grpo', 'continual_pretrain')
     """
-    st.header("💾 Управление данными")
+    st.header(f"💾 {t('data.manager')}")
     
     col_upload, col_list = st.columns([1, 2])
     
     with col_upload:
         # Секция 1: Загрузка локальных файлов
-        with st.expander("📤 Загрузка локальных файлов", expanded=False):
+        with st.expander(f"📤 {t('data.upload_local')}", expanded=False):
             uploaded_files = st.file_uploader(
                 "Перетащите файлы сюда", 
                 type=["jsonl", "txt"],  # ВАЖНО: не включаем .json, т.к. это обычно массив, а не JSONL 
@@ -4994,7 +5010,7 @@ def render_data_manager(stage: str = "pretrain"):
             )
             
             if uploaded_files:
-                if st.button("📥 Сохранить файлы"):
+                if st.button(f"📥 {t('button.save_files')}"):
                     for uploaded_file in uploaded_files:
                         save_path = DATASET_DIR / uploaded_file.name
                         with open(save_path, "wb") as f:
@@ -5004,7 +5020,7 @@ def render_data_manager(stage: str = "pretrain"):
                     st.rerun()
 
         # Секция 2: Загрузка с HuggingFace
-        st.subheader("🤗 Скачать с HuggingFace")
+        st.subheader(f"🤗 {t('data.download_hf')}")
         
         # Разные пресеты для разных режимов
         if stage == "grpo":
@@ -5063,7 +5079,7 @@ def render_data_manager(stage: str = "pretrain"):
                 # Ручной ввод
                 "📝 Ввести вручную...": (None, None, None),
             }
-            st.caption("🟢 **Text corpora** для Pretrain / Continual Pretrain")
+            st.caption(f"🟢 **Text corpora** {t('data.for_pretrain')}")
         
         # Инициализация дефолтных значений (FineWeb-2 Russian)
         if "hf_repo_id_input" not in st.session_state:
@@ -5104,7 +5120,7 @@ def render_data_manager(stage: str = "pretrain"):
 
         # Селектор пресетов (по умолчанию FineWeb-2 Russian)
         st.selectbox(
-            "📚 Популярные датасеты",
+            f"📚 {t('data.popular_datasets')}",
             options=list(presets.keys()),
             index=0,  # FineWeb-2 Russian первый
             key="dataset_preset_selector",
@@ -5115,7 +5131,7 @@ def render_data_manager(stage: str = "pretrain"):
         repo_id = st.text_input("Репозиторий (ID)", key="hf_repo_id_input")
         
         # Кнопка проверки репозитория
-        if st.button("🔍 Проверить репозиторий"):
+        if st.button(f"🔍 {t('button.check_repo')}"):
             try:
                 with st.spinner(f"Анализируем {repo_id}..."):
                     # 1. Получаем конфиги
@@ -5156,9 +5172,9 @@ def render_data_manager(stage: str = "pretrain"):
                     if "hf_subset_select" in st.session_state:
                         del st.session_state.hf_subset_select
                     
-                    st.success(f"✅ Найдено {len(configs)} конфигураций, splits: {splits}")
+                    st.success(f"✅ {t('success.found_configs')} {len(configs)}, splits: {splits}")
             except Exception as e:
-                st.error(f"Не удалось получить информацию: {e}")
+                st.error(f"{t('error.fetch_info')}: {e}")
 
         # Работаем с кэшированной информацией
         repo_info = st.session_state.ds_repo_info.get(repo_id, {})
@@ -5184,20 +5200,20 @@ def render_data_manager(stage: str = "pretrain"):
             split = st.text_input("Split", st.session_state.hf_split_default, key="hf_split_input")
 
         # --- УМНЫЕ ФИЛЬТРЫ ---
-        with st.expander("🛠️ Фильтры и Лимиты", expanded=True):
+        with st.expander(f"🛠️ {t('data.filters_limits')}", expanded=True):
             # Лимиты (всегда доступны)
             col_lim1, col_lim2 = st.columns(2)
             with col_lim1:
-                limit_type = st.radio("Тип лимита", ["ГБ (Размер)", "Строки (Количество)"], key="limit_type")
+                limit_type = st.radio(t("data.limit_type"), [t("data.limit_gb"), t("data.limit_rows")], key="limit_type")
             
             with col_lim2:
                 limit_val = 0
                 limit_bytes = 0
                 
-                if limit_type == "Строки (Количество)":
-                    limit_val = st.number_input("Кол-во строк", value=100000, step=10000, key="limit_val")
+                if limit_type == t("data.limit_rows"):
+                    limit_val = st.number_input(t("data.row_count"), value=100000, step=10000, key="limit_val")
                 else:
-                    limit_gb = st.number_input("Размер (ГБ)", value=2.0, step=0.5, min_value=0.1, key="limit_gb")
+                    limit_gb = st.number_input(t("data.size_gb"), value=2.0, step=0.5, min_value=0.1, key="limit_gb")
                     limit_bytes = int(limit_gb * 1024**3)
             
             st.divider()
@@ -5206,7 +5222,7 @@ def render_data_manager(stage: str = "pretrain"):
             active_filters = {}
             
             if features:
-                st.caption("🔍 Настройка фильтров по колонкам:")
+                st.caption(f"🔍 {t('data.column_filters')}:")
                 
                 # Получаем список колонок и их типов
                 # features это словарь {col_name: feature_info}
@@ -5229,7 +5245,7 @@ def render_data_manager(stage: str = "pretrain"):
                 with col_f1:
                     if float_cols:
                         st.markdown("**Фильтр по значению (float)**")
-                        selected_float_col = st.selectbox("Выберите колонку", ["(нет)"] + float_cols, key="sel_float_col")
+                        selected_float_col = st.selectbox(t("common.select_column"), [f"({t('common.none')})"] + float_cols, key="sel_float_col")
                         if selected_float_col != "(нет)":
                             min_val = st.slider(f"Мин. значение {selected_float_col}", 0.0, 1.0, 0.0, key="val_float_col")
                             active_filters["score_col"] = selected_float_col
@@ -5240,7 +5256,7 @@ def render_data_manager(stage: str = "pretrain"):
                 with col_f2:
                     if string_cols:
                         st.markdown("**Фильтр по тексту (contains)**")
-                        selected_str_col = st.selectbox("Выберите колонку", ["(нет)"] + string_cols, key="sel_str_col")
+                        selected_str_col = st.selectbox(t("common.select_column"), [f"({t('common.none')})"] + string_cols, key="sel_str_col")
                         if selected_str_col != "(нет)":
                             target_str = st.text_input(f"Текст должен содержать:", key="val_str_col")
                             if target_str:
@@ -5250,7 +5266,7 @@ def render_data_manager(stage: str = "pretrain"):
                         st.caption("Текстовые колонки не найдены")
 
             else:
-                st.info("⚠️ Структура датасета не загружена. Доступны только лимиты по объему.")
+                st.info(t("info.dataset_structure_not_loaded"))
 
 
         # Формируем дефолтное имя файла из repo_id
@@ -5285,7 +5301,7 @@ def render_data_manager(stage: str = "pretrain"):
             st.session_state[widget_key] = computed_filename
         
         save_filename = st.text_input(
-            "Имя файла для сохранения", 
+            t("data.filename_save"), 
             value=st.session_state.get(widget_key, computed_filename), 
             key=widget_key,
             help="Автоматически формируется из названия репозитория и subset. Можно изменить вручную."
@@ -5325,10 +5341,10 @@ def render_data_manager(stage: str = "pretrain"):
             
             download_hf_dataset(r_id, sub, spl, l_type, l_val, l_bytes, s_path, filters=filters_to_pass)
 
-        st.button("Скачать и обработать", on_click=on_download_click, args=(active_filters,))
+        st.button(t("button.download_process"), on_click=on_download_click, args=(active_filters,))
     
     with col_list:
-        st.subheader("Доступные датасеты")
+        st.subheader(t("data.available_datasets"))
         
         datasets = []
         if DATASET_DIR.exists():
@@ -5352,7 +5368,7 @@ def render_data_manager(stage: str = "pretrain"):
                 })
         
         if not datasets:
-            st.info("Нет загруженных датасетов. Загрузите файлы слева.")
+            st.info(t("info.no_datasets"))
         else:
             # Отображаем список
             for ds in datasets:
@@ -5371,17 +5387,17 @@ def render_data_manager(stage: str = "pretrain"):
                         if head:
                             st.code("\n".join(head), language="json" if "JSON" in ds['type'] else "text")
                         else:
-                            st.info("Файл пуст")
+                                    st.info(t("error.file_empty"))
                         
                         col_del, col_info = st.columns([1, 4])
                         with col_del:
-                            if st.button("🗑️ Удалить", key=f"del_{ds['name']}"):
+                            if st.button(f"🗑️ {t('button.delete')}", key=f"del_{ds['name']}"):
                                 ds['path'].unlink()
                                 st.toast(f"Файл {ds['name']} удалён", icon="🗑️")
                                 time.sleep(1)
                                 st.rerun()
                     except Exception as e:
-                        st.error(f"Ошибка чтения файла: {e}")
+                        st.error(t("error.file_read", error=str(e)))
 
 
 def download_hf_model(repo_id: str, save_name: str, revision: str = "main"):
@@ -5394,7 +5410,7 @@ def download_hf_model(repo_id: str, save_name: str, revision: str = "main"):
     
     # Проверяем, не существует ли уже
     if save_path.exists():
-        st.warning(f"⚠️ Модель `{save_name}` уже существует!")
+        st.warning(f"⚠️ {t('warning.model_exists', name=save_name)}")
         return False
     
     try:
@@ -5421,7 +5437,7 @@ def download_hf_model(repo_id: str, save_name: str, revision: str = "main"):
             # Проверяем, что скачалось
             config_file = save_path / "config.json"
             if not config_file.exists():
-                st.error("❌ Не найден config.json в скачанной модели")
+                st.error(f"❌ {t('error.no_config')}")
                 return False
             
             # Читаем конфиг для отображения информации
@@ -5446,7 +5462,7 @@ def download_hf_model(repo_id: str, save_name: str, revision: str = "main"):
             return True
             
     except Exception as e:
-        st.error(f"❌ Ошибка скачивания: {e}")
+        st.error(f"❌ {t('error.download')}: {e}")
         import traceback
         print(traceback.format_exc())
         # Удаляем частично скачанное
@@ -5458,12 +5474,12 @@ def download_hf_model(repo_id: str, save_name: str, revision: str = "main"):
 
 def render_model_manager():
     """Вкладка управления моделями (скачивание с HuggingFace)."""
-    st.header("🤖 Управление моделями")
+    st.header(f"🤖 {t('models.manager')}")
     
     col_download, col_list = st.columns([1, 2])
     
     with col_download:
-        st.subheader("🤗 Скачать с HuggingFace")
+        st.subheader(f"🤗 {t('data.download_hf')}")
         
         # Пресеты популярных небольших моделей для continual pretraining / SFT
         model_presets = {
@@ -5497,7 +5513,7 @@ def render_model_manager():
                 st.session_state.model_save_name = preset_data[1]
         
         st.selectbox(
-            "📚 Популярные модели",
+            f"📚 {t('models.popular')}",
             options=list(model_presets.keys()),
             index=0,
             key="model_preset_selector",
@@ -5505,20 +5521,20 @@ def render_model_manager():
             help="Выберите модель — repo_id заполнится автоматически"
         )
         
-        repo_id = st.text_input("Репозиторий (ID)", key="model_repo_id")
-        save_name = st.text_input("Название для сохранения", key="model_save_name", 
+        repo_id = st.text_input(t("models.repo_id"), key="model_repo_id")
+        save_name = st.text_input(t("models.save_name"), key="model_save_name", 
                                    help="Папка в models/, куда будет сохранена модель")
         
-        # Информация о модели
-        st.markdown("""
+        # Model info
+        st.markdown(f"""
 <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
             padding: 12px; border-radius: 8px; margin: 10px 0;
             border: 1px solid #0f3460; color: #e8e8e8;">
-<b style="color: #4fc3f7;">💡 Рекомендации:</b><br>
-• <b style="color: #81d4fa;">SmolLM2</b> — современные компактные модели от HuggingFace<br>
-• <b style="color: #81d4fa;">Pythia</b> — отличные для экспериментов, разные размеры<br>
-• <b style="color: #81d4fa;">TinyLlama</b> — популярная, хорошо обучена на 3T токенов<br>
-• <b style="color: #81d4fa;">Qwen2.5</b> — сильные модели от Alibaba
+<b style="color: #4fc3f7;">💡 {t('models.recommendations')}:</b><br>
+• <b style="color: #81d4fa;">SmolLM2</b> — {t('models.rec_smollm2')}<br>
+• <b style="color: #81d4fa;">Pythia</b> — {t('models.rec_pythia')}<br>
+• <b style="color: #81d4fa;">TinyLlama</b> — {t('models.rec_tinyllama')}<br>
+• <b style="color: #81d4fa;">Qwen2.5</b> — {t('models.rec_qwen')}
 </div>
 """, unsafe_allow_html=True)
         
@@ -5530,18 +5546,18 @@ def render_model_manager():
             "124m": "~500 MB", "355m": "~1.5 GB", "125m": "~500 MB",
         }
         
-        estimated_size = "Неизвестно"
+        estimated_size = t("common.unknown")
         repo_lower = repo_id.lower()
         for size_key, size_val in size_estimates.items():
             if size_key in repo_lower:
                 estimated_size = size_val
                 break
         
-        st.caption(f"📦 Примерный размер: **{estimated_size}**")
+        st.caption(f"📦 {t('models.estimated_size')}: **{estimated_size}**")
         
-        if st.button("⬇️ Скачать модель", type="primary"):
+        if st.button(f"⬇️ {t('button.download_model')}", type="primary"):
             if not repo_id or not save_name:
-                st.error("Укажите repo_id и название!")
+                st.error(t("error.missing_repo_id"))
             else:
                 success = download_hf_model(repo_id, save_name)
                 if success:
@@ -5549,7 +5565,7 @@ def render_model_manager():
                     st.rerun()
     
     with col_list:
-        st.subheader("📁 Скачанные модели")
+        st.subheader(f"📁 {t('model.downloaded')}")
         
         models = []
         if MODELS_DIR.exists():
@@ -5589,7 +5605,7 @@ def render_model_manager():
                             })
         
         if not models:
-            st.info("Нет скачанных моделей. Скачайте модель слева для Continual Pretraining или SFT.")
+            st.info(t("info.no_downloaded_models"))
         else:
             for m in sorted(models, key=lambda x: x["name"]):
                 with st.expander(f"🤖 {m['name']} ({m['size_gb']:.2f} GB)"):
@@ -5605,28 +5621,22 @@ def render_model_manager():
                         st.caption(f"📂 Путь: `{m['path']}`")
                         
                         # Кнопка использования
-                        if st.button("🚀 Использовать", key=f"use_{m['name']}", 
+                        if st.button(f"🚀 {t('button.use')}", key=f"use_{m['name']}", 
                                      help="Выбрать эту модель для Continual Pretrain / SFT"):
                             st.session_state.selected_base_model = str(m['path'])
                             st.toast(f"Модель {m['name']} выбрана! Перейдите в Запуск и выберите Continual Pretrain или SFT.", icon="✅")
                         
                         # Кнопка удаления
-                        if st.button("🗑️ Удалить", key=f"del_model_{m['name']}"):
+                        if st.button(f"🗑️ {t('button.delete')}", key=f"del_model_{m['name']}"):
                             import shutil
                             shutil.rmtree(m['path'])
-                            st.toast(f"Модель {m['name']} удалена", icon="🗑️")
+                            st.toast(f"{t('models.deleted')}: {m['name']}", icon="🗑️")
                             time.sleep(1)
                             st.rerun()
         
-        # Подсказка
+        # Tip
         st.markdown("---")
-        st.info("""
-💡 **Как использовать скачанную модель:**
-1. Нажмите **🚀 Использовать** на нужной модели
-2. Перейдите на вкладку **🚀 Запуск**
-3. В сайдбаре выберите режим **Continual Pretrain** или **SFT**
-4. Модель автоматически подставится как базовая
-""")
+        st.info(t("models.usage_tip"))
 
 
 def _bytes_to_gb(x: int) -> float:
@@ -5940,26 +5950,31 @@ def render_quick_summary(model_config: dict, dataset_config: dict, distributed_c
     check_icon = "✅" if all_selected else "⚠️"
     status_color = "#22c55e" if all_selected else "#f59e0b"
     
+    # Warning messages for missing items
+    warn_model = f"⚠️ {t('warning.select_model')}"
+    warn_data = f"⚠️ {t('warning.select_data')}"
+    warn_mode = f"⚠️ {t('warning.select_mode')}"
+    
     st.markdown(f"""
     <div class="quick-summary">
         <div class="quick-summary-header">
-            Конфигурация тренировки
+            {t('launch.config_title')}
         </div>
         <div class="quick-summary-grid">
             <div class="quick-summary-item">
-                <div class="quick-summary-label">Модель</div>
+                <div class="quick-summary-label">{t('launch.model')}</div>
                 <div class="quick-summary-value">{model_display}</div>
-                {"<div class='quick-summary-check'>✅</div>" if has_model else "<div class='quick-summary-warning'>⚠️ Выберите модель</div>"}
+                {"<div class='quick-summary-check'>✅</div>" if has_model else f"<div class='quick-summary-warning'>{warn_model}</div>"}
             </div>
             <div class="quick-summary-item">
-                <div class="quick-summary-label">Данные</div>
+                <div class="quick-summary-label">{t('launch.data')}</div>
                 <div class="quick-summary-value">{data_display}</div>
-                {"<div class='quick-summary-check'>✅</div>" if has_data else "<div class='quick-summary-warning'>⚠️ Выберите датасет</div>"}
+                {"<div class='quick-summary-check'>✅</div>" if has_data else f"<div class='quick-summary-warning'>{warn_data}</div>"}
             </div>
             <div class="quick-summary-item">
-                <div class="quick-summary-label">Режим тренировки</div>
+                <div class="quick-summary-label">{t('launch.training_mode')}</div>
                 <div class="quick-summary-value">{training_mode_display}</div>
-                {"<div class='quick-summary-check'>✅</div>" if has_mode else "<div class='quick-summary-warning'>⚠️ Выберите режим</div>"}
+                {"<div class='quick-summary-check'>✅</div>" if has_mode else f"<div class='quick-summary-warning'>{warn_mode}</div>"}
             </div>
         </div>
     </div>
@@ -5970,17 +5985,17 @@ def render_quick_summary(model_config: dict, dataset_config: dict, distributed_c
 
 def render_model_preview(config: dict, distributed_config: dict = None):
     """Превью архитектуры модели и настроек параллелизма."""
-    st.subheader("📐 Архитектура модели")
+    st.subheader(f"📐 {t('model.architecture')}")
     
     stage = config.get("stage", "pretrain")
     if stage == "sft":
-        st.info(f"🔄 **Режим SFT** (Fine-Tuning)\nБазовая модель: `{Path(config.get('base_model_path') or 'Unknown').name}`")
+        st.info(f"🔄 **{t('mode.sft')}**\n{t('model.base')}: `{Path(config.get('base_model_path') or 'Unknown').name}`")
     elif stage == "continual_pretrain":
-        st.info(f"🔄 **Режим Continual Pretraining** (Продолжение)\nБазовая модель: `{Path(config.get('base_model_path') or 'Unknown').name}`")
+        st.info(f"🔄 **{t('mode.continual_pretrain')}**\n{t('model.base')}: `{Path(config.get('base_model_path') or 'Unknown').name}`")
     elif stage == "grpo":
-        st.info(f"🧠 **Режим GRPO** (RL для Reasoning)\nБазовая модель: `{Path(config.get('base_model_path') or 'Unknown').name}`")
+        st.info(f"🧠 **{t('mode.grpo')}**\n{t('model.base')}: `{Path(config.get('base_model_path') or 'Unknown').name}`")
     else:
-        st.success("🏗️ **Режим Pretraining** (С нуля)")
+        st.success(f"🏗️ **{t('mode.pretrain')}**")
 
     # Рассчитываем память
     # Нам нужен batch_size из конфига (это батч на девайс)
@@ -6018,7 +6033,7 @@ def render_model_preview(config: dict, distributed_config: dict = None):
         st.metric("Head Dim", config["hidden_size"] // config["n_heads"])
     
     with col3:
-        st.metric("Параметры", format_params(mem_info["params"]))
+        st.metric(t("model.params"), format_params(mem_info["params"]))
         
         # Цвет метрики в зависимости от размера (примерно для 24GB карты)
         val = mem_info["total_gb"]
@@ -6065,7 +6080,7 @@ def render_model_preview(config: dict, distributed_config: dict = None):
                 st.json(mem_info["detail"])
 
         if mem_info["act_gb"] > mem_info["model_gb"] * 2:
-            st.warning("⚠️ Активации занимают много памяти! Включите Gradient Checkpointing или уменьшите Batch Size.")
+            st.warning(f"⚠️ {t('warning.high_memory')}")
 
     
     # Визуальная схема архитектуры
@@ -6089,7 +6104,7 @@ def render_model_preview(config: dict, distributed_config: dict = None):
     # Информация о параллелизме
 
     if distributed_config:
-        st.subheader("⚡ Параллелизм")
+        st.subheader(f"⚡ {t('parallel.title')}")
         
         mode = distributed_config.get("distributed_mode", "default")
         mode_info = PARALLEL_TYPES.get(mode, PARALLEL_TYPES["default"])
@@ -6098,16 +6113,16 @@ def render_model_preview(config: dict, distributed_config: dict = None):
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            st.metric("Режим", mode_info["name"])
+            st.metric(t("parallel.mode"), mode_info["name"])
         
         with col2:
-            st.metric("Тип", mode_info["type"])
+            st.metric(t("parallel.type"), mode_info["type"])
         
         with col3:
             if num_gpus > 0:
-                st.metric("GPU", f"{num_gpus} шт.")
+                st.metric("GPU", f"{num_gpus}")
             else:
-                st.metric("Устройство", "CPU")
+                st.metric(t("parallel.device"), "CPU")
         
         # Схема параллелизма
         if mode == "default":
@@ -6274,7 +6289,7 @@ def export_model_to_hf(model, tokenizer, source_path: str):
         
         return str(export_dir)
     except Exception as e:
-        st.error(f"Ошибка экспорта: {e}")
+        st.error(f"{t('error.export')}: {e}")
         return None
 
 
@@ -6399,7 +6414,15 @@ def main():
         full_config["tokenizer_path"] = model_config["base_model_path"]
     
     # Main content
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["🚀 Запуск", "📊 Мониторинг", "💬 Чат", "📜 История", "💾 Данные", "🤖 Модели", "📚 Учебник"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        f"🚀 {t('tabs.launch')}", 
+        f"📊 {t('tabs.monitoring')}", 
+        f"💬 {t('tabs.chat')}", 
+        f"📜 {t('tabs.history')}",
+        f"💾 {t('tabs.data')}", 
+        f"🤖 {t('tabs.models')}", 
+        f"📚 {t('tabs.docs')}"
+    ])
     
     with tab1:
         col1, col2 = st.columns([2, 1])
@@ -6414,7 +6437,7 @@ def main():
             # SFT: Chat Template модели (отдельный блок ПЕРЕД настройкой данных)
             if model_config.get("stage") == "sft" and model_config.get("base_model_path"):
                 st.markdown("---")
-                st.markdown("### 📝 Chat Template модели")
+                st.markdown(f"### 📝 {t('sft.chat_template')}")
                 
                 # Загружаем chat_template из базовой модели
                 base_model_path = model_config.get("base_model_path")
@@ -6429,14 +6452,14 @@ def main():
                         if hasattr(tok, 'chat_template') and tok.chat_template:
                             model_chat_template = tok.chat_template
                 except Exception as e:
-                    st.warning(f"Не удалось загрузить токенизатор: {e}")
+                    st.warning(f"{t('warning.tokenizer_load_failed')}: {e}")
                     st.session_state.sft_tokenizer = None
                 
                 # Показываем статус
                 if model_chat_template:
-                    st.success(f"✅ Chat template загружен из модели `{Path(base_model_path).name}`")
+                    st.success(f"✅ {t('success.chat_template_loaded')} `{Path(base_model_path).name}`")
                 else:
-                    st.info("ℹ️ У базовой модели нет chat_template. Будет сгенерирован автоматически при сохранении.")
+                    st.info(t("info.no_chat_template"))
                 
                 # Инициализируем session_state если нужно
                 if "sft_user_chat_template" not in st.session_state:
@@ -6458,7 +6481,7 @@ def main():
                 # Кнопки управления
                 col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
                 with col_btn1:
-                    if st.button("✨ Qwen-style", key="sft_qwen_template", help="Генерировать Qwen-style chat template"):
+                    if st.button("✨ Qwen-style", key="sft_qwen_template", help=t("help.qwen_template")):
                         # Qwen-style chat template (упрощённый, без tools)
                         qwen_template = """{%- if messages[0]['role'] == 'system' -%}
 {{ '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}
@@ -6478,11 +6501,11 @@ def main():
                         st.session_state.sft_user_chat_template = qwen_template
                         st.rerun()
                 with col_btn2:
-                    if model_chat_template and st.button("↩️ Из модели", key="sft_restore_template"):
+                    if model_chat_template and st.button(f"↩️ {t('button.from_model')}", key="sft_restore_template"):
                         st.session_state.sft_user_chat_template = model_chat_template
                         st.rerun()
                 with col_btn3:
-                    if st.button("🗑️ Очистить", key="sft_clear_template"):
+                    if st.button(f"🗑️ {t('button.clear')}", key="sft_clear_template"):
                         st.session_state.sft_user_chat_template = ""
                         st.rerun()
                 with col_btn4:
@@ -6504,27 +6527,27 @@ def main():
                 grpo_main_cfg = render_grpo_main_config(dataset_config.get("data_path"))
                 full_config.update(grpo_main_cfg)
             
-            st.subheader("📋 Конфигурация")
+            st.subheader(f"📋 {t('common.configuration')}")
             st.json(full_config)
         
         with col2:
-            st.subheader("🎮 Управление")
+            st.subheader(f"🎮 {t('common.control')}")
             
             if st.session_state.training_active:
-                if st.button("⏹️ Остановить", type="primary"):
+                if st.button(f"⏹️ {t('button.stop_training')}", type="primary"):
                     with st.spinner("Останавливаем тренировку..."):
                         stopped = stop_training()
                     if stopped:
-                        st.success("✅ Тренировка остановлена")
+                        st.success(f"✅ {t('status.stopped')}")
                     else:
-                        st.warning("⚠️ Не удалось остановить (возможно уже завершена)")
+                        st.warning(f"⚠️ {t('warning.stop_failed')}")
                     time.sleep(1)
                     st.rerun()
             else:
                 # Для GRPO отдельная кнопка и запуск
                 if model_config.get("stage") == "grpo":
                     button_disabled = not all_ready
-                    if st.button("🧠 Начать GRPO обучение", type="primary", disabled=button_disabled):
+                    if st.button(f"🧠 {t('button.start_grpo')}", type="primary", disabled=button_disabled):
                         with st.spinner("Запуск GRPO..."):
                             run_id, process = start_grpo_training(full_config)
                             st.session_state.current_run_id = run_id
@@ -6538,7 +6561,7 @@ def main():
                         st.caption("⚠️ Выберите модель, данные и режим тренировки для запуска")
                 else:
                     button_disabled = not all_ready
-                    if st.button("▶️ Начать тренировку", type="primary", disabled=button_disabled):
+                    if st.button(f"▶️ {t('button.start_training')}", type="primary", disabled=button_disabled):
                         with st.spinner("Запуск..."):
                             run_id, process = start_training(full_config)
                             st.session_state.current_run_id = run_id
@@ -6557,7 +6580,7 @@ def main():
         live_metrics_fragment()
     
     with tab4:
-        st.header("📜 История запусков")
+        st.header(f"📜 {t('history.title')}")
         st.markdown("---")
         
         # Фильтруем только директории (игнорируем файлы типа active_run.json)
@@ -6632,9 +6655,9 @@ def main():
                             st.metric("Final Loss", f"{metrics.get('current_loss', 0):.4f}")
                         with col3:
                             if model_params:
-                                st.metric("Параметры", format_params(model_params))
+                                st.metric(t("model.params"), format_params(model_params))
                             else:
-                                st.metric("Параметры", "—")
+                                st.metric(t("model.params"), "—")
                         with col4:
                             st.metric("Status", status)
                         with col5:
@@ -6666,7 +6689,7 @@ def main():
                         # Кнопки
                         btn_col1, btn_col2, btn_col3 = st.columns(3)
                         with btn_col1:
-                            if st.button(f"📊 Метрики", key=f"metrics_{run_id}"):
+                            if st.button(f"📊 {t('metrics.title')}", key=f"metrics_{run_id}"):
                                 st.session_state.current_run_id = run_id
                                 st.toast(f"✅ Выбран run: {run_id}. Перейдите на вкладку 📊 Мониторинг", icon="📊")
                         with btn_col2:
@@ -6679,7 +6702,7 @@ def main():
                                     model_dir = PROJECT_ROOT / run_config.get("output_dir", "")
                                     final_model = model_dir / "final_model"
                                     if final_model.exists():
-                                        if st.button("💬 Чат", key=f"chat_run_{run_id}"):
+                                        if st.button(f"💬 {t('tabs.chat')}", key=f"chat_run_{run_id}"):
                                             st.session_state.selected_chat_model = str(final_model)
                                             st.toast("✅ Модель выбрана! Перейдите на вкладку 💬 Чат", icon="💬")
                                 except:
@@ -6699,7 +6722,7 @@ def main():
                                     valid_ckpt = str(abs_ckpt_path)
 
                             if valid_ckpt:
-                                if st.button("▶️ Продолжить", key=f"continue_{run_id}", help="Продолжить обучение с последнего чекпоинта"):
+                                if st.button(f"▶️ {t('button.continue_training')}", key=f"continue_{run_id}", help=t("help.continue_training")):
                                     try:
                                         # 2. Загружаем конфиг старого запуска
                                         config_path = run_dir / "config.json"
@@ -6734,7 +6757,7 @@ def main():
                                         st.error(f"Не удалось возобновить: {e}")
                             elif checkpoints:
                                 # Чекпоинты были в метриках, но удалены с диска
-                                st.button("⚠️ Файлы удалены", key=f"gone_{run_id}", disabled=True, help=f"Чекпоинт {checkpoints[-1]['path']} не найден на диске")
+                                st.button(f"⚠️ {t('status.files_deleted')}", key=f"gone_{run_id}", disabled=True, help=t("help.checkpoint_not_found"))
                         
                         # Показываем что выбрано
                         if st.session_state.current_run_id == run_id:
@@ -6756,7 +6779,7 @@ def main():
         render_docs()
     
     with tab3:
-        st.header("💬 Чат с моделью")
+        st.header(f"💬 {t('chat.title')}")
         st.markdown("---")
         
         # Список моделей обновляется при каждом заходе на вкладку Чат
@@ -6778,7 +6801,7 @@ def main():
                             break
                 
                 selected_model_name = st.selectbox(
-                    "Выберите модель или чекпоинт",
+                    t("chat.select_model"),
                     options=model_options,
                     index=default_idx,
                     help="Выберите обученную модель для чата"
@@ -6801,7 +6824,7 @@ def main():
                 with info_cols[0]:
                     # Тип модели
                     type_labels = {
-                        "final": "✅ Финальная модель",
+                        "final": f"✅ {t('chat.final_model')}",
                         "checkpoint": "📦 Чекпоинт",
                         "lora": "🔧 LoRA адаптер",
                         "hf": "🤗 HuggingFace"
@@ -6816,12 +6839,12 @@ def main():
                         "base": "Base Model"
                     }
                     if training_type != "unknown":
-                        st.caption(f"Тренировка: {training_labels.get(training_type, training_type)}")
+                        st.caption(f"{t('chat.training_type')}: {training_labels.get(training_type, training_type)}")
                 
                 with info_cols[1]:
                     # Технические характеристики
                     if model_info.get("max_context"):
-                        st.metric("Контекст", f"{model_info['max_context']:,}")
+                        st.metric(t("model.context"), f"{model_info['max_context']:,}")
                     if is_lora and model_info.get("lora_r"):
                         st.caption(f"LoRA r={model_info['lora_r']}")
                 
@@ -6832,7 +6855,7 @@ def main():
                 st.caption(f"📁 {selected_model['path']}")
             
             # Параметры генерации
-            with st.expander("⚙️ Параметры генерации", expanded=True):
+            with st.expander(f"⚙️ {t('chat.generation_params')}", expanded=True):
                 # Определяем максимальный контекст из конфига модели
                 max_context = model_info.get("max_context") or 32168
                 default_max_tokens = min(256, max_context // 4)
@@ -6841,7 +6864,7 @@ def main():
                 gen_col1, gen_col2 = st.columns(2)
                 with gen_col1:
                     max_tokens = st.slider(
-                        "Max New Tokens", 
+                        t("chat.max_tokens"), 
                         min_value=16, 
                         max_value=max_tokens_limit, 
                         value=default_max_tokens,
@@ -6866,15 +6889,15 @@ def main():
                     # vLLM первым если доступен (быстрее)
                     backend_options = []
                     if vllm_available:
-                        backend_options.append("vLLM (быстрее)")
+                        backend_options.append(f"vLLM ({t('chat.faster')})")
                     backend_options.append("Transformers")
                     
                     if "chat_inference_backend" not in st.session_state:
                         # По умолчанию vLLM если доступен
-                        st.session_state.chat_inference_backend = "vLLM (быстрее)" if vllm_available else "Transformers"
+                        st.session_state.chat_inference_backend = f"vLLM ({t('chat.faster')})" if vllm_available else "Transformers"
                     
                     inference_backend = st.selectbox(
-                        "Inference Backend",
+                        t("chat.inference_backend"),
                         options=backend_options,
                         index=backend_options.index(st.session_state.chat_inference_backend) if st.session_state.chat_inference_backend in backend_options else 0,
                         help="vLLM: быстрее (PagedAttention), но требует больше VRAM",
@@ -6895,31 +6918,31 @@ def main():
                     model_loaded = st.session_state.get("chat_backend") is not None
                     
                     if model_loaded and has_template:
-                        # Оба режима доступны
+                        # Both modes available
                         prompt_mode_label = st.selectbox(
-                            "Режим",
+                            t("chat.mode"),
                             options=["Chat (template)", "Completion"],
                             index=0 if st.session_state.chat_prompt_mode == "chat" else 1,
-                            help="Chat: использует chat_template модели для форматирования диалога",
+                            help=t("help.chat_mode"),
                             key="chat_prompt_mode_select",
                         )
                         prompt_mode = "chat" if "Chat" in prompt_mode_label else "completion"
                     elif model_loaded and not has_template:
-                        # Только Completion, Chat недоступен
+                        # Only Completion, Chat unavailable
                         st.selectbox(
-                            "Режим",
-                            options=["Completion (no chat_template)"],
+                            t("chat.mode"),
+                            options=[f"Completion ({t('chat.no_template')})"],
                             index=0,
                             disabled=True,
-                            help="У модели нет chat_template - только режим Completion",
+                            help=t("help.no_chat_template"),
                             key="chat_prompt_mode_select",
                         )
                         prompt_mode = "completion"
                     else:
-                        # Модель не загружена - показываем placeholder
+                        # Model not loaded - show placeholder
                         st.selectbox(
-                            "Режим",
-                            options=["Загрузите модель..."],
+                            t("chat.mode"),
+                            options=[t("chat.load_model_prompt")],
                             index=0,
                             disabled=True,
                             key="chat_prompt_mode_select",
@@ -6943,7 +6966,7 @@ def main():
             
             # Кнопка загрузки модели
             if st.session_state.chat_model_path != selected_model["path"]:
-                if st.button("🔄 Загрузить модель", type="primary"):
+                if st.button(f"🔄 {t('button.load_model')}", type="primary"):
                     with st.spinner("Загружаем модель..."):
                         try:
                             from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -7254,7 +7277,7 @@ def main():
                                     st.rerun()
 
                 # --- НАСТРОЙКИ СИСТЕМНОГО ПРОМПТА ---
-                with st.expander("💬 Системный промпт", expanded=False):
+                with st.expander(f"💬 {t('chat.system_prompt')}", expanded=False):
                     # Предустановленные промпты
                     preset_prompts = {
                         "Нет": "",

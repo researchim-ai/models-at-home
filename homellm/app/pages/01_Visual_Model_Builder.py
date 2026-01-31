@@ -13,6 +13,14 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from homellm.models.blueprint import Blueprint
+
+# Internationalization (i18n)
+try:
+    from homellm.i18n import t
+except ImportError:
+    # Fallback for direct run
+    def t(key, **kwargs):
+        return key
 from homellm.models.blocks import BLOCK_REGISTRY
 
 def _find_project_root(start: Path) -> Path:
@@ -1003,12 +1011,12 @@ def main():
     st.set_page_config(page_title="Visual Model Builder", page_icon="🧪", layout="wide")
     
     st.title("🧪 Visual Model Builder")
-    st.caption("Редактор архитектур моделей")
+    st.caption(t("visual_builder.subtitle"))
 
     components.html(DRAWFLOW_HTML, height=1100, scrolling=False)
 
     st.divider()
-    st.caption("🚀 Model Builder поддерживает стандартные блоки PyTorch и пользовательские операции.")
+    st.caption(t("visual_builder.footer"))
 
 if __name__ == "__main__":
     main()
