@@ -13,7 +13,7 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Callable, Union
+from typing import Optional, List, Dict, Any, Callable, Union, Tuple
 from datetime import datetime
 
 import torch
@@ -30,9 +30,9 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
-from .config import GRPOConfig, RLAlgorithm
+from .legacy_config import GRPOConfig, RLAlgorithm
 from .experience import Experience, ReplayBuffer, join_experience_batch
-from .loss import GRPOLoss, LigerFusedGRPOLoss, compute_advantages, compute_entropy, create_loss_function
+from .loss import GRPOLoss, SDPOLoss, LigerFusedGRPOLoss, compute_advantages, compute_entropy, create_loss_function
 from .rollout import (
     generate_rollouts,
     generate_rollouts_vllm,
@@ -337,10 +337,12 @@ class GRPOTrainer:
 
     def _create_loss_function(self) -> None:
         """
-        Создаёт loss функцию.
+        Создаёт loss функцию в зависимости от алгоритма.
         
-        Если liger_fused_grpo=True и Liger доступен — создаёт LigerFusedGRPOLoss.
-        Иначе — стандартный GRPOLoss.
+        Поддерживаемые алгоритмы:
+        - SDPO: SDPOLoss (GRPO + self-distillation)
+        - GRPO/DrGRPO/DAPO с Liger: LigerFusedGRPOLoss
+        - GRPO/DrGRPO/DAPO без Liger: GRPOLoss
         
         ВАЖНО: Вызывается ПОСЛЕ accelerator.prepare() потому что для Liger Fused Loss
         нужна unwrapped модель для доступа к lm_head.weight.
@@ -351,6 +353,50 @@ class GRPOTrainer:
         else:
             unwrapped_model = self.model
         
+        # Проверяем тип алгоритма
+        is_sdpo = (
+            getattr(self.config, 'algorithm', None) == RLAlgorithm.SDPO or
+            getattr(self.config, 'use_self_distillation', False)
+        )
+        
+        if is_sdpo:
+            # SDPO: используем SDPOLoss
+            self.loss_fn = SDPOLoss(config=self.config)
+            logger.info("🎓 SDPOLoss активирован!")
+            logger.info("   - GRPO loss + Self-Distillation")
+            logger.info(f"   - success_threshold: {getattr(self.config, 'sdpo_success_threshold', 0.5)}")
+            logger.info(f"   - alpha (KL type): {getattr(self.config, 'sdpo_alpha', 0.5)}")
+            
+            # ============================================================
+            # 🔥 ОПТИМИЗАЦИЯ: Teacher Module Setup (из verl)
+            # ============================================================
+            # Используем reference_model как teacher — экономит память!
+            # Вместо отдельной модели шарим с ref model для KL penalty
+            self.teacher_module = self.reference_model  # 🔥 Шаринг памяти!
+            self.sdpo_ema_rate = getattr(self.config, 'sdpo_ema_rate', 0.0)
+            
+            if self.teacher_module is not None:
+                logger.info("   🔥 Teacher = Reference Model (шаринг памяти!)")
+            else:
+                # Если нет reference модели — используем student как teacher
+                logger.info("   ⚠️ Нет reference модели, teacher = student (detached)")
+            
+            # Top-K Distillation параметры
+            self.sdpo_distillation_topk = getattr(self.config, 'sdpo_distillation_topk', None)
+            self.sdpo_full_logit_distillation = getattr(self.config, 'sdpo_full_logit_distillation', False)
+            
+            if self.sdpo_distillation_topk is not None:
+                logger.info(f"   🔥 Top-K Distillation: k={self.sdpo_distillation_topk}")
+                logger.info(f"      Экономия памяти: ~99.97% vs full vocab!")
+            
+            if self.sdpo_ema_rate > 0:
+                logger.info(f"   📈 EMA Teacher: rate={self.sdpo_ema_rate}")
+            
+            # Инициализируем хранилище успешных траекторий
+            self._successful_trajectories: Dict[int, List[str]] = {}
+            return
+        
+        # GRPO/DrGRPO/DAPO с Liger Fused Loss
         if self.use_liger_fused_loss:
             try:
                 from .liger_utils import is_liger_available, get_liger_fused_linear_grpo
@@ -372,6 +418,304 @@ class GRPOTrainer:
         # Fallback на стандартный GRPOLoss
         self.loss_fn = GRPOLoss(config=self.config)
         logger.info("📊 Используется стандартный GRPOLoss")
+
+    # =========================================================================
+    # 🎓 SDPO: Teacher Model и EMA Update (из verl)
+    # =========================================================================
+    
+    def _update_teacher_ema(self) -> None:
+        """
+        🔥 ОПТИМИЗАЦИЯ: EMA Update для Teacher модели (из verl).
+        
+        Teacher = EMA(Student) — медленно обновляемая копия student модели.
+        Это даёт более стабильный target для distillation.
+        
+        Формула: teacher = (1 - ema_rate) * teacher + ema_rate * student
+        """
+        if not hasattr(self, 'sdpo_ema_rate') or self.sdpo_ema_rate <= 0:
+            return
+        
+        if not hasattr(self, 'teacher_module') or self.teacher_module is None:
+            return
+        
+        # Проверяем что teacher != student (иначе EMA бессмысленен)
+        if self.teacher_module is self.model:
+            return
+        
+        ema_rate = self.sdpo_ema_rate
+        
+        # Unwrap модели если нужно
+        if self.accelerator:
+            student_model = self.accelerator.unwrap_model(self.model)
+        else:
+            student_model = self.model
+        
+        with torch.no_grad():
+            for teacher_param, student_param in zip(
+                self.teacher_module.parameters(),
+                student_model.parameters()
+            ):
+                # EMA update: teacher = (1 - ema) * teacher + ema * student
+                student_data = student_param.data.to(device=teacher_param.device)
+                teacher_param.data.mul_(1.0 - ema_rate).add_(student_data, alpha=ema_rate)
+        
+        logger.debug(f"🎓 SDPO EMA Teacher обновлён (rate={ema_rate})")
+    
+    # =========================================================================
+    # 🎓 SDPO: Reprompting методы
+    # =========================================================================
+    
+    def _create_reprompted_input(
+        self,
+        original_prompt: str,
+        successful_solution: str,
+        feedback: Optional[str] = None,
+    ) -> str:
+        """
+        Создаёт reprompted контекст для teacher (SDPO).
+        
+        Формат:
+            Here is the problem:
+            {original_question}
+            
+            Here is a successful solution for reference:
+            {successful_solution}
+            
+            Now solve this problem step by step.
+        
+        Args:
+            original_prompt: Исходный промпт с вопросом
+            successful_solution: Успешное решение (completion)
+            feedback: Опциональный feedback (ошибки и т.д.)
+            
+        Returns:
+            Reprompted строка для teacher
+        """
+        # Получаем шаблоны из конфига
+        reprompt_template = getattr(
+            self.config, 
+            'sdpo_reprompt_template',
+            """Here is the problem:
+{question}
+
+Here is a successful solution for reference:
+{successful_solution}
+
+Now solve this problem step by step."""
+        )
+        
+        feedback_template = getattr(
+            self.config,
+            'sdpo_feedback_template',
+            """
+Previous attempt feedback:
+{feedback}
+"""
+        )
+        
+        # Извлекаем вопрос из original_prompt
+        # Обычно prompt содержит system message + user question
+        # Пытаемся извлечь только вопрос
+        question = original_prompt
+        
+        # Пытаемся найти вопрос в chat template формате
+        if "User:" in original_prompt:
+            parts = original_prompt.split("User:")
+            if len(parts) > 1:
+                question = parts[-1].split("Assistant:")[0].strip()
+        elif "<|user|>" in original_prompt:
+            parts = original_prompt.split("<|user|>")
+            if len(parts) > 1:
+                question = parts[-1].split("<|assistant|>")[0].strip()
+        elif "[INST]" in original_prompt:
+            parts = original_prompt.split("[INST]")
+            if len(parts) > 1:
+                question = parts[-1].split("[/INST]")[0].strip()
+        
+        # Создаём reprompted текст
+        reprompted = reprompt_template.format(
+            question=question,
+            successful_solution=successful_solution,
+        )
+        
+        # Добавляем feedback если есть
+        include_feedback = getattr(self.config, 'sdpo_include_feedback', True)
+        if include_feedback and feedback:
+            feedback_text = feedback_template.format(feedback=feedback)
+            reprompted = reprompted + feedback_text
+        
+        # Обрезаем если слишком длинный
+        max_len = getattr(self.config, 'sdpo_max_reprompt_len', 4096)
+        if len(reprompted) > max_len:
+            reprompted = reprompted[:max_len]
+        
+        return reprompted
+    
+    def _get_teacher_log_probs(
+        self,
+        exp_batch: "Experience",
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        🔥 ОПТИМИЗАЦИЯ: Вычисляет teacher_log_probs для SDPO (из verl).
+        
+        Ключевые оптимизации:
+        1. Использует teacher_module (шаринг с reference_model) — экономия памяти!
+        2. Top-K Distillation — вместо vocab=152k используем только k=50-100 токенов
+        3. Chunked processing — по одному reprompt за раз
+        
+        Для каждого сэмпла в batch:
+        1. Ищем успешную траекторию для его prompt_id
+        2. Создаём reprompted контекст (prompt + successful_solution)
+        3. Делаем forward pass через teacher_module
+        4. Получаем log_probs (и top-k если нужно)
+        
+        Args:
+            exp_batch: Batch Experience объектов
+            device: Устройство для вычислений
+            
+        Returns:
+            (teacher_log_probs, distillation_mask, student_topk, teacher_topk) или (None, None, None, None)
+        """
+        if not hasattr(self, '_successful_trajectories'):
+            return None, None, None, None
+        
+        batch_size = exp_batch.sequences.size(0)
+        seq_len = exp_batch.action_log_probs.size(1)
+        
+        # 🔥 ОПТИМИЗАЦИЯ: Используем teacher_module (шаринг с ref model)
+        teacher_model = getattr(self, 'teacher_module', None)
+        if teacher_model is None:
+            # Fallback: используем student model
+            teacher_model = self.model
+        
+        # Top-K параметры
+        use_topk = getattr(self, 'sdpo_full_logit_distillation', False) and \
+                   getattr(self, 'sdpo_distillation_topk', None) is not None
+        topk = getattr(self, 'sdpo_distillation_topk', 50) if use_topk else None
+        
+        # Проверяем какие сэмплы имеют успешные траектории
+        has_teacher = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        reprompted_inputs = []
+        sample_to_reprompt_idx = {}
+        
+        # Получаем prompt_ids из batch если есть
+        prompt_ids = getattr(exp_batch, 'prompt_ids', None)
+        if prompt_ids is None:
+            prompt_ids = [None] * batch_size
+        
+        for idx in range(batch_size):
+            pid = prompt_ids[idx] if prompt_ids is not None else None
+            if pid is None:
+                continue
+                
+            pid_int = int(pid) if torch.is_tensor(pid) else pid
+            
+            if pid_int in self._successful_trajectories and self._successful_trajectories[pid_int]:
+                import random
+                trajectory = random.choice(self._successful_trajectories[pid_int])
+                
+                reprompted = self._create_reprompted_input(
+                    original_prompt=trajectory['prompt'],
+                    successful_solution=trajectory['completion'],
+                )
+                
+                has_teacher[idx] = True
+                sample_to_reprompt_idx[idx] = len(reprompted_inputs)
+                reprompted_inputs.append(reprompted)
+        
+        if not reprompted_inputs:
+            return None, None, None, None
+        
+        # 🔥 Результаты
+        teacher_log_probs = torch.zeros(batch_size, seq_len, device=device)
+        
+        # Top-K tensors (только если используем full_logit_distillation)
+        student_topk_log_probs = None
+        teacher_topk_log_probs = None
+        if use_topk and topk is not None:
+            student_topk_log_probs = torch.zeros(batch_size, seq_len, topk, device=device)
+            teacher_topk_log_probs = torch.zeros(batch_size, seq_len, topk, device=device)
+        
+        with torch.no_grad():
+            for idx in range(batch_size):
+                if not has_teacher[idx]:
+                    continue
+                
+                reprompt_idx = sample_to_reprompt_idx[idx]
+                reprompt_text = reprompted_inputs[reprompt_idx]
+                
+                # Токенизируем ОДИН reprompt
+                reprompt_encoding = self.tokenizer(
+                    reprompt_text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=getattr(self.config, 'sdpo_max_reprompt_len', 4096),
+                ).to(device)
+                
+                # 🔥 Forward pass через TEACHER MODEL (не student!)
+                output = teacher_model(
+                    input_ids=reprompt_encoding['input_ids'],
+                    attention_mask=reprompt_encoding['attention_mask'],
+                    use_cache=False,
+                )
+                
+                logits = output.logits[0]  # [reprompt_seq, vocab]
+                reprompt_seq_len = logits.size(0)
+                completion_tokens = exp_batch.sequences[idx, 1:seq_len+1]
+                
+                for t in range(min(seq_len, reprompt_seq_len - 1)):
+                    pos = reprompt_seq_len - seq_len - 1 + t if reprompt_seq_len > seq_len else t
+                    if pos >= 0 and pos < reprompt_seq_len - 1:
+                        token_id = completion_tokens[t].item()
+                        if token_id < logits.size(-1):
+                            log_probs_pos = F.log_softmax(logits[pos], dim=-1)
+                            teacher_log_probs[idx, t] = log_probs_pos[token_id]
+                            
+                            # 🔥 TOP-K DISTILLATION
+                            if use_topk and teacher_topk_log_probs is not None:
+                                topk_vals, topk_idxs = torch.topk(log_probs_pos, topk)
+                                teacher_topk_log_probs[idx, t] = topk_vals
+                
+                del output, logits, reprompt_encoding
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        # 🔥 TOP-K для Student (нужно если используем full_logit_distillation)
+        # Вычисляем top-k student log_probs для тех же позиций
+        if use_topk and student_topk_log_probs is not None:
+            # Unwrap student model
+            if self.accelerator:
+                student_model = self.accelerator.unwrap_model(self.model)
+            else:
+                student_model = self.model
+            
+            with torch.no_grad():
+                # Forward pass student на оригинальных sequences
+                student_output = student_model(
+                    input_ids=exp_batch.sequences,
+                    attention_mask=exp_batch.attention_mask,
+                    use_cache=False,
+                )
+                student_logits = student_output.logits[:, :-1]  # [batch, seq, vocab]
+                
+                for idx in range(batch_size):
+                    if has_teacher[idx]:
+                        for t in range(seq_len):
+                            log_probs_t = F.log_softmax(student_logits[idx, t], dim=-1)
+                            topk_vals, _ = torch.topk(log_probs_t, topk)
+                            student_topk_log_probs[idx, t] = topk_vals
+                
+                del student_output, student_logits
+        
+        distillation_mask = has_teacher.float()
+        
+        logger.debug(
+            f"🎓 SDPO: {has_teacher.sum().item()}/{batch_size} сэмплов с teacher, "
+            f"top-k={topk if use_topk else 'off'}"
+        )
+        
+        return teacher_log_probs, distillation_mask, student_topk_log_probs, teacher_topk_log_probs
 
     def _setup_rollout_engine(self) -> None:
         """
@@ -663,6 +1007,12 @@ class GRPOTrainer:
         logger.info(f"Алгоритм: {self.config.algorithm.value}")
         if self.config.dynamic_sampling:
             logger.info(f"  🎯 Dynamic sampling: ON (max_refill_rounds={self.config.max_refill_rounds})")
+            # Предупреждение для multi-GPU
+            if self.accelerator.num_processes > 1:
+                logger.warning(
+                    f"  ⚠️ Dynamic sampling + Multi-GPU ({self.accelerator.num_processes} процессов) "
+                    f"может вызывать рассинхронизацию! Добавлены барьеры синхронизации."
+                )
         else:
             logger.info(f"  🎯 Dynamic sampling: OFF (быстрее)")
         if self.config.token_level_loss:
@@ -1751,11 +2101,40 @@ class GRPOTrainer:
                         f"Получилось {self.replay_buffer.get_stats().get('num_groups', 0)} после {refill_rounds} доборов. "
                         f"Возможная причина: модель даёт одинаковый reward на большинстве промптов."
                     )
+                
+                # 🔥 Barrier после refills чтобы все GPU закончили генерацию
+                if self.accelerator.num_processes > 1:
+                    self.accelerator.wait_for_everyone()
 
             epoch_rewards.extend(batch_rewards)
             
             # Обучение на собранном опыте
             buffer_size = len(self.replay_buffer)
+            
+            # ============================================================
+            # 🔥 КРИТИЧНО: Синхронизация между GPU перед training!
+            # ============================================================
+            # При multi-GPU dynamic_sampling может дать разные buffer_size на разных GPU.
+            # Без barrier один GPU ждёт другой в DDP forward → NCCL timeout!
+            if self.accelerator.num_processes > 1:
+                # Собираем buffer_size со всех GPU
+                buffer_tensor = torch.tensor([buffer_size], device=self.device)
+                all_buffers = self.accelerator.gather(buffer_tensor)
+                min_buffer = int(all_buffers.min().item())
+                max_buffer = int(all_buffers.max().item())
+                
+                # Если хотя бы один GPU имеет пустой буфер — все пропускают training
+                if min_buffer == 0:
+                    if buffer_size > 0:
+                        logger.warning(
+                            f"⚠️ Multi-GPU sync: пропускаем training (другой GPU имеет пустой буфер). "
+                            f"Local buffer: {buffer_size}, all buffers: {all_buffers.tolist()}"
+                        )
+                    buffer_size = 0  # Force skip
+                
+                # Barrier для синхронизации перед training
+                self.accelerator.wait_for_everyone()
+            
             if buffer_size == 0:
                 logger.warning(
                     f"⚠️ Буфер пуст на шаге {self.global_step}! "
@@ -1821,6 +2200,10 @@ class GRPOTrainer:
 
             # Rollout-step завершён (1 batch промптов -> сбор rollout -> train on buffer)
             self.rollout_step += 1
+            
+            # 🔥 Barrier в конце batch для синхронизации multi-GPU
+            if self.accelerator.num_processes > 1:
+                self.accelerator.wait_for_everyone()
             
             # Проверяем max_steps
             if self.config.max_steps and self.global_step >= self.config.max_steps:
@@ -2000,6 +2383,30 @@ class GRPOTrainer:
             prompt_idx = rollout.metadata.get("prompt_id", rollout.metadata.get("prompt_idx", 0))
             rollout_completions_len = len(rollout.completions)
             
+            # 🎓 SDPO: сохраняем успешные траектории для self-distillation
+            if hasattr(self, '_successful_trajectories') and isinstance(self.loss_fn, SDPOLoss):
+                sdpo_threshold = getattr(self.config, 'sdpo_success_threshold', 0.5)
+                for comp_idx, (reward, completion) in enumerate(zip(rollout_rewards, rollout.completions)):
+                    if reward >= sdpo_threshold:
+                        # Сохраняем пару (prompt, completion) для reprompting
+                        if prompt_idx not in self._successful_trajectories:
+                            self._successful_trajectories[prompt_idx] = []
+                        
+                        trajectory_data = {
+                            'prompt': rollout.prompt,  # Исходный prompt (текст)
+                            'completion': completion,   # Успешный completion
+                            'reward': reward,
+                        }
+                        
+                        # Храним только последние N успешных (чтобы не раздувать память)
+                        if len(self._successful_trajectories[prompt_idx]) < 5:
+                            self._successful_trajectories[prompt_idx].append(trajectory_data)
+                        else:
+                            # Заменяем случайный старый
+                            import random
+                            replace_idx = random.randint(0, 4)
+                            self._successful_trajectories[prompt_idx][replace_idx] = trajectory_data
+            
             # Явно удаляем rollout после использования
             del rollout
             
@@ -2069,6 +2476,25 @@ class GRPOTrainer:
             collate_fn=join_experience_batch,
         )
         
+        # ============================================================
+        # 🔥 КРИТИЧНО: Синхронизация количества батчей между GPU!
+        # ============================================================
+        # При multi-GPU каждый GPU может иметь разное количество элементов в буфере.
+        # Это приводит к разному количеству итераций → DDP deadlock!
+        local_num_batches = len(exp_loader)
+        if self.accelerator is not None and self.accelerator.num_processes > 1:
+            # Собираем количество батчей со всех GPU
+            num_batches_tensor = torch.tensor([local_num_batches], device=self.device)
+            all_num_batches = self.accelerator.gather(num_batches_tensor)
+            min_batches = int(all_num_batches.min().item())
+            
+            if min_batches != local_num_batches:
+                logger.info(
+                    f"🔄 Multi-GPU sync: ограничиваем итерации до {min_batches} "
+                    f"(local={local_num_batches}, all={all_num_batches.tolist()})"
+                )
+            local_num_batches = min_batches
+        
         epoch_losses = []
         epoch_kls = []
         epoch_grad_norms = []
@@ -2077,6 +2503,9 @@ class GRPOTrainer:
 
         for epoch_idx in range(self.config.epochs_per_step):
             for batch_idx, exp_batch in enumerate(exp_loader):
+                # 🔥 Прерываем если достигли min_batches (для синхронизации multi-GPU)
+                if batch_idx >= local_num_batches:
+                    break
                 exp_batch = exp_batch.to(self.device)
                 accumulate_ctx = (
                     self.accelerator.accumulate(self.model)
@@ -2191,13 +2620,42 @@ class GRPOTrainer:
                                 accelerator=self.accelerator,
                             )
                             
-                            loss, metrics = self.loss_fn(
-                                log_probs=log_probs,
-                                experience=exp_batch,
-                            )
+                            # 🎓 SDPO: получаем teacher_log_probs через reprompting
+                            teacher_log_probs = None
+                            distillation_mask = None
+                            student_topk_log_probs = None
+                            teacher_topk_log_probs = None
+                            
+                            if isinstance(self.loss_fn, SDPOLoss) and hasattr(self, '_successful_trajectories'):
+                                # 🔥 ОПТИМИЗАЦИЯ: Top-K Distillation + Teacher Module (из verl)
+                                teacher_log_probs, distillation_mask, student_topk_log_probs, teacher_topk_log_probs = \
+                                    self._get_teacher_log_probs(
+                                        exp_batch=exp_batch,
+                                        device=exp_batch.sequences.device,
+                                    )
+                            
+                            # Вызываем loss функцию
+                            if isinstance(self.loss_fn, SDPOLoss):
+                                loss, metrics = self.loss_fn(
+                                    log_probs=log_probs,
+                                    experience=exp_batch,
+                                    teacher_log_probs=teacher_log_probs,
+                                    distillation_mask=distillation_mask,
+                                    student_topk_log_probs=student_topk_log_probs,  # 🔥 Top-K
+                                    teacher_topk_log_probs=teacher_topk_log_probs,  # 🔥 Top-K
+                                )
+                            else:
+                                loss, metrics = self.loss_fn(
+                                    log_probs=log_probs,
+                                    experience=exp_batch,
+                                )
                             
                             # Освобождаем память
                             del log_probs
+                            if teacher_log_probs is not None:
+                                del teacher_log_probs
+                            if student_topk_log_probs is not None:
+                                del student_topk_log_probs, teacher_topk_log_probs
                 
                     # ВАЖНО: Освобождаем промежуточные активации после forward pass
                     if torch.cuda.is_available():
@@ -2291,6 +2749,10 @@ class GRPOTrainer:
                         self.scheduler.step()
                         self.optimizer.zero_grad()
                         
+                        # 🔥 SDPO: EMA Update для Teacher модели (из verl)
+                        if isinstance(self.loss_fn, SDPOLoss):
+                            self._update_teacher_ema()
+                        
                         self.global_step += 1
                     else:
                         grad_norm = 0.0
@@ -2301,6 +2763,10 @@ class GRPOTrainer:
                     epoch_grad_norms.append(
                         grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
                     )
+            
+            # 🔥 Barrier после каждой epoch для синхронизации multi-GPU
+            if self.accelerator is not None and self.accelerator.num_processes > 1:
+                self.accelerator.wait_for_everyone()
         
         return {
             "loss": sum(epoch_losses) / max(len(epoch_losses), 1),

@@ -26,7 +26,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 
-from .config import GRPOConfig, RLAlgorithm
+from .legacy_config import GRPOConfig, RLAlgorithm
 from .trainer import GRPOTrainer
 from .data.gsm8k import load_gsm8k
 from .rewards.base import CombinedReward, UniversalRuleReward
@@ -56,14 +56,14 @@ def parse_args():
         "--algorithm",
         type=str,
         default="grpo",
-        choices=["grpo", "drgrpo", "dapo"],
+        choices=["grpo", "drgrpo", "dapo", "sdpo"],
         help="Алгоритм RL",
     )
     parser.add_argument(
         "--preset",
         type=str,
         default=None,
-        choices=["grpo", "drgrpo", "dapo", "reasoning_small", "reasoning_large"],
+        choices=["grpo", "drgrpo", "dapo", "sdpo", "reasoning_small", "reasoning_large"],
         help="Использовать предустановленную конфигурацию",
     )
     
@@ -424,6 +424,22 @@ def main():
             config.max_refill_rounds = int(ui_config["grpo_max_refill_rounds"])
         if "grpo_token_level_loss" in ui_config:
             config.token_level_loss = bool(ui_config["grpo_token_level_loss"])
+        
+        # 🎓 SDPO-специфичные параметры
+        if "sdpo_success_threshold" in ui_config:
+            config.sdpo_success_threshold = float(ui_config["sdpo_success_threshold"])
+        if "sdpo_alpha" in ui_config:
+            config.sdpo_alpha = float(ui_config["sdpo_alpha"])
+        if "sdpo_loss_weight" in ui_config:
+            config.sdpo_loss_weight = float(ui_config["sdpo_loss_weight"])
+        # 🔥 SDPO Top-K Distillation и EMA (из verl)
+        if "sdpo_distillation_topk" in ui_config:
+            topk = ui_config["sdpo_distillation_topk"]
+            config.sdpo_distillation_topk = int(topk) if topk is not None else None
+        if "sdpo_full_logit_distillation" in ui_config:
+            config.sdpo_full_logit_distillation = bool(ui_config["sdpo_full_logit_distillation"])
+        if "sdpo_ema_rate" in ui_config:
+            config.sdpo_ema_rate = float(ui_config["sdpo_ema_rate"])
 
         # Rollout engine (отдельная модель для генерации)
         config.use_rollout_engine = bool(ui_config.get("grpo_use_rollout_engine", getattr(config, "use_rollout_engine", False)))

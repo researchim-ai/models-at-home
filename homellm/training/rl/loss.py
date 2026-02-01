@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .experience import Experience
-from .config import GRPOConfig, RLAlgorithm
+from .legacy_config import GRPOConfig, RLAlgorithm
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
@@ -632,6 +632,313 @@ class LigerFusedGRPOLoss(nn.Module):
         )
 
 
+# ============================================================
+# 🎓 SDPO LOSS (Self-Distilled Policy Optimization)
+# ============================================================
+
+class SDPOLoss(nn.Module):
+    """
+    🎓 SDPO Loss — Self-Distilled Policy Optimization.
+    
+    SDPO комбинирует GRPO loss с self-distillation:
+    - GRPO loss на обычных rollouts (как в стандартном GRPO)
+    - Self-distillation loss: KL между student и teacher (на reprompted контексте)
+    
+    Идея: успешные траектории становятся "учителем" для текущей политики,
+    что даёт более плотный learning signal чем только скалярный reward.
+    
+    total_loss = grpo_loss + sdpo_loss_weight * distillation_loss
+    
+    Attributes:
+        alpha: Параметр для KL (0=forward, 1=reverse, 0.5=JSD)
+        success_threshold: Порог reward для "успешной" траектории
+        is_clip: Importance sampling clip для стабильности
+        loss_weight: Вес distillation loss относительно GRPO loss
+    """
+    
+    def __init__(
+        self,
+        config: Optional[GRPOConfig] = None,
+        # GRPO параметры
+        clip_eps_low: float = 0.2,
+        clip_eps_high: float = 0.2,
+        kl_weight: float = 0.0,
+        token_level_loss: bool = False,
+        fixed_length_normalizer: Optional[int] = None,
+        # SDPO параметры
+        alpha: float = 0.5,
+        success_threshold: float = 0.5,
+        full_logit_distillation: bool = False,
+        distillation_topk: Optional[int] = None,
+        is_clip: float = 2.0,
+        loss_weight: float = 1.0,
+    ) -> None:
+        """
+        Args:
+            config: GRPOConfig с SDPO параметрами
+            alpha: 0=forward KL, 1=reverse KL, 0.5=JSD (рекомендуется)
+            success_threshold: Порог reward для учителя
+            full_logit_distillation: Использовать полное распределение
+            distillation_topk: Top-k логитов для distillation
+            is_clip: IS clip для стабильности
+            loss_weight: Вес SDPO loss
+        """
+        super().__init__()
+        
+        # GRPO параметры
+        if config is not None:
+            self.clip_eps_low = config.clip_eps_low
+            self.clip_eps_high = config.clip_eps_high
+            self.kl_weight = config.kl_weight
+            self.token_level_loss = getattr(config, 'token_level_loss', False)
+            self.fixed_length_normalizer = getattr(config, 'fixed_length_normalizer', None)
+            # SDPO параметры
+            self.alpha = getattr(config, 'sdpo_alpha', alpha)
+            self.success_threshold = getattr(config, 'sdpo_success_threshold', success_threshold)
+            self.full_logit_distillation = getattr(config, 'sdpo_full_logit_distillation', full_logit_distillation)
+            self.distillation_topk = getattr(config, 'sdpo_distillation_topk', distillation_topk)
+            self.is_clip = getattr(config, 'sdpo_is_clip', is_clip)
+            self.loss_weight = getattr(config, 'sdpo_loss_weight', loss_weight)
+        else:
+            self.clip_eps_low = clip_eps_low
+            self.clip_eps_high = clip_eps_high
+            self.kl_weight = kl_weight
+            self.token_level_loss = token_level_loss
+            self.fixed_length_normalizer = fixed_length_normalizer
+            self.alpha = alpha
+            self.success_threshold = success_threshold
+            self.full_logit_distillation = full_logit_distillation
+            self.distillation_topk = distillation_topk
+            self.is_clip = is_clip
+            self.loss_weight = loss_weight
+        
+        # Базовый GRPO loss
+        self.grpo_loss = GRPOLoss(
+            clip_eps_low=self.clip_eps_low,
+            clip_eps_high=self.clip_eps_high,
+            kl_weight=self.kl_weight,
+            token_level_loss=self.token_level_loss,
+            fixed_length_normalizer=self.fixed_length_normalizer,
+        )
+        
+        self.last_components: dict = {}
+        
+        logger.info(f"🎓 SDPOLoss инициализирован:")
+        logger.info(f"   - alpha (KL type): {self.alpha} ({'JSD' if self.alpha == 0.5 else 'forward' if self.alpha == 0 else 'reverse'})")
+        logger.info(f"   - success_threshold: {self.success_threshold}")
+        logger.info(f"   - loss_weight: {self.loss_weight}")
+        logger.info(f"   - full_logit_distillation: {self.full_logit_distillation}")
+        logger.info(f"   - is_clip: {self.is_clip}")
+    
+    def compute_distillation_loss(
+        self,
+        student_log_probs: torch.Tensor,  # [batch, seq] или [batch, seq, vocab/topk]
+        teacher_log_probs: torch.Tensor,  # [batch, seq] или [batch, seq, vocab/topk]
+        action_mask: torch.Tensor,  # [batch, seq]
+        old_log_probs: Optional[torch.Tensor] = None,  # [batch, seq]
+        distillation_mask: Optional[torch.Tensor] = None,  # [batch] — какие сэмплы имеют teacher
+        student_topk_log_probs: Optional[torch.Tensor] = None,  # [batch, seq, topk] — Top-K логиты
+        teacher_topk_log_probs: Optional[torch.Tensor] = None,  # [batch, seq, topk] — Top-K логиты
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Вычисляет self-distillation loss между student и teacher.
+        
+        🔥 ОПТИМИЗАЦИЯ: Поддерживает Top-K Distillation из verl!
+        Вместо KL по всему vocab (152k) используем только top-k токенов.
+        Экономия памяти: 99.97% при k=50 vs vocab=152k
+        
+        Args:
+            student_log_probs: Log-вероятности текущей политики [batch, seq]
+            teacher_log_probs: Log-вероятности teacher [batch, seq]
+            action_mask: Маска токенов [batch, seq]
+            old_log_probs: Log-вероятности из rollout (для IS)
+            distillation_mask: Маска сэмплов с teacher [batch]
+            student_topk_log_probs: Top-K log_probs student [batch, seq, k] (для full_logit_distillation)
+            teacher_topk_log_probs: Top-K log_probs teacher [batch, seq, k] (для full_logit_distillation)
+            
+        Returns:
+            (loss, metrics)
+        """
+        metrics = {}
+        
+        # Комбинируем маски
+        loss_mask = action_mask.float()
+        if distillation_mask is not None:
+            # distillation_mask [batch] -> [batch, 1] для broadcasting
+            loss_mask = loss_mask * distillation_mask.unsqueeze(1).float()
+        
+        # Если нет сэмплов для distillation — возвращаем 0
+        if loss_mask.sum() < 1:
+            metrics["sdpo_empty_batch"] = True
+            return torch.tensor(0.0, device=student_log_probs.device), metrics
+        
+        # ============================================================
+        # 🔥 FULL-LOGIT / TOP-K DISTILLATION (из verl)
+        # ============================================================
+        if self.full_logit_distillation and student_topk_log_probs is not None and teacher_topk_log_probs is not None:
+            # Top-K distillation: используем только top-k токенов
+            # Это экономит ~99.97% памяти при k=50 vs vocab=152k
+            
+            # Ренормализация top-k log probs (чтобы сумма prob = 1)
+            def renorm_topk_log_probs(logp: torch.Tensor) -> torch.Tensor:
+                """Ренормализует top-k log_probs чтобы сумма prob = 1."""
+                logZ = torch.logsumexp(logp, dim=-1, keepdim=True)
+                return logp - logZ
+            
+            student_distill = renorm_topk_log_probs(student_topk_log_probs)  # [batch, seq, k]
+            teacher_distill = renorm_topk_log_probs(teacher_topk_log_probs)  # [batch, seq, k]
+            
+            # KL divergence по top-k распределению
+            if self.alpha == 0.0:
+                # Forward KL: KL(teacher || student)
+                kl_loss = F.kl_div(
+                    student_distill, teacher_distill, reduction="none", log_target=True
+                )
+            elif self.alpha == 1.0:
+                # Reverse KL: KL(student || teacher)
+                kl_loss = F.kl_div(
+                    teacher_distill, student_distill, reduction="none", log_target=True
+                )
+            else:
+                # Jensen-Shannon Divergence
+                alpha_t = torch.tensor(
+                    self.alpha, dtype=student_distill.dtype, device=student_distill.device
+                )
+                mixture_log_probs = torch.logsumexp(
+                    torch.stack([
+                        student_distill + torch.log(1 - alpha_t),
+                        teacher_distill + torch.log(alpha_t)
+                    ]),
+                    dim=0,
+                )
+                kl_teacher = F.kl_div(mixture_log_probs, teacher_distill, reduction="none", log_target=True)
+                kl_student = F.kl_div(mixture_log_probs, student_distill, reduction="none", log_target=True)
+                kl_loss = torch.lerp(kl_student, kl_teacher, alpha_t)
+            
+            # Суммируем по k-dimension -> [batch, seq]
+            per_token_loss = kl_loss.sum(dim=-1)
+            metrics["sdpo_topk_distill"] = True
+            metrics["sdpo_topk_k"] = student_topk_log_probs.shape[-1]
+        else:
+            # ============================================================
+            # SIMPLE PER-TOKEN DISTILLATION (fallback)
+            # ============================================================
+            # Вычисляем KL divergence по per-token log_probs
+            if self.alpha == 0.0:
+                # Forward KL: student -> teacher (mode-seeking)
+                per_token_loss = (teacher_log_probs.exp() * (teacher_log_probs - student_log_probs))
+            elif self.alpha == 1.0:
+                # Reverse KL: teacher -> student (mode-covering)
+                log_ratio = student_log_probs - teacher_log_probs
+                per_token_loss = log_ratio.detach() * student_log_probs
+            else:
+                # Jensen-Shannon Divergence (alpha = 0.5)
+                alpha_t = torch.tensor(self.alpha, dtype=student_log_probs.dtype, device=student_log_probs.device)
+                
+                mixture_log_probs = torch.logsumexp(
+                    torch.stack([
+                        student_log_probs + torch.log(1 - alpha_t),
+                        teacher_log_probs + torch.log(alpha_t)
+                    ]),
+                    dim=0,
+                )
+                
+                kl_student = student_log_probs - mixture_log_probs
+                kl_teacher = teacher_log_probs - mixture_log_probs
+                
+                per_token_loss = (1 - alpha_t) * (student_log_probs.exp() * kl_student) + \
+                                 alpha_t * (teacher_log_probs.exp() * kl_teacher)
+            
+            metrics["sdpo_topk_distill"] = False
+        
+        # Importance Sampling clipping для стабильности
+        if self.is_clip is not None and old_log_probs is not None:
+            negative_approx_kl = (student_log_probs - old_log_probs).detach()
+            negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+            ratio = torch.exp(negative_approx_kl).clamp(max=self.is_clip)
+            per_token_loss = per_token_loss * ratio
+        
+        # Агрегация loss
+        if self.token_level_loss:
+            total_tokens = loss_mask.sum().clamp(min=1)
+            loss = (per_token_loss * loss_mask).sum() / total_tokens
+        else:
+            if self.fixed_length_normalizer is not None:
+                loss = masked_sum(
+                    per_token_loss,
+                    loss_mask,
+                    dim=-1,
+                    constant_normalizer=self.fixed_length_normalizer
+                ).mean()
+            else:
+                loss = masked_mean(per_token_loss, loss_mask, dim=-1).mean()
+        
+        metrics["sdpo_distill_loss"] = loss.item()
+        metrics["sdpo_empty_batch"] = False
+        
+        return loss, metrics
+    
+    def forward(
+        self,
+        log_probs: torch.Tensor,
+        experience: Experience,
+        teacher_log_probs: Optional[torch.Tensor] = None,
+        distillation_mask: Optional[torch.Tensor] = None,
+        student_topk_log_probs: Optional[torch.Tensor] = None,  # 🔥 Top-K optimization
+        teacher_topk_log_probs: Optional[torch.Tensor] = None,  # 🔥 Top-K optimization
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Вычисляет комбинированный SDPO loss.
+        
+        🔥 ОПТИМИЗАЦИЯ: Поддерживает Top-K Distillation!
+        Если переданы student_topk_log_probs и teacher_topk_log_probs,
+        используется KL по top-k токенам вместо всего vocab.
+        
+        Args:
+            log_probs: Log-вероятности текущей политики [batch, seq]
+            experience: Experience с rollout данными
+            teacher_log_probs: Log-вероятности teacher [batch, seq] (опционально)
+            distillation_mask: Маска сэмплов с teacher [batch]
+            student_topk_log_probs: Top-K log_probs student [batch, seq, k] (опционально)
+            teacher_topk_log_probs: Top-K log_probs teacher [batch, seq, k] (опционально)
+            
+        Returns:
+            (total_loss, metrics)
+        """
+        # 1. Стандартный GRPO loss
+        grpo_loss, grpo_metrics = self.grpo_loss(log_probs, experience)
+        
+        # 2. Self-distillation loss (если есть teacher данные)
+        if teacher_log_probs is not None:
+            distill_loss, distill_metrics = self.compute_distillation_loss(
+                student_log_probs=log_probs,
+                teacher_log_probs=teacher_log_probs,
+                action_mask=experience.action_mask,
+                old_log_probs=experience.action_log_probs,
+                distillation_mask=distillation_mask,
+                student_topk_log_probs=student_topk_log_probs,
+                teacher_topk_log_probs=teacher_topk_log_probs,
+            )
+            
+            # Комбинируем losses
+            total_loss = grpo_loss + self.loss_weight * distill_loss
+            
+            # Собираем метрики
+            metrics = {**grpo_metrics, **distill_metrics}
+            metrics["grpo_loss"] = grpo_loss.item()
+            metrics["sdpo_weight"] = self.loss_weight
+            metrics["total_loss"] = total_loss.item()
+        else:
+            # Нет teacher данных — только GRPO loss
+            total_loss = grpo_loss
+            metrics = grpo_metrics
+            metrics["sdpo_distill_loss"] = 0.0
+            metrics["sdpo_empty_batch"] = True
+        
+        self.last_components = metrics
+        return total_loss, metrics
+
+
 def create_loss_function(
     model: "PreTrainedModel",
     config: GRPOConfig,
@@ -639,16 +946,29 @@ def create_loss_function(
     """
     Создаёт loss функцию в зависимости от конфигурации.
     
-    Если liger_fused_grpo=True и Liger доступен — создаёт LigerFusedGRPOLoss.
-    Иначе — стандартный GRPOLoss.
+    Выбор loss функции:
+    - SDPO: SDPOLoss (GRPO + self-distillation)
+    - Liger GRPO: LigerFusedGRPOLoss (оптимизация памяти)
+    - Default: GRPOLoss
     
     Args:
         model: HuggingFace модель
         config: GRPOConfig
     
     Returns:
-        Loss module (GRPOLoss или LigerFusedGRPOLoss)
+        Loss module (SDPOLoss, LigerFusedGRPOLoss или GRPOLoss)
     """
+    # SDPO: используем SDPOLoss
+    is_sdpo = (
+        getattr(config, 'algorithm', None) == RLAlgorithm.SDPO or
+        getattr(config, 'use_self_distillation', False)
+    )
+    
+    if is_sdpo:
+        logger.info("🎓 Используется SDPOLoss (GRPO + Self-Distillation)")
+        return SDPOLoss(config=config)
+    
+    # Liger Fused GRPO: оптимизация памяти
     use_liger_fused = getattr(config, 'liger_fused_grpo', False) and getattr(config, 'use_liger', False)
     
     if use_liger_fused:

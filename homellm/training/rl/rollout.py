@@ -95,7 +95,7 @@ def ds3_gather_for_generation(model, accelerator):
         yield
 
 from .experience import Experience
-from .config import GRPOConfig
+from .legacy_config import GRPOConfig
 
 
 @dataclass
@@ -244,9 +244,19 @@ def compute_log_probs(
     sequence_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     accelerator=None,
+    chunk_size: Optional[int] = None,  # 🔥 ОПТИМИЗАЦИЯ: auto-detect
 ) -> torch.Tensor:
     """
     Вычисляет log-вероятности для последовательности.
+    
+    🔥 ОПТИМИЗАЦИЯ ПАМЯТИ: Обрабатывает sequences по частям (chunked forward pass)
+    чтобы не материализовать все logits [batch, seq, vocab] одновременно.
+    
+    Для batch=8, seq=1200, vocab=152k это экономит ~2.9 GB на logits!
+    
+    Автоматически определяет режим:
+    - no_grad context: chunk_size=1 (максимальная экономия памяти для rollout)
+    - with grad: chunk_size=batch_size (нужны все activations для backprop)
     
     ВАЖНО: Эта функция НЕ использует @torch.no_grad(), чтобы градиенты могли проходить
     при использовании в обучении. Используйте torch.no_grad() вручную там где нужно.
@@ -256,41 +266,69 @@ def compute_log_probs(
         sequence_ids: Token IDs [batch, seq_len]
         attention_mask: Маска внимания [batch, seq_len]
         accelerator: Accelerator объект для unwrap модели (опционально)
+        chunk_size: Сколько sequences обрабатывать за раз (None=auto-detect)
         
     Returns:
         Log-вероятности [batch, seq_len-1]
     """
-    # ВАЖНО (память): для обучения в distributed режиме НЕ делаем unwrap через Accelerator.
-    # Иначе accelerate может оборачивать forward и конвертировать выходы в fp32 (convert_to_fp32),
-    # что сильно увеличивает пик памяти на больших vocab (Qwen ~152k) и длинных seq.
-    # Для DDP/FSDP forward() доступен напрямую на подготовленной модели.
     forward_model = model
+    batch_size, seq_len = sequence_ids.shape
+    device = sequence_ids.device
+    
+    # 🔥 AUTO-DETECT: если градиенты нужны, не делаем chunking (иначе backprop сломается)
+    # Если no_grad context — chunk по 1 для максимальной экономии памяти
+    if chunk_size is None:
+        if torch.is_grad_enabled():
+            # Training mode: нужны все activations для backprop
+            chunk_size = batch_size
+        else:
+            # Inference mode (rollout): chunk по 1 для экономии памяти
+            chunk_size = 1
     
     # Position IDs
     position_ids = attention_mask.long().cumsum(dim=-1) - 1
     position_ids.masked_fill_(mask=(attention_mask == 0), value=1)
     
-    # Forward pass
-    output = forward_model(
-        input_ids=sequence_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        use_cache=False,
-    )
+    # 🔥 CHUNKED FORWARD: обрабатываем по chunk_size sequences за раз
+    if batch_size <= chunk_size:
+        # Batch достаточно маленький — обрабатываем сразу
+        output = forward_model(
+            input_ids=sequence_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+        )
+        logits = output.logits[:, :-1]
+        target_ids = sequence_ids[:, 1:]
+        log_probs = sequence_log_probs_from_logits(logits, target_ids)
+        del output, logits  # Освобождаем память
+        return log_probs
     
-    # Log probs для следующих токенов
-    logits = output.logits[:, :-1]  # [batch, seq_len-1, vocab]
-    target_ids = sequence_ids[:, 1:]  # [batch, seq_len-1]
+    # Chunked processing (только для no_grad mode)
+    all_log_probs = []
+    for start_idx in range(0, batch_size, chunk_size):
+        end_idx = min(start_idx + chunk_size, batch_size)
+        
+        # Forward pass для chunk
+        chunk_output = forward_model(
+            input_ids=sequence_ids[start_idx:end_idx],
+            attention_mask=attention_mask[start_idx:end_idx],
+            position_ids=position_ids[start_idx:end_idx],
+            use_cache=False,
+        )
+        
+        chunk_logits = chunk_output.logits[:, :-1]
+        chunk_targets = sequence_ids[start_idx:end_idx, 1:]
+        
+        chunk_log_probs = sequence_log_probs_from_logits(chunk_logits, chunk_targets)
+        all_log_probs.append(chunk_log_probs)
+        
+        # 🔥 Освобождаем память после каждого chunk
+        del chunk_output, chunk_logits
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
-    # ВАЖНО: НЕ конвертируем dtype - работаем с исходным dtype модели
-    # Конвертация может разорвать граф градиентов
-    # sequence_log_probs_from_logits работает с любым float dtype
-    log_probs = sequence_log_probs_from_logits(
-        logits,
-        target_ids,
-    )
-    
-    return log_probs
+    return torch.cat(all_log_probs, dim=0)
 
 
 def _batch_generate_multi_prompt(

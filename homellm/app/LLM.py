@@ -540,6 +540,133 @@ def format_time(seconds: float) -> str:
         return f"{seconds/3600:.1f}h"
 
 
+def delete_checkpoint(run_id: str, checkpoint_path: str) -> tuple[bool, str]:
+    """
+    Удалить отдельный чекпоинт.
+    
+    Args:
+        run_id: ID запуска
+        checkpoint_path: Путь к чекпоинту
+        
+    Returns:
+        (success, message) - успех операции и сообщение
+    """
+    import shutil
+    
+    try:
+        ckpt_path = Path(checkpoint_path)
+        
+        # Если путь относительный, делаем абсолютным
+        if not ckpt_path.is_absolute():
+            ckpt_path = PROJECT_ROOT / ckpt_path
+        
+        if not ckpt_path.exists():
+            return False, f"Чекпоинт не найден: {checkpoint_path}"
+        
+        # Удаляем папку чекпоинта
+        shutil.rmtree(ckpt_path)
+        
+        # Обновляем metrics.json - удаляем запись о чекпоинте
+        run_dir = RUNS_DIR / run_id
+        metrics_path = run_dir / "metrics.json"
+        
+        if metrics_path.exists():
+            try:
+                with open(metrics_path, "r", encoding="utf-8") as f:
+                    metrics = json.load(f)
+                
+                # Фильтруем чекпоинты - удаляем тот что удалили
+                if "checkpoints" in metrics:
+                    original_count = len(metrics["checkpoints"])
+                    metrics["checkpoints"] = [
+                        ckpt for ckpt in metrics["checkpoints"]
+                        if ckpt.get("path") != checkpoint_path and not str(ckpt.get("path", "")).endswith(ckpt_path.name)
+                    ]
+                    
+                    # Сохраняем обновленные метрики
+                    with open(metrics_path, "w", encoding="utf-8") as f:
+                        json.dump(metrics, f, indent=2, ensure_ascii=False)
+                    
+                    logger.info(f"Удален чекпоинт {checkpoint_path}, обновлены метрики ({original_count} -> {len(metrics['checkpoints'])})")
+            except Exception as e:
+                logger.warning(f"Не удалось обновить metrics.json: {e}")
+        
+        return True, f"Чекпоинт удален: {ckpt_path.name}"
+        
+    except Exception as e:
+        logger.error(f"Ошибка удаления чекпоинта {checkpoint_path}: {e}")
+        return False, f"Ошибка удаления: {e}"
+
+
+def delete_experiment(run_id: str) -> tuple[bool, str]:
+    """
+    Удалить весь эксперимент (run) вместе со всеми чекпоинтами и моделями.
+    
+    Args:
+        run_id: ID запуска для удаления
+        
+    Returns:
+        (success, message) - успех операции и сообщение
+    """
+    import shutil
+    
+    deleted_items = []
+    errors = []
+    
+    try:
+        run_dir = RUNS_DIR / run_id
+        
+        if not run_dir.exists():
+            return False, f"Запуск не найден: {run_id}"
+        
+        # 1. Получаем output_dir из конфига (там хранятся чекпоинты и модели)
+        output_dir = None
+        config_path = run_dir / "config.json"
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                    output_dir = config.get("output_dir")
+            except Exception as e:
+                logger.warning(f"Не удалось прочитать config.json: {e}")
+        
+        # 2. Удаляем output_dir (чекпоинты, final_model, etc.)
+        if output_dir:
+            output_path = Path(output_dir)
+            if not output_path.is_absolute():
+                output_path = PROJECT_ROOT / output_dir
+            
+            if output_path.exists():
+                try:
+                    shutil.rmtree(output_path)
+                    deleted_items.append(f"📁 {output_path.name}")
+                    logger.info(f"Удалена папка output: {output_path}")
+                except Exception as e:
+                    errors.append(f"output_dir: {e}")
+                    logger.error(f"Не удалось удалить output_dir {output_path}: {e}")
+        
+        # 3. Удаляем директорию запуска в .runs/
+        try:
+            shutil.rmtree(run_dir)
+            deleted_items.append(f"📊 .runs/{run_id}")
+            logger.info(f"Удалена папка запуска: {run_dir}")
+        except Exception as e:
+            errors.append(f"run_dir: {e}")
+            logger.error(f"Не удалось удалить run_dir {run_dir}: {e}")
+        
+        # Формируем сообщение
+        if deleted_items and not errors:
+            return True, f"Эксперимент удален: {', '.join(deleted_items)}"
+        elif deleted_items and errors:
+            return True, f"Частично удалено: {', '.join(deleted_items)}. Ошибки: {', '.join(errors)}"
+        else:
+            return False, f"Не удалось удалить: {', '.join(errors)}"
+            
+    except Exception as e:
+        logger.error(f"Ошибка удаления эксперимента {run_id}: {e}")
+        return False, f"Ошибка удаления: {e}"
+
+
 def load_metrics(run_id: str) -> dict:
     """Загрузить метрики из файла."""
     run_dir = RUNS_DIR / run_id
@@ -1550,25 +1677,99 @@ def render_grpo_sidebar_config():
     # Алгоритм
     algorithm = st.sidebar.selectbox(
         "Алгоритм",
-        ["grpo", "dapo", "dr_grpo"],
+        ["grpo", "dapo", "dr_grpo", "sdpo"],
         format_func=lambda x: {
             "grpo": "⭐ GRPO (рекомендуется)",
             "dapo": "DAPO (Dynamic Advantage)",
             "dr_grpo": "Dr.GRPO (улучшенный)",
+            "sdpo": "🎓 SDPO (Self-Distillation)",
         }[x],
         help="""
         **GRPO** ⭐: Рекомендуется! Стандартный Group Relative Policy Optimization
         **DAPO**: Token-level loss + асимметричный клиппинг + dynamic sampling
         **Dr.GRPO**: Без деления на std, фиксированная нормализация
+        **SDPO** 🎓: Self-Distilled Policy Optimization — успешные траектории как учитель
         """
     )
+    
+    # ============================================================
+    # 🔥 ПРЕСЕТЫ ДЛЯ КАЖДОГО АЛГОРИТМА
+    # ============================================================
+    ALGORITHM_PRESETS = {
+        "grpo": {
+            "kl_weight": 0.0,  # GRPO работает без KL
+            "clip_eps_high": 0.2,
+            "group_size": 8,
+            "learning_rate": 5e-6,  # Full fine-tuning
+            "train_batch_size": 2,
+            "max_new_tokens": 1024,
+            "description": "Стандартный GRPO",
+        },
+        "dapo": {
+            "kl_weight": 0.0,  # DAPO без KL
+            "clip_eps_high": 0.28,  # Асимметричный клиппинг
+            "group_size": 8,
+            "learning_rate": 5e-6,
+            "train_batch_size": 2,
+            "max_new_tokens": 1024,
+            "description": "DAPO с асимметричным клиппингом",
+        },
+        "dr_grpo": {
+            "kl_weight": 0.001,  # Dr.GRPO рекомендует KL
+            "clip_eps_high": 0.2,
+            "group_size": 8,
+            "learning_rate": 5e-6,
+            "train_batch_size": 2,
+            "max_new_tokens": 1024,
+            "description": "Dr.GRPO с фиксированной нормализацией",
+        },
+        "sdpo": {
+            # 🔥 SDPO ТРЕБУЕТ reference модель для teacher!
+            "kl_weight": 0.01,  # Обязательно > 0 для teacher!
+            "clip_eps_high": 0.2,
+            "group_size": 8,
+            "learning_rate": 5e-6,
+            "train_batch_size": 2,
+            "max_new_tokens": 1024,
+            # SDPO-специфичные
+            "sdpo_distillation_topk": 50,  # Top-K distillation
+            "sdpo_ema_rate": 0.0,  # Teacher = Ref model
+            "description": "🔥 SDPO с Top-K Distillation",
+        },
+    }
+    
+    preset = ALGORITHM_PRESETS[algorithm]
+    
+    # Показываем информацию о пресете
+    if algorithm == "sdpo":
+        st.sidebar.info(
+            "🎓 **SDPO требует reference модель!**\n\n"
+            "KL weight автоматически установлен > 0 для загрузки teacher модели.\n\n"
+            "**Оптимизации из verl:**\n"
+            "• Top-K Distillation (k=50)\n"
+            "• Teacher = Reference Model"
+        )
+    elif algorithm == "dapo":
+        st.sidebar.info(
+            "🎯 **DAPO пресет:**\n\n"
+            "• Асимметричный клиппинг (0.28)\n"
+            "• Dynamic sampling\n"
+            "• Token-level loss"
+        )
+    elif algorithm == "dr_grpo":
+        st.sidebar.info(
+            "🔬 **Dr.GRPO пресет:**\n\n"
+            "• Без деления на std\n"
+            "• Фиксированная нормализация\n"
+            "• KL weight = 0.001"
+        )
     
     # Генерация
     group_size = st.sidebar.slider(
         "Group size (G)",
         min_value=8,
         max_value=32,
-        value=8,
+        value=preset.get("group_size", 8),
         help="Количество генераций на один промпт. Важно: для GRPO обычно нужно G>=8 для стабильного обучения."
     )
 
@@ -1585,7 +1786,7 @@ def render_grpo_sidebar_config():
         "Max new tokens",
         min_value=128,
         max_value=16384,
-        value=1024,
+        value=preset.get("max_new_tokens", 1024),  # 🔥 Из пресета
         step=128,
         help="Максимальная длина генерируемого ответа"
     )
@@ -1599,11 +1800,17 @@ def render_grpo_sidebar_config():
         help="Температура сэмплирования"
     )
     
-    # Обучение
+    # Обучение — learning rate зависит от метода тюнинга
+    # Если LoRA — используем 5e-5, если full fine-tuning — из пресета (5e-6)
+    lr_options = [1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 1e-5, 3e-5, 5e-5, 1e-4]
+    # Берём ближайшее значение из пресета
+    preset_lr = preset.get("learning_rate", 5e-6)
+    default_lr = min(lr_options, key=lambda x: abs(x - preset_lr))
+    
     grpo_learning_rate = st.sidebar.select_slider(
         "Learning Rate (GRPO)",
-        options=[1e-7, 5e-7, 1e-6, 3e-6, 5e-6, 1e-5, 3e-5, 5e-5, 1e-4],
-        value=5e-5,
+        options=lr_options,
+        value=default_lr,  # 🔥 Из пресета
         format_func=lambda x: f"{x:.0e}",
         help="""**Для LoRA:** рекомендуется **5e-5** — сразу начинает учиться.
 **Для full fine-tuning:** 1e-6 — 5e-6.
@@ -1614,7 +1821,7 @@ def render_grpo_sidebar_config():
         "Train Batch Size",
         min_value=1,
         max_value=128,
-        value=2,
+        value=preset.get("train_batch_size", 2),  # 🔥 Из пресета
         step=1,
         help="Размер микро-батча при обучении на опыте. Уменьшите до 1-2, если возникает OOM"
     )
@@ -1652,20 +1859,34 @@ def render_grpo_sidebar_config():
         help="Сколько раз обновлять политику на каждом батче rollout'ов"
     )
     
-    # KL
-    kl_weight = st.sidebar.slider(
-        "KL weight",
-        min_value=0.0,
-        max_value=0.1,
-        value=0.0,
-        step=0.001,
-        format="%.3f",
-        help="""**KL penalty** ограничивает отклонение от исходной политики.
+    # KL — используем пресет для default value!
+    kl_weight_default = preset.get("kl_weight", 0.0)
+    kl_weight_help = """**KL penalty** ограничивает отклонение от исходной политики.
 
 - **0.0** — без KL (обычно для full fine-tuning)
 - **0.001** — стандартное значение (если нестабильно)
 - **0.01+** — сильный constraint"""
+    
+    if algorithm == "sdpo":
+        kl_weight_help += "\n\n🔥 **SDPO:** KL > 0 обязателен для загрузки teacher модели!"
+    
+    kl_weight = st.sidebar.slider(
+        "KL weight",
+        min_value=0.0,
+        max_value=0.1,
+        value=kl_weight_default,  # 🔥 Используем пресет!
+        step=0.001,
+        format="%.3f",
+        help=kl_weight_help
     )
+    
+    # 🔥 Предупреждение если SDPO с kl_weight=0
+    if algorithm == "sdpo" and kl_weight == 0.0:
+        st.sidebar.warning(
+            "⚠️ **SDPO без reference модели!**\n\n"
+            "Рекомендуется KL weight > 0 для загрузки teacher модели. "
+            "Без неё teacher = student (менее эффективно)."
+        )
     
     # Клиппинг и продвинутые параметры
     with st.sidebar.expander("⚙️ Продвинутые параметры"):
@@ -1673,7 +1894,7 @@ def render_grpo_sidebar_config():
         clip_eps_high = st.slider(
             "Clip ε (high)", 
             0.1, 0.4, 
-            0.28 if algorithm == "dapo" else 0.2, 
+            preset.get("clip_eps_high", 0.2),  # 🔥 Из пресета!
             0.01,
             help="DAPO рекомендует 0.28 для верхней границы"
         )
@@ -1693,6 +1914,12 @@ def render_grpo_sidebar_config():
         if algorithm == "dapo":
             st.markdown("---")
             st.markdown("**🎯 DAPO-специфичные настройки**")
+            st.success(
+                "✅ **DAPO пресет применён!**\n\n"
+                "• Clip ε high = 0.28 (асимметричный)\n"
+                "• Dynamic sampling = ON\n"
+                "• Token-level loss = ON"
+            )
             
             dynamic_sampling = st.checkbox(
                 "Dynamic sampling",
@@ -1700,9 +1927,18 @@ def render_grpo_sidebar_config():
                 help=(
                     "Фильтровать группы где все rewards одинаковы (zero-gradient).\n\n"
                     "**⚠️ Замедляет обучение** — делает дополнительные генерации!\n"
-                    "Отключите если скорость важнее качества."
+                    "Отключите если скорость важнее качества.\n\n"
+                    "**⚠️ Multi-GPU:** может вызывать NCCL timeout если GPU получают разное кол-во данных!"
                 )
             )
+            
+            # Предупреждение для multi-GPU
+            if dynamic_sampling:
+                st.warning(
+                    "⚠️ **Multi-GPU + Dynamic sampling**\n\n"
+                    "При 2+ GPU может вызывать рассинхронизацию (NCCL timeout). "
+                    "Рекомендуется отключить dynamic sampling или уменьшить max_refill_rounds до 1."
+                )
             
             # Максимум попыток добора (только если dynamic_sampling включён)
             if dynamic_sampling:
@@ -1710,12 +1946,13 @@ def render_grpo_sidebar_config():
                     "Max refill rounds",
                     min_value=1,
                     max_value=8,
-                    value=3,
+                    value=1,  # 🔥 Уменьшил default для стабильности
                     step=1,
                     help=(
                         "Сколько раз пытаться добирать группы.\n"
-                        "**8** = максимум (медленно, но больше данных)\n"
-                        "**2-3** = быстрее (рекомендуется)"
+                        "**1** = рекомендуется для Multi-GPU (минимум рассинхронизации)\n"
+                        "**2-3** = только для Single-GPU\n"
+                        "**8** = максимум (медленно)"
                     )
                 )
             else:
@@ -1730,28 +1967,149 @@ def render_grpo_sidebar_config():
         elif algorithm == "dr_grpo":
             st.markdown("---")
             st.markdown("**🔬 Dr.GRPO-специфичные настройки**")
-            st.info(
-                "Dr.GRPO автоматически:\n"
-                "• Отключает деление на std\n"
-                "• Использует фиксированную нормализацию по длине"
+            st.success(
+                "✅ **Dr.GRPO пресет применён!**\n\n"
+                "• KL weight = 0.001\n"
+                "• Без деления на std\n"
+                "• Фиксированная нормализация"
             )
             # Dr.GRPO не использует dynamic_sampling и token_level_loss
             dynamic_sampling = False
             max_refill_rounds = 0
             token_level_loss = False
+            # SDPO параметры не нужны
+            sdpo_success_threshold = 0.5
+            sdpo_alpha = 0.5
+            sdpo_loss_weight = 1.0
+            sdpo_distillation_topk = None
+            sdpo_full_logit_distillation = False
+            sdpo_ema_rate = 0.0
+        
+        elif algorithm == "sdpo":
+            st.markdown("---")
+            st.markdown("**🎓 SDPO-специфичные настройки**")
+            st.success(
+                "✅ **SDPO пресет применён!**\n\n"
+                "• KL weight = 0.01 (для загрузки teacher модели)\n"
+                "• Top-K Distillation = 50 (экономия памяти)\n"
+                "• Teacher = Reference Model"
+            )
+            
+            sdpo_success_threshold = st.slider(
+                "Success threshold",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.5,
+                step=0.1,
+                help="Порог reward для 'успешной' траектории. Траектории с reward >= threshold становятся учителем."
+            )
+            
+            sdpo_alpha = st.slider(
+                "Alpha (KL type)",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.5,
+                step=0.1,
+                help="0 = Forward KL (mode-seeking), 1 = Reverse KL (mode-covering), 0.5 = Jensen-Shannon (рекомендуется)"
+            )
+            
+            sdpo_loss_weight = st.slider(
+                "Distillation loss weight",
+                min_value=0.0,
+                max_value=5.0,
+                value=1.0,
+                step=0.1,
+                help="Вес distillation loss относительно GRPO loss. total_loss = grpo_loss + weight * distill_loss"
+            )
+            
+            st.markdown("---")
+            st.markdown("**🔥 Оптимизации памяти (из verl)**")
+            
+            # 🔥 Используем пресет для Top-K
+            preset_topk = preset.get("sdpo_distillation_topk", 50)
+            sdpo_distillation_topk = st.number_input(
+                "Top-K Distillation (k)",
+                min_value=0,
+                max_value=500,
+                value=preset_topk,  # 🔥 Из пресета!
+                step=10,
+                help="🔥 Вместо KL по всему vocab (152k) используем только top-k токенов. "
+                     "k=50-100 экономит ~99% памяти! 0 = отключено"
+            )
+            sdpo_distillation_topk = sdpo_distillation_topk if sdpo_distillation_topk > 0 else None
+            
+            sdpo_full_logit_distillation = sdpo_distillation_topk is not None
+            
+            # 🔥 Используем пресет для EMA
+            preset_ema = preset.get("sdpo_ema_rate", 0.0)
+            sdpo_ema_rate = st.slider(
+                "EMA Teacher rate",
+                min_value=0.0,
+                max_value=0.1,
+                value=preset_ema,  # 🔥 Из пресета!
+                step=0.01,
+                format="%.2f",
+                help="EMA update rate для Teacher модели. 0 = Teacher=Reference Model (рекомендуется). "
+                     ">0 = медленно обновляемый teacher (более стабильно, но требует память)"
+            )
+            
+            # SDPO использует dynamic_sampling по умолчанию
+            dynamic_sampling = st.checkbox(
+                "Dynamic sampling",
+                value=False,  # 🔥 Отключаем по умолчанию для стабильности multi-GPU
+                help=(
+                    "Фильтровать группы где все rewards одинаковы.\n\n"
+                    "**⚠️ Multi-GPU:** может вызывать NCCL timeout! "
+                    "Рекомендуется **отключить** при 2+ GPU."
+                )
+            )
+            
+            if dynamic_sampling:
+                st.warning(
+                    "⚠️ **Multi-GPU + Dynamic sampling**\n\n"
+                    "При 2+ GPU может вызывать рассинхронизацию. "
+                    "Отключите для стабильности!"
+                )
+                max_refill_rounds = st.slider(
+                    "Max refill rounds",
+                    min_value=1,
+                    max_value=3,
+                    value=1,
+                    help="Сколько раз добирать группы. 1 = минимум для Multi-GPU"
+                )
+            else:
+                max_refill_rounds = 0
+            token_level_loss = False
         
         else:  # GRPO
             st.markdown("---")
             st.markdown("**📊 GRPO-специфичные настройки**")
-            st.info(
-                "Стандартный GRPO:\n"
-                "• Нормализация advantages: (r - mean) / std\n"
-                "• Sample-level loss агрегация"
+            st.success(
+                "✅ **GRPO пресет применён!**\n\n"
+                "• KL weight = 0 (без penalty)\n"
+                "• Нормализация: (r - mean) / std\n"
+                "• Sample-level loss"
             )
             # GRPO не использует dynamic_sampling и token_level_loss
             dynamic_sampling = False
             max_refill_rounds = 0
             token_level_loss = False
+            # SDPO параметры не нужны
+            sdpo_success_threshold = 0.5
+            sdpo_alpha = 0.5
+            sdpo_loss_weight = 1.0
+            sdpo_distillation_topk = None
+            sdpo_full_logit_distillation = False
+            sdpo_ema_rate = 0.0
+        
+        # DAPO тоже нужны default SDPO параметры
+        if algorithm == "dapo":
+            sdpo_success_threshold = 0.5
+            sdpo_alpha = 0.5
+            sdpo_loss_weight = 1.0
+            sdpo_distillation_topk = None
+            sdpo_full_logit_distillation = False
+            sdpo_ema_rate = 0.0
 
         # Liger настройки берутся из общих настроек Precision & Memory (сайдбар)
         # Здесь только вычисляем loss_type на основе алгоритма
@@ -1759,6 +2117,7 @@ def render_grpo_sidebar_config():
             "grpo": "grpo",
             "dapo": "dapo", 
             "dr_grpo": "dr_grpo",
+            "sdpo": "dr_grpo",  # SDPO использует Dr.GRPO как базу
         }
         grpo_liger_loss_type = algorithm_to_loss_type.get(algorithm, "grpo")
         
@@ -1955,6 +2314,14 @@ def render_grpo_sidebar_config():
         "grpo_max_refill_rounds": max_refill_rounds,
         "grpo_token_level_loss": token_level_loss,
         "grpo_min_lr_ratio": min_lr_ratio,
+        
+        # SDPO параметры
+        "sdpo_success_threshold": sdpo_success_threshold,
+        "sdpo_alpha": sdpo_alpha,
+        "sdpo_loss_weight": sdpo_loss_weight,
+        "sdpo_distillation_topk": sdpo_distillation_topk,  # 🔥 Top-K Distillation
+        "sdpo_full_logit_distillation": sdpo_full_logit_distillation,
+        "sdpo_ema_rate": sdpo_ema_rate,
 
         # Liger loss_type — автоматически из алгоритма
         # Остальные Liger настройки берутся из distributed_config (Precision & Memory)
@@ -6671,7 +7038,7 @@ def main():
                             loss_history = metrics.get("loss_history", [])
                             steps_history = metrics.get("steps_history", [])
                             
-                            for ckpt in checkpoints:
+                            for ckpt_idx, ckpt in enumerate(checkpoints):
                                 ckpt_loss = ckpt.get("loss")
                                 # Если loss нет в чекпоинте, пытаемся найти в loss_history
                                 if ckpt_loss is None and steps_history and loss_history:
@@ -6681,13 +7048,41 @@ def main():
                                         if idx < len(loss_history):
                                             ckpt_loss = loss_history[idx]
                                 
-                                if ckpt_loss is not None:
-                                    st.caption(f"Step {ckpt['step']}: Loss {ckpt_loss:.4f} | {ckpt['path']}")
-                                else:
-                                    st.caption(f"Step {ckpt['step']}: {ckpt['path']}")
+                                # Колонки: инфо о чекпоинте + кнопка удаления
+                                ckpt_col1, ckpt_col2 = st.columns([5, 1])
+                                
+                                with ckpt_col1:
+                                    # Проверяем существует ли чекпоинт на диске
+                                    ckpt_path = Path(ckpt['path'])
+                                    if not ckpt_path.is_absolute():
+                                        ckpt_path = PROJECT_ROOT / ckpt['path']
+                                    ckpt_exists = ckpt_path.exists()
+                                    
+                                    if ckpt_loss is not None:
+                                        info_text = f"Step {ckpt['step']}: Loss {ckpt_loss:.4f} | {ckpt['path']}"
+                                    else:
+                                        info_text = f"Step {ckpt['step']}: {ckpt['path']}"
+                                    
+                                    if not ckpt_exists:
+                                        st.caption(f"~~{info_text}~~ *(удален с диска)*")
+                                    else:
+                                        st.caption(info_text)
+                                
+                                with ckpt_col2:
+                                    if ckpt_exists:
+                                        # Уникальный ключ для каждой кнопки удаления чекпоинта
+                                        del_key = f"del_ckpt_{run_id}_{ckpt['step']}_{ckpt_idx}"
+                                        if st.button("🗑️", key=del_key, help=f"Удалить чекпоинт step {ckpt['step']}"):
+                                            success, msg = delete_checkpoint(run_id, ckpt['path'])
+                                            if success:
+                                                st.toast(msg, icon="✅")
+                                                time.sleep(0.5)
+                                                st.rerun()
+                                            else:
+                                                st.toast(msg, icon="❌")
                         
-                        # Кнопки
-                        btn_col1, btn_col2, btn_col3 = st.columns(3)
+                        # Кнопки действий
+                        btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
                         with btn_col1:
                             if st.button(f"📊 {t('metrics.title')}", key=f"metrics_{run_id}"):
                                 st.session_state.current_run_id = run_id
@@ -6758,6 +7153,41 @@ def main():
                             elif checkpoints:
                                 # Чекпоинты были в метриках, но удалены с диска
                                 st.button(f"⚠️ {t('status.files_deleted')}", key=f"gone_{run_id}", disabled=True, help=t("help.checkpoint_not_found"))
+                        
+                        with btn_col4:
+                            # Кнопка удаления эксперимента с подтверждением
+                            delete_confirm_key = f"delete_confirm_{run_id}"
+                            
+                            # Инициализируем состояние подтверждения если его нет
+                            if delete_confirm_key not in st.session_state:
+                                st.session_state[delete_confirm_key] = False
+                            
+                            if not st.session_state[delete_confirm_key]:
+                                # Первое нажатие - показываем кнопку удаления
+                                if st.button("🗑️ Удалить", key=f"del_exp_{run_id}", help="Удалить эксперимент со всеми чекпоинтами"):
+                                    st.session_state[delete_confirm_key] = True
+                                    st.rerun()
+                            else:
+                                # Показываем кнопки подтверждения
+                                confirm_col1, confirm_col2 = st.columns(2)
+                                with confirm_col1:
+                                    if st.button("✅ Да", key=f"confirm_del_{run_id}", type="primary"):
+                                        # Выполняем удаление
+                                        success, msg = delete_experiment(run_id)
+                                        st.session_state[delete_confirm_key] = False
+                                        if success:
+                                            st.toast(msg, icon="✅")
+                                            # Если удалили текущий выбранный run, сбрасываем
+                                            if st.session_state.current_run_id == run_id:
+                                                st.session_state.current_run_id = None
+                                            time.sleep(0.5)
+                                            st.rerun()
+                                        else:
+                                            st.toast(msg, icon="❌")
+                                with confirm_col2:
+                                    if st.button("❌ Нет", key=f"cancel_del_{run_id}"):
+                                        st.session_state[delete_confirm_key] = False
+                                        st.rerun()
                         
                         # Показываем что выбрано
                         if st.session_state.current_run_id == run_id:

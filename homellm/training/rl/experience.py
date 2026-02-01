@@ -72,6 +72,7 @@ class Experience:
     action_mask: Optional[torch.Tensor] = None
     kl: Optional[torch.Tensor] = None
     prompt_id: Optional[int] = None
+    prompt_ids: Optional[List[int]] = None  # Список prompt_ids для batch (для SDPO)
     completion_text: Optional[str] = None  # Для отладки
     
     def to(self, device: torch.device) -> "ReplayBuffer":
@@ -148,6 +149,8 @@ def join_experience_batch(items: List[Experience]) -> Experience:
     # Для prompt_length берём первый (должны быть одинаковые в группе)
     batch_data["prompt_length"] = items[0].prompt_length if items else 0
     batch_data["prompt_id"] = items[0].prompt_id if items else None
+    # 🎓 SDPO: сохраняем все prompt_ids для batch
+    batch_data["prompt_ids"] = [item.prompt_id for item in items] if items else None
     batch_data["completion_text"] = None
     
     return Experience(**batch_data)
