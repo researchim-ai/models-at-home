@@ -4,19 +4,19 @@
 
 Пример использования:
     # Базовое обучение
-    python -m homellm.training.rl.train_gsm8k --model Qwen/Qwen2.5-0.5B-Instruct
+    python -m homellm.training.rl.train_rl --model Qwen/Qwen2.5-0.5B-Instruct
 
     # С кастомными параметрами
-    python -m homellm.training.rl.train_gsm8k \
+    python -m homellm.training.rl.train_rl \
         --model Qwen/Qwen2.5-1.5B-Instruct \
         --algorithm drgrpo \
         --batch_size 4 \
         --group_size 8 \
         --max_samples 1000 \
-        --output_dir ./output/grpo_gsm8k
+        --output_dir ./output/grpo
 
     # С W&B логированием
-    python -m homellm.training.rl.train_gsm8k \
+    python -m homellm.training.rl.train_rl \
         --model Qwen/Qwen2.5-0.5B-Instruct \
         --use_wandb \
         --wandb_project my-grpo-experiments
@@ -712,6 +712,14 @@ def main():
     
     # Запускаем обучение
     logger.info("Начинаем обучение...")
+    
+    # 🔥 Логируем system prompt чтобы было видно что используется
+    user_sys_prompt = getattr(config, 'user_system_prompt', None)
+    if user_sys_prompt:
+        logger.info(f"📝 System prompt (из UI): {user_sys_prompt[:200]}...")
+    else:
+        logger.info(f"📝 System prompt: (используется default из reasoning_format={config.reasoning_format})")
+    
     trainer.train(train_dataset)
     
     logger.info("=" * 60)

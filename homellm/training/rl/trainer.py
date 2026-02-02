@@ -2048,6 +2048,7 @@ Previous attempt feedback:
                     s.prompt,
                     self.tokenizer,
                     self.config.reasoning_format,
+                    system_prompt=getattr(self.config, 'user_system_prompt', None),
                 )
                 for s in batch_samples
             ]
@@ -2080,7 +2081,12 @@ Previous attempt feedback:
                     extra_indices = [random.randrange(0, len(dataset)) for _ in range(missing)]
                     extra_samples = [dataset[i] for i in extra_indices]
                     extra_prompts = [
-                        build_reasoning_prompt(s.prompt, self.tokenizer, self.config.reasoning_format)
+                        build_reasoning_prompt(
+                            s.prompt, 
+                            self.tokenizer, 
+                            self.config.reasoning_format,
+                            system_prompt=getattr(self.config, 'user_system_prompt', None),
+                        )
                         for s in extra_samples
                     ]
                     extra_refs = [s.reference_answer for s in extra_samples]
@@ -2796,6 +2802,7 @@ Previous attempt feedback:
                 sample.prompt,
                 self.tokenizer,
                 self.config.reasoning_format,
+                system_prompt=getattr(self.config, 'user_system_prompt', None),
             )
             
             # Генерируем один ответ (greedy)
@@ -3124,6 +3131,7 @@ Previous attempt feedback:
             prompt,
             self.tokenizer,
             self.config.reasoning_format,
+            system_prompt=getattr(self.config, 'user_system_prompt', None),
         )
         
         inputs = self.tokenizer(

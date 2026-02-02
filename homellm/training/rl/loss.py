@@ -106,7 +106,7 @@ def masked_sum(
 def compute_advantages(
     returns: torch.Tensor,
     use_std_normalization: bool = True,
-    eps: float = 1e-8,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     """
     Вычисляет advantages (преимущества) для группы rollout'ов.
@@ -117,20 +117,41 @@ def compute_advantages(
     Формула Dr.GRPO (без деления на std):
         A_i = r_i - mean(r)
     
+    🔥 Важно (из verl): для группы из 1 элемента:
+        mean = 0, std = 1 (чтобы избежать деления на 0)
+    
     Args:
         returns: Rewards для группы [group_size] или [batch, group_size]
         use_std_normalization: Делить ли на std (True для GRPO, False для DrGRPO)
-        eps: Эпсилон для стабильности
+        eps: Эпсилон для стабильности (verl использует 1e-6)
         
     Returns:
         Advantages той же размерности
     """
+    # 🔥 Обработка группы из 1 элемента (из verl)
+    # В этом случае mean = 0, std = 1 чтобы advantage = reward
+    if returns.numel() == 1:
+        return returns.clone()
+    
+    # Проверяем размер группы по последнему измерению
+    group_size = returns.size(-1) if returns.dim() > 0 else 1
+    if group_size == 1:
+        # Для группы из 1: advantage = reward (mean=0, std=1)
+        return returns.clone()
+    
     mean_return = returns.mean(dim=-1, keepdim=True)
     advantages = returns - mean_return
     
     if use_std_normalization:
         std_return = returns.std(dim=-1, keepdim=True)
-        advantages = advantages / (std_return + eps)
+        # 🔥 Если std очень маленький (все rewards одинаковы), не делим
+        # Это предотвращает очень большие advantages
+        std_return = torch.where(
+            std_return < eps,
+            torch.ones_like(std_return),  # Используем 1 вместо деления на eps
+            std_return
+        )
+        advantages = advantages / std_return
     
     return advantages
 
@@ -220,7 +241,10 @@ class GRPOLoss(nn.Module):
             kl = torch.zeros_like(log_probs)
         
         # Policy ratio: r(θ) = π(a|s) / π_old(a|s) = exp(log_π - log_π_old)
-        ratio = (log_probs - old_log_probs).exp()
+        # 🔥 Clamp для численной стабильности (из verl)
+        log_ratio = log_probs - old_log_probs
+        log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+        ratio = log_ratio.exp()
         
         # PPO-style clipped surrogate loss
         # Для DAPO используем асимметричный клиппинг [1-eps_low, 1+eps_high]
@@ -230,11 +254,19 @@ class GRPOLoss(nn.Module):
         )
         
         # Surrogate objectives
-        surr1 = ratio * advantages
-        surr2 = ratio_clipped * advantages
+        # verl использует max(-r*A, -clip(r)*A), что эквивалентно -min(r*A, clip(r)*A)
+        pg_losses1 = -advantages * ratio
+        pg_losses2 = -advantages * ratio_clipped
+        clip_pg_losses = torch.maximum(pg_losses1, pg_losses2)
         
-        # Loss = -min(surr1, surr2) + kl_weight * kl
-        policy_loss = -torch.min(surr1, surr2)
+        # 🔥 Dual-clip PPO для negative advantages (из verl)
+        # Нижний порог c=3.0 для стабильности при A < 0
+        clip_ratio_c = 3.0
+        pg_losses_lower = -advantages * clip_ratio_c
+        dual_clip_losses = torch.minimum(pg_losses_lower, clip_pg_losses)
+        
+        # Применяем dual-clip только для negative advantages
+        policy_loss = torch.where(advantages < 0, dual_clip_losses, clip_pg_losses)
         loss_per_token = policy_loss + self.kl_weight * kl
         
         # Агрегация loss
@@ -270,6 +302,8 @@ class GRPOLoss(nn.Module):
             "advantages_mean": advantages.mean().item(),
             "advantages_std": advantages.std().item(),
             "clip_fraction": ((ratio < 1 - self.clip_eps_low) | (ratio > 1 + self.clip_eps_high)).float().mean().item(),
+            # 🔥 Dual-clip метрики (из verl)
+            "dual_clip_fraction": ((advantages < 0) & (clip_pg_losses > pg_losses_lower)).float().mean().item(),
         }
         self.last_components = metrics
         

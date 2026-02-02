@@ -1065,13 +1065,13 @@ def start_grpo_training(config: dict) -> tuple[str, subprocess.Popen]:
             "accelerate", "launch",
             "--config_file", config_file,
             "--num_processes", str(num_gpus),
-            "-m", "homellm.training.rl.train_gsm8k",
+            "-m", "homellm.training.rl.train_rl",
             "--config_json", config_json,
         ]
     else:
         # Обычный запуск (single GPU или CPU)
         cmd = [
-            sys.executable, "-m", "homellm.training.rl.train_gsm8k",
+            sys.executable, "-m", "homellm.training.rl.train_rl",
             "--config_json", config_json,
         ]
     
@@ -1079,9 +1079,9 @@ def start_grpo_training(config: dict) -> tuple[str, subprocess.Popen]:
     cmd_path = run_dir / "command.txt"
     with open(cmd_path, "w") as f:
         if distributed_mode != "default" and config_file:
-            f.write(f"accelerate launch --config_file {config_file} --num_processes {num_gpus} -m homellm.training.rl.train_gsm8k --config_json <config from {config_path}>")
+            f.write(f"accelerate launch --config_file {config_file} --num_processes {num_gpus} -m homellm.training.rl.train_rl --config_json <config from {config_path}>")
         else:
-            f.write(f"{sys.executable} -m homellm.training.rl.train_gsm8k --config_json <config from {config_path}>")
+            f.write(f"{sys.executable} -m homellm.training.rl.train_rl --config_json <config from {config_path}>")
     
     stdout_file = open(stdout_path, "w")
     stderr_file = open(stderr_path, "w")
@@ -2581,8 +2581,28 @@ Therefore, the answer is X.
         st.markdown("#### 📝 Шаблон промпта")
         st.caption(t("grpo.prompt_template_desc"))
         
-        # Пресеты шаблонов (Reasoning по умолчанию)
+        # Опция: использовать system_prompt из датасета
+        system_prompt_fields = ["-- использовать свой --"]
+        if dataset_samples:
+            sample = dataset_samples[0] if isinstance(dataset_samples[0], dict) else {}
+            # Ищем поля которые могут содержать system prompt
+            for key in sample.keys():
+                if any(x in key.lower() for x in ["system", "instruction", "context"]):
+                    system_prompt_fields.append(key)
+        
+        use_dataset_system = st.selectbox(
+            "System prompt из датасета",
+            options=system_prompt_fields,
+            help="Если в датасете есть поле с system prompt, выберите его. Иначе используйте свой ниже.",
+            key="grpo_system_from_dataset",
+        )
+        
+        # Пресеты шаблонов (Custom по умолчанию!)
         template_presets = {
+            "🎯 Custom (свой шаблон)": {
+                "system": st.session_state.grpo_system_prompt,
+                "template": st.session_state.grpo_prompt_template,
+            },
             "🤔 Reasoning (теги <reasoning>/<answer>)": {
                 "system": """You are a helpful assistant that solves problems step by step.
 Think through the problem carefully inside <reasoning>...</reasoning> tags.
@@ -2596,10 +2616,6 @@ Step 2: ...
 Therefore, the answer is X.
 </reasoning>
 <answer>X</answer>""",
-                "template": "{{prompt}}"
-            },
-            "🧮 Math (GSM8K стиль)": {
-                "system": "You are a helpful assistant that solves math problems step by step. Show your reasoning, then provide the final numerical answer after ####.",
                 "template": "{{prompt}}"
             },
             "🧮 Math RU (русский)": {
@@ -2622,41 +2638,58 @@ The reasoning process and answer are enclosed within <think>...</think> and <ans
                 "system": "",
                 "template": "{{prompt}}"
             },
-            "🎯 Custom (свой шаблон)": {
-                "system": "",
-                "template": "{{prompt}}"
-            },
         }
         
+        # По умолчанию Custom
+        preset_options = list(template_presets.keys())
+        default_idx = 0  # Custom первый
+        
         selected_preset = st.selectbox(
-            "Выберите пресет",
-            options=list(template_presets.keys()),
+            "Пресеты (для быстрой настройки)",
+            options=preset_options,
+            index=default_idx,
             key="grpo_template_preset",
+            help="Выберите пресет чтобы заполнить поля. **Custom** сохраняет ваши настройки.",
         )
         
         preset_data = template_presets[selected_preset]
         
-        # System prompt
+        # System prompt — ВСЕГДА показываем и сохраняем
+        # Если выбран пресет (не Custom) и поле пустое — подставляем из пресета
+        current_system = st.session_state.grpo_system_prompt
+        if "Custom" not in selected_preset and not current_system:
+            current_system = preset_data["system"]
+        
         system_prompt = st.text_area(
-            "System prompt (необязательно)",
-            value=st.session_state.grpo_system_prompt or preset_data["system"],
-            height=80,
+            "System prompt",
+            value=current_system,
+            height=120,
             key="grpo_system_prompt_input",
-            help="Системный промпт для модели. Будет добавлен через chat_template если доступен."
+            help="Системный промпт для модели. Этот текст будет использован при тренировке!"
         )
+        # 🔥 ВАЖНО: Сохраняем в session_state сразу!
         st.session_state.grpo_system_prompt = system_prompt
+        
+        # Кнопка для загрузки пресета
+        if "Custom" not in selected_preset:
+            if st.button(f"📥 Загрузить пресет '{selected_preset}'", key="load_preset_btn"):
+                st.session_state.grpo_system_prompt = preset_data["system"]
+                st.session_state.grpo_prompt_template = preset_data["template"]
+                st.rerun()
         
         # Шаблон промпта
         st.markdown("**Шаблон пользовательского промпта:**")
         st.caption("Доступные переменные: `{{prompt}}` (поле промпта), `{{reference}}` (поле ответа), `{{metadata.имя}}` (доп. поля)")
         
+        current_template = st.session_state.grpo_prompt_template
         prompt_template = st.text_area(
             "Шаблон",
-            value=st.session_state.grpo_prompt_template if "Custom" in selected_preset else preset_data["template"],
-            height=100,
+            value=current_template,
+            height=80,
             key="grpo_prompt_template_input",
             label_visibility="collapsed",
         )
+        # 🔥 ВАЖНО: Сохраняем в session_state сразу!
         st.session_state.grpo_prompt_template = prompt_template
         
         # Превью готового промпта
@@ -6727,7 +6760,7 @@ def main():
                     "❌ Выбран метод 'lora' или 'qlora', но lora_alpha не установлен! "
                     "Убедитесь что в секции '🎯 Метод тюнинга' указан параметр 'LoRA alpha'."
                 )
-            # Копируем LoRA параметры из model_config в full_config для передачи в train_gsm8k.py
+            # Копируем LoRA параметры из model_config в full_config для передачи в train_rl.py
             full_config["use_lora"] = True
             full_config["lora_r"] = model_config["lora_r"]
             full_config["lora_alpha"] = model_config["lora_alpha"]

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "models-at-home"
 version = "0.1.0"
-description = "Тренируй нейросети дома. Учись. Создавай."
+description = "Делай модельки дома"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
@@ -53,7 +53,7 @@ dev = [
 [project.scripts]
 mah-train = "homellm.training.pretrain:main"
 mah-chat = "homellm.cli.chat:main"
-mah-grpo = "homellm.training.rl.train_gsm8k:main"
+mah-grpo = "homellm.training.rl.train_rl:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

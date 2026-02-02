@@ -253,7 +253,7 @@ def run_unsloth_grpo(
             logger.warning("⚠️ Multi-GPU + fast_inference (vLLM) НЕ поддерживается Unsloth!")
             logger.warning("   Отключаю fast_inference для стабильной работы.")
             logger.warning("   Для максимальной скорости используйте single GPU:")
-            logger.warning("   CUDA_VISIBLE_DEVICES=0 python -m homellm.training.rl.train_gsm8k")
+            logger.warning("   CUDA_VISIBLE_DEVICES=0 python -m homellm.training.rl.train_rl")
             logger.warning("=" * 60)
             logger.info(f"🦥 Multi-GPU ({world_size} GPUs): Training with DDP (без vLLM)")
         else:

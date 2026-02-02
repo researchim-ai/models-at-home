@@ -57,17 +57,17 @@ trainer.train(dataset)
 
 ```bash
 # Базовое обучение
-python -m homellm.training.rl.train_gsm8k --model Qwen/Qwen2.5-0.5B-Instruct
+python -m homellm.training.rl.train_rl --model Qwen/Qwen2.5-0.5B-Instruct
 
 # С Dr.GRPO и W&B
-python -m homellm.training.rl.train_gsm8k \
+python -m homellm.training.rl.train_rl \
     --model Qwen/Qwen2.5-1.5B-Instruct \
     --algorithm drgrpo \
     --use_wandb \
     --max_samples 5000
 
 # С 4-bit квантизацией для 3B модели
-python -m homellm.training.rl.train_gsm8k \
+python -m homellm.training.rl.train_rl \
     --model Qwen/Qwen2.5-3B-Instruct \
     --use_4bit \
     --batch_size 2 \
@@ -198,7 +198,7 @@ homellm/training/rl/
 ├── loss.py              # Loss функции
 ├── experience.py        # Experience буфер
 ├── rollout.py           # Генерация rollout'ов
-├── train_gsm8k.py       # Скрипт обучения
+├── train_rl.py       # Скрипт обучения
 ├── algorithms/          # (для будущих алгоритмов)
 ├── rewards/             # Reward функции
 │   ├── base.py
