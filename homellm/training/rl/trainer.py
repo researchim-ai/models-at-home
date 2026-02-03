@@ -1551,26 +1551,35 @@ Previous attempt feedback:
                 logger.info("⚠️ Референсная модель квантизирована (экономия памяти, но может быть менее точный KL)")
             else:
                 # Не квантизируем reference модель для точности KL
-                # Используем тот же dtype что и основная модель (или bfloat16 по умолчанию)
-                if not quantization_config:
-                    # Reference модель без градиентов: можно грузить в mp dtype для экономии памяти.
-                    mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
-                    if mp == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-                        ref_model_kwargs["dtype"] = torch.bfloat16
-                    elif mp == "fp16" and torch.cuda.is_available():
-                        ref_model_kwargs["dtype"] = torch.float16
-                    else:
-                        # fp32
-                        pass
-                logger.info("✅ Референсная модель НЕ квантизирована (точный KL divergence)")
+                # ВАЖНО: Всегда задаём dtype для reference модели (bf16/fp16 для FlashAttention)
+                mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
+                if mp == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                    ref_model_kwargs["dtype"] = torch.bfloat16
+                    logger.info("✅ Референсная модель в bfloat16 (точный KL divergence)")
+                elif mp == "fp16" and torch.cuda.is_available():
+                    ref_model_kwargs["dtype"] = torch.float16
+                    logger.info("✅ Референсная модель в float16 (точный KL divergence)")
+                else:
+                    # fp32 — но FlashAttention не будет работать!
+                    logger.info("✅ Референсная модель в float32 (точный KL divergence)")
+                    logger.warning("⚠️ FlashAttention не поддерживает fp32, будет использован sdpa")
             
-            # Flash Attention для reference модели (если не квантизирована)
-            if self.config.use_flash_attention and not (self.config.quantize_reference_model and quantization_config):
+            # Flash Attention для reference модели (только если dtype = bf16/fp16)
+            # FlashAttention НЕ поддерживает fp32!
+            ref_dtype = ref_model_kwargs.get("dtype")
+            if (self.config.use_flash_attention and 
+                not (self.config.quantize_reference_model and quantization_config) and
+                ref_dtype in (torch.bfloat16, torch.float16)):
                 try:
                     import flash_attn
                     ref_model_kwargs["attn_implementation"] = "flash_attention_2"
+                    logger.info("✅ Reference модель использует FlashAttention2")
                 except ImportError:
                     pass
+            else:
+                # Если fp32 или без dtype — используем sdpa
+                ref_model_kwargs["attn_implementation"] = "sdpa"
+                logger.info("ℹ️ Reference модель использует SDPA attention")
             
             self.reference_model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
