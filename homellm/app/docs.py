@@ -14,12 +14,17 @@ def render_docs():
     st.markdown(t("docs.welcome"))
 
     # Create tabs inside documentation for convenient navigation
-    doc_tab1, doc_tab2, doc_tab3, doc_tab4, doc_tab5 = st.tabs([
+    doc_tab1, doc_tab2, doc_tab3, doc_tab4, doc_tab5, doc_tab6, doc_tab7, doc_tab8, doc_tab9, doc_tab10 = st.tabs([
         f"🚀 {t('docs.quick_start')}", 
         f"📈 {t('docs.scaling_laws')}",
         f"🧠 {t('docs.how_it_works')}", 
         f"📖 {t('docs.terminology')}", 
-        f"💾 {t('docs.data_preparation')}"
+        f"💾 {t('docs.data_preparation')}",
+        f"🎯 {t('docs.grpo_tutorial')}",
+        f"🔧 {t('docs.lora_tutorial')}",
+        f"🖥️ {t('docs.distributed_training')}",
+        f"⚡ {t('docs.optimizations')}",
+        f"🛠️ {t('docs.troubleshooting')}"
     ])
 
     # --- 1. STEP-BY-STEP GUIDE (Pretrain + SFT) ---
@@ -209,3 +214,172 @@ def render_docs():
     # --- 5. DATA PREPARATION ---
     with doc_tab5:
         st.markdown(t("docs.data_prep_content"))
+
+    # --- 6. GRPO / RL TUTORIAL ---
+    with doc_tab6:
+        st.markdown(t("docs.grpo_intro"))
+        
+        # Algorithm comparison
+        st.markdown(f"### 🔬 {t('docs.grpo_algorithms')}")
+        
+        algo_col1, algo_col2, algo_col3 = st.columns(3)
+        
+        with algo_col1:
+            st.markdown(f"""
+**GRPO**
+- {t('docs.grpo_algo_standard')}
+- ✅ {t('docs.grpo_algo_simple')}
+- ⚠️ {t('docs.grpo_algo_length_bias')}
+""")
+        
+        with algo_col2:
+            st.markdown(f"""
+**Dr.GRPO**
+- {t('docs.drgrpo_algo_improved')}
+- ✅ {t('docs.drgrpo_algo_no_bias')}
+- ✅ {t('docs.drgrpo_algo_stable')}
+""")
+        
+        with algo_col3:
+            st.markdown(f"""
+**SDPO**
+- {t('docs.dapo_algo_advanced')}
+- ✅ {t('docs.dapo_algo_dynamic')}
+- ✅ {t('docs.dapo_algo_best')}
+""")
+        
+        st.markdown("---")
+        st.markdown(t("docs.grpo_content"))
+        
+        st.markdown("---")
+        st.markdown(f"### 🎁 {t('docs.grpo_rewards')}")
+        st.markdown(t("docs.grpo_rewards_content"))
+        
+        st.markdown("---")
+        st.markdown(f"### 💡 {t('docs.grpo_tips')}")
+        st.markdown(t("docs.grpo_tips_content"))
+
+    # --- 7. LORA TUTORIAL ---
+    with doc_tab7:
+        st.markdown(t("docs.lora_intro"))
+        
+        # Visual explanation
+        st.markdown(f"### 📐 {t('docs.lora_math')}")
+        st.latex(r"W_{new} = W_{frozen} + \alpha \cdot B \cdot A")
+        st.markdown(t("docs.lora_math_explanation"))
+        
+        st.markdown("---")
+        st.markdown(f"### ⚙️ {t('docs.lora_params')}")
+        st.markdown(t("docs.lora_params_content"))
+        
+        # Interactive recommendation
+        st.markdown(f"### 🎯 {t('docs.lora_recommendation')}")
+        
+        task_type = st.radio(
+            t("docs.lora_task_type"),
+            [t("docs.lora_task_sft"), t("docs.lora_task_grpo"), t("docs.lora_task_domain")],
+            horizontal=True,
+            key="lora_task_selector"
+        )
+        
+        if task_type == t("docs.lora_task_sft"):
+            st.success(t("docs.lora_rec_sft"))
+        elif task_type == t("docs.lora_task_grpo"):
+            st.success(t("docs.lora_rec_grpo"))
+        else:
+            st.success(t("docs.lora_rec_domain"))
+        
+        st.markdown("---")
+        st.markdown(t("docs.lora_content"))
+
+    # --- 8. DISTRIBUTED TRAINING ---
+    with doc_tab8:
+        st.markdown(t("docs.distributed_intro"))
+        
+        # Decision tree
+        st.markdown(f"### 🌳 {t('docs.distributed_decision')}")
+        
+        num_gpus = st.selectbox(
+            t("docs.distributed_num_gpus"),
+            ["1", "2-4", "8+"],
+            key="dist_gpu_selector"
+        )
+        
+        model_fits = st.checkbox(t("docs.distributed_model_fits"), value=True, key="dist_model_fits")
+        
+        if num_gpus == "1":
+            st.info(t("docs.distributed_rec_single"))
+        elif model_fits:
+            st.success(t("docs.distributed_rec_ddp"))
+        else:
+            st.success(t("docs.distributed_rec_fsdp"))
+        
+        st.markdown("---")
+        st.markdown(t("docs.distributed_content"))
+        
+        st.markdown("---")
+        st.markdown(f"### 📊 {t('docs.distributed_comparison')}")
+        st.markdown(t("docs.distributed_table"))
+
+    # --- 9. OPTIMIZATIONS ---
+    with doc_tab9:
+        st.markdown(t("docs.optimizations_intro"))
+        
+        # Checklist
+        st.markdown(f"### ✅ {t('docs.optimizations_checklist')}")
+        
+        opt_col1, opt_col2 = st.columns(2)
+        
+        with opt_col1:
+            st.markdown(f"""
+**{t('docs.opt_memory')}**
+- 🔲 Gradient Checkpointing
+- 🔲 Mixed Precision (bf16/fp16)
+- 🔲 Fused Loss (Liger)
+- 🔲 LoRA / QLoRA
+""")
+        
+        with opt_col2:
+            st.markdown(f"""
+**{t('docs.opt_speed')}**
+- 🔲 Flash Attention
+- 🔲 Liger Kernels
+- 🔲 torch.compile
+- 🔲 Larger Batch Size
+""")
+        
+        st.markdown("---")
+        st.markdown(t("docs.optimizations_content"))
+        
+        st.markdown("---")
+        st.markdown(f"### 💾 {t('docs.opt_vram_calc')}")
+        st.markdown(t("docs.optimizations_vram"))
+
+    # --- 10. TROUBLESHOOTING ---
+    with doc_tab10:
+        st.markdown(t("docs.troubleshooting_intro"))
+        
+        # Common issues accordion
+        st.markdown(f"### 🔥 {t('docs.trouble_common')}")
+        
+        with st.expander(f"💥 {t('docs.trouble_oom')}", expanded=False):
+            st.markdown(t("docs.trouble_oom_content"))
+        
+        with st.expander(f"📈 {t('docs.trouble_loss_spike')}", expanded=False):
+            st.markdown(t("docs.trouble_loss_spike_content"))
+        
+        with st.expander(f"📉 {t('docs.trouble_loss_plateau')}", expanded=False):
+            st.markdown(t("docs.trouble_loss_plateau_content"))
+        
+        with st.expander(f"🤖 {t('docs.trouble_gibberish')}", expanded=False):
+            st.markdown(t("docs.trouble_gibberish_content"))
+        
+        with st.expander(f"🐌 {t('docs.trouble_slow')}", expanded=False):
+            st.markdown(t("docs.trouble_slow_content"))
+        
+        with st.expander(f"🔄 {t('docs.trouble_grpo_no_improve')}", expanded=False):
+            st.markdown(t("docs.trouble_grpo_no_improve_content"))
+        
+        st.markdown("---")
+        st.markdown(f"### 🩺 {t('docs.trouble_diagnostics')}")
+        st.markdown(t("docs.troubleshooting_diagnostics"))
