@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import random
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, Union, Tuple
@@ -370,16 +371,33 @@ class GRPOTrainer:
             # ============================================================
             # 🔥 ОПТИМИЗАЦИЯ: Teacher Module Setup (из verl)
             # ============================================================
-            # Используем reference_model как teacher — экономит память!
-            # Вместо отдельной модели шарим с ref model для KL penalty
-            self.teacher_module = self.reference_model  # 🔥 Шаринг памяти!
             self.sdpo_ema_rate = getattr(self.config, 'sdpo_ema_rate', 0.0)
             
-            if self.teacher_module is not None:
-                logger.info("   🔥 Teacher = Reference Model (шаринг памяти!)")
+            # Определяем стратегию teacher:
+            # 1. LoRA + EMA > 0: Teacher = Student с EMA LoRA весами (через context manager)
+            # 2. LoRA без EMA: Teacher = Student (detached)  
+            # 3. Full FT + reference: Teacher = Reference Model
+            # 4. Full FT без reference: Teacher = Student (detached)
+            
+            use_lora = getattr(self.config, 'use_lora', False)
+            
+            if use_lora:
+                # При LoRA: НЕ используем reference_model как teacher!
+                # Reference model не имеет LoRA адаптеров — структуры несовместимы
+                self.teacher_module = None  # Будет использоваться student через context manager
+                
+                if self.sdpo_ema_rate > 0:
+                    logger.info("   🔥 Teacher = Student + EMA LoRA (через context manager)")
+                else:
+                    logger.info("   ℹ️ Teacher = Student (detached, EMA отключен)")
             else:
-                # Если нет reference модели — используем student как teacher
-                logger.info("   ⚠️ Нет reference модели, teacher = student (detached)")
+                # Full Fine-tuning: можем использовать reference_model
+                self.teacher_module = self.reference_model  # 🔥 Шаринг памяти!
+                
+                if self.teacher_module is not None:
+                    logger.info("   🔥 Teacher = Reference Model (шаринг памяти!)")
+                else:
+                    logger.info("   ⚠️ Нет reference модели, teacher = student (detached)")
             
             # Top-K Distillation параметры
             self.sdpo_distillation_topk = getattr(self.config, 'sdpo_distillation_topk', None)
@@ -391,6 +409,11 @@ class GRPOTrainer:
             
             if self.sdpo_ema_rate > 0:
                 logger.info(f"   📈 EMA Teacher: rate={self.sdpo_ema_rate}")
+                
+                # 🔥 Инициализируем EMA для LoRA (если используется)
+                if getattr(self.config, 'use_lora', False):
+                    self._init_ema_for_lora()
+                    logger.info("   🔥 EMA LoRA режим активирован!")
             
             # Инициализируем хранилище успешных траекторий
             self._successful_trajectories: Dict[int, List[str]] = {}
@@ -423,6 +446,61 @@ class GRPOTrainer:
     # 🎓 SDPO: Teacher Model и EMA Update (из verl)
     # =========================================================================
     
+    def _init_ema_for_lora(self) -> None:
+        """
+        Инициализирует EMA state dict для LoRA весов.
+        
+        При использовании LoRA мы храним EMA копию только LoRA адаптеров (~50-200 MB),
+        а не всей модели (~ГБ). Это позволяет использовать EMA Teacher с минимальным
+        overhead по памяти.
+        """
+        if not getattr(self.config, 'use_lora', False):
+            return
+        
+        if not hasattr(self, 'sdpo_ema_rate') or self.sdpo_ema_rate <= 0:
+            return
+        
+        # Unwrap модели
+        if self.accelerator:
+            model = self.accelerator.unwrap_model(self.model)
+        else:
+            model = self.model
+        
+        # Проверяем что это PEFT модель
+        try:
+            from peft import PeftModel
+            if not isinstance(model, PeftModel):
+                logger.warning("⚠️ use_lora=True, но модель не PeftModel. EMA LoRA пропущен.")
+                return
+        except ImportError:
+            logger.warning("⚠️ peft не установлен. EMA LoRA пропущен.")
+            return
+        
+        # Инициализируем EMA state dict для LoRA весов
+        self._ema_lora_state_dict: Dict[str, torch.Tensor] = {}
+        self._original_lora_state_dict: Dict[str, torch.Tensor] = {}  # Для восстановления
+        
+        lora_param_count = 0
+        lora_memory_bytes = 0
+        
+        for name, param in model.named_parameters():
+            # LoRA параметры имеют 'lora_' в имени и требуют градиентов
+            if 'lora_' in name.lower() and param.requires_grad:
+                # Клонируем текущие веса как начальное значение EMA
+                self._ema_lora_state_dict[name] = param.data.clone().detach()
+                lora_param_count += param.numel()
+                lora_memory_bytes += param.numel() * param.element_size()
+        
+        if lora_param_count > 0:
+            lora_memory_mb = lora_memory_bytes / (1024 ** 2)
+            logger.info(f"✅ EMA LoRA инициализирован:")
+            logger.info(f"   - LoRA параметров: {lora_param_count:,}")
+            logger.info(f"   - EMA память: ~{lora_memory_mb:.1f} MB")
+            logger.info(f"   - EMA rate: {self.sdpo_ema_rate}")
+        else:
+            logger.warning("⚠️ Не найдено LoRA параметров для EMA!")
+            self._ema_lora_state_dict = {}
+    
     def _update_teacher_ema(self) -> None:
         """
         🔥 ОПТИМИЗАЦИЯ: EMA Update для Teacher модели (из verl).
@@ -431,24 +509,48 @@ class GRPOTrainer:
         Это даёт более стабильный target для distillation.
         
         Формула: teacher = (1 - ema_rate) * teacher + ema_rate * student
+        
+        Для LoRA: обновляем только LoRA адаптеры (экономия памяти!)
+        Для Full Fine-tuning: обновляем все параметры teacher модели
         """
         if not hasattr(self, 'sdpo_ema_rate') or self.sdpo_ema_rate <= 0:
             return
         
+        ema_rate = self.sdpo_ema_rate
+        
+        # Unwrap модели
+        if self.accelerator:
+            student_model = self.accelerator.unwrap_model(self.model)
+        else:
+            student_model = self.model
+        
+        # ============================================================
+        # РЕЖИМ 1: LoRA — обновляем только EMA LoRA весов
+        # ============================================================
+        if getattr(self.config, 'use_lora', False) and hasattr(self, '_ema_lora_state_dict'):
+            if not self._ema_lora_state_dict:
+                return  # EMA не инициализирован
+            
+            with torch.no_grad():
+                for name, param in student_model.named_parameters():
+                    if name in self._ema_lora_state_dict:
+                        # EMA update: ema = (1 - rate) * ema + rate * current
+                        ema_tensor = self._ema_lora_state_dict[name]
+                        student_data = param.data.to(device=ema_tensor.device, dtype=ema_tensor.dtype)
+                        ema_tensor.mul_(1.0 - ema_rate).add_(student_data, alpha=ema_rate)
+            
+            logger.debug(f"🎓 SDPO EMA LoRA обновлён (rate={ema_rate}, params={len(self._ema_lora_state_dict)})")
+            return
+        
+        # ============================================================
+        # РЕЖИМ 2: Full Fine-tuning — обновляем teacher_module
+        # ============================================================
         if not hasattr(self, 'teacher_module') or self.teacher_module is None:
             return
         
         # Проверяем что teacher != student (иначе EMA бессмысленен)
         if self.teacher_module is self.model:
             return
-        
-        ema_rate = self.sdpo_ema_rate
-        
-        # Unwrap модели если нужно
-        if self.accelerator:
-            student_model = self.accelerator.unwrap_model(self.model)
-        else:
-            student_model = self.model
         
         with torch.no_grad():
             for teacher_param, student_param in zip(
@@ -460,6 +562,79 @@ class GRPOTrainer:
                 teacher_param.data.mul_(1.0 - ema_rate).add_(student_data, alpha=ema_rate)
         
         logger.debug(f"🎓 SDPO EMA Teacher обновлён (rate={ema_rate})")
+    
+    def _apply_ema_lora_weights(self) -> None:
+        """
+        Применяет EMA LoRA веса к модели (сохраняя оригинальные для восстановления).
+        
+        Используется перед forward pass teacher для SDPO.
+        После forward pass нужно вызвать _restore_lora_weights().
+        """
+        if not hasattr(self, '_ema_lora_state_dict') or not self._ema_lora_state_dict:
+            return
+        
+        # Unwrap модели
+        if self.accelerator:
+            model = self.accelerator.unwrap_model(self.model)
+        else:
+            model = self.model
+        
+        self._original_lora_state_dict = {}
+        
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in self._ema_lora_state_dict:
+                    # Сохраняем оригинальные веса
+                    self._original_lora_state_dict[name] = param.data.clone()
+                    # Применяем EMA веса
+                    param.data.copy_(self._ema_lora_state_dict[name])
+    
+    def _restore_lora_weights(self) -> None:
+        """
+        Восстанавливает оригинальные LoRA веса после forward pass teacher.
+        """
+        if not hasattr(self, '_original_lora_state_dict') or not self._original_lora_state_dict:
+            return
+        
+        # Unwrap модели
+        if self.accelerator:
+            model = self.accelerator.unwrap_model(self.model)
+        else:
+            model = self.model
+        
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in self._original_lora_state_dict:
+                    param.data.copy_(self._original_lora_state_dict[name])
+        
+        # Очищаем временное хранилище
+        self._original_lora_state_dict = {}
+    
+    @contextmanager
+    def _with_ema_lora_weights(self):
+        """
+        Context manager для временного применения EMA LoRA весов.
+        
+        Использование:
+            with self._with_ema_lora_weights():
+                output = model(input_ids)  # Использует EMA веса
+            # Здесь веса восстановлены
+        """
+        use_ema_lora = (
+            getattr(self.config, 'use_lora', False) and
+            hasattr(self, '_ema_lora_state_dict') and
+            bool(self._ema_lora_state_dict) and
+            getattr(self, 'sdpo_ema_rate', 0) > 0
+        )
+        
+        if use_ema_lora:
+            self._apply_ema_lora_weights()
+        
+        try:
+            yield
+        finally:
+            if use_ema_lora:
+                self._restore_lora_weights()
     
     # =========================================================================
     # 🎓 SDPO: Reprompting методы
@@ -583,11 +758,34 @@ Previous attempt feedback:
         batch_size = exp_batch.sequences.size(0)
         seq_len = exp_batch.action_log_probs.size(1)
         
-        # 🔥 ОПТИМИЗАЦИЯ: Используем teacher_module (шаринг с ref model)
-        teacher_model = getattr(self, 'teacher_module', None)
-        if teacher_model is None:
-            # Fallback: используем student model
-            teacher_model = self.model
+        # ============================================================
+        # 🔥 ОПТИМИЗАЦИЯ: Выбор Teacher Model
+        # ============================================================
+        # Для LoRA + EMA: используем student модель с EMA весами
+        # Для Full Fine-tuning: используем teacher_module (reference model)
+        use_ema_lora = (
+            getattr(self.config, 'use_lora', False) and
+            hasattr(self, '_ema_lora_state_dict') and
+            bool(self._ema_lora_state_dict) and
+            getattr(self, 'sdpo_ema_rate', 0) > 0
+        )
+        
+        if use_ema_lora:
+            # LoRA + EMA: используем student с EMA весами
+            if self.accelerator:
+                teacher_model = self.accelerator.unwrap_model(self.model)
+            else:
+                teacher_model = self.model
+            logger.debug("🎓 Teacher: Student + EMA LoRA веса")
+        else:
+            # Full Fine-tuning или LoRA без EMA: используем teacher_module
+            teacher_model = getattr(self, 'teacher_module', None)
+            if teacher_model is None:
+                # Fallback: используем student model
+                if self.accelerator:
+                    teacher_model = self.accelerator.unwrap_model(self.model)
+                else:
+                    teacher_model = self.model
         
         # Top-K параметры
         use_topk = getattr(self, 'sdpo_full_logit_distillation', False) and \
@@ -637,49 +835,54 @@ Previous attempt feedback:
             student_topk_log_probs = torch.zeros(batch_size, seq_len, topk, device=device)
             teacher_topk_log_probs = torch.zeros(batch_size, seq_len, topk, device=device)
         
+        # 🔥 Forward pass через Teacher (с EMA LoRA весами если нужно)
         with torch.no_grad():
-            for idx in range(batch_size):
-                if not has_teacher[idx]:
-                    continue
-                
-                reprompt_idx = sample_to_reprompt_idx[idx]
-                reprompt_text = reprompted_inputs[reprompt_idx]
-                
-                # Токенизируем ОДИН reprompt
-                reprompt_encoding = self.tokenizer(
-                    reprompt_text,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=getattr(self.config, 'sdpo_max_reprompt_len', 4096),
-                ).to(device)
-                
-                # 🔥 Forward pass через TEACHER MODEL (не student!)
-                output = teacher_model(
-                    input_ids=reprompt_encoding['input_ids'],
-                    attention_mask=reprompt_encoding['attention_mask'],
-                    use_cache=False,
-                )
-                
-                logits = output.logits[0]  # [reprompt_seq, vocab]
-                reprompt_seq_len = logits.size(0)
-                completion_tokens = exp_batch.sequences[idx, 1:seq_len+1]
-                
-                for t in range(min(seq_len, reprompt_seq_len - 1)):
-                    pos = reprompt_seq_len - seq_len - 1 + t if reprompt_seq_len > seq_len else t
-                    if pos >= 0 and pos < reprompt_seq_len - 1:
-                        token_id = completion_tokens[t].item()
-                        if token_id < logits.size(-1):
-                            log_probs_pos = F.log_softmax(logits[pos], dim=-1)
-                            teacher_log_probs[idx, t] = log_probs_pos[token_id]
-                            
-                            # 🔥 TOP-K DISTILLATION
-                            if use_topk and teacher_topk_log_probs is not None:
-                                topk_vals, topk_idxs = torch.topk(log_probs_pos, topk)
-                                teacher_topk_log_probs[idx, t] = topk_vals
-                
-                del output, logits, reprompt_encoding
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            # Используем context manager для EMA LoRA весов
+            with self._with_ema_lora_weights():
+                for idx in range(batch_size):
+                    if not has_teacher[idx]:
+                        continue
+                    
+                    reprompt_idx = sample_to_reprompt_idx[idx]
+                    reprompt_text = reprompted_inputs[reprompt_idx]
+                    
+                    # Токенизируем ОДИН reprompt
+                    reprompt_encoding = self.tokenizer(
+                        reprompt_text,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=getattr(self.config, 'sdpo_max_reprompt_len', 4096),
+                    ).to(device)
+                    
+                    # 🔥 Forward pass через TEACHER MODEL
+                    # При LoRA + EMA: student модель с EMA весами
+                    # При Full FT: reference модель
+                    output = teacher_model(
+                        input_ids=reprompt_encoding['input_ids'],
+                        attention_mask=reprompt_encoding['attention_mask'],
+                        use_cache=False,
+                    )
+                    
+                    logits = output.logits[0]  # [reprompt_seq, vocab]
+                    reprompt_seq_len = logits.size(0)
+                    completion_tokens = exp_batch.sequences[idx, 1:seq_len+1]
+                    
+                    for t in range(min(seq_len, reprompt_seq_len - 1)):
+                        pos = reprompt_seq_len - seq_len - 1 + t if reprompt_seq_len > seq_len else t
+                        if pos >= 0 and pos < reprompt_seq_len - 1:
+                            token_id = completion_tokens[t].item()
+                            if token_id < logits.size(-1):
+                                log_probs_pos = F.log_softmax(logits[pos], dim=-1)
+                                teacher_log_probs[idx, t] = log_probs_pos[token_id]
+                                
+                                # 🔥 TOP-K DISTILLATION
+                                if use_topk and teacher_topk_log_probs is not None:
+                                    topk_vals, topk_idxs = torch.topk(log_probs_pos, topk)
+                                    teacher_topk_log_probs[idx, t] = topk_vals
+                    
+                    del output, logits, reprompt_encoding
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         
         # 🔥 TOP-K для Student (нужно если используем full_logit_distillation)
         # Вычисляем top-k student log_probs для тех же позиций
