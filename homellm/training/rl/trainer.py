@@ -1352,9 +1352,20 @@ Previous attempt feedback:
             logger.info("ℹ️  Квантизация отключена (use_4bit=False, use_8bit=False)")
         
         # Загрузка модели
+        # ВАЖНО: для QLoRA с Liger Kernels нужно размещать всю модель на одном GPU!
+        # device_map="auto" может разместить часть на CPU, что несовместимо с Triton kernels.
+        # Используем device_map={"": local_rank} для multi-GPU или {"": 0} для single-GPU.
+        if quantization_config:
+            # Для квантизированных моделей - размещаем на конкретном GPU
+            local_rank = getattr(self.accelerator, "local_process_index", 0) if self.accelerator else 0
+            device_map = {"": local_rank}
+            logger.info(f"📍 QLoRA device_map: {device_map} (вся модель на GPU {local_rank})")
+        else:
+            device_map = None
+        
         model_kwargs = {
             "trust_remote_code": True,
-            "device_map": "auto" if quantization_config else None,
+            "device_map": device_map,
         }
         
         if quantization_config:
@@ -1433,6 +1444,8 @@ Previous attempt feedback:
                 logger.warning(f"Не удалось включить gradient checkpointing: {e}")
         
         # Liger Kernel патчинг модели (оптимизированные Triton kernels)
+        # ПРИМЕЧАНИЕ: Liger совместим с QLoRA если все тензоры на GPU
+        # При device_map="auto" модель должна быть на одном GPU для Triton kernels
         if getattr(self.config, "use_liger", True) and getattr(self.config, "liger_patch_model", True):
             try:
                 from homellm.training.rl.liger_utils import apply_liger_patch_to_model, is_liger_available
@@ -1520,9 +1533,16 @@ Previous attempt feedback:
             logger.info("Загрузка референсной модели для KL...")
             
             # Создаём отдельные model_kwargs для reference модели
+            # Для квантизированной ref модели - размещаем на том же GPU что и основную
+            if self.config.quantize_reference_model and quantization_config:
+                local_rank = getattr(self.accelerator, "local_process_index", 0) if self.accelerator else 0
+                ref_device_map = {"": local_rank}
+            else:
+                ref_device_map = None
+            
             ref_model_kwargs = {
                 "trust_remote_code": True,
-                "device_map": "auto" if (self.config.quantize_reference_model and quantization_config) else None,
+                "device_map": ref_device_map,
             }
             
             # Квантизация reference модели опциональна
@@ -1705,7 +1725,21 @@ Previous attempt feedback:
             return  # Выходим из _load_model для ZeRO-3
         
         self.model.train()  # Убеждаемся что в train режиме
-        test_input = torch.randint(0, 1000, (1, 10), device=self.device)
+        
+        # Определяем устройство для тестового input
+        # При device_map="auto" (QLoRA) модель может быть распределена по устройствам
+        # Нужно использовать устройство первого параметра модели
+        try:
+            # Для PEFT модели получаем base model
+            if hasattr(self.model, 'get_base_model'):
+                first_param = next(self.model.get_base_model().parameters())
+            else:
+                first_param = next(self.model.parameters())
+            input_device = first_param.device
+        except StopIteration:
+            input_device = self.device
+        
+        test_input = torch.randint(0, 1000, (1, 10), device=input_device)
         test_mask = torch.ones_like(test_input)
         mp = (getattr(self.config, "mixed_precision", None) or "bf16").lower()
         use_autocast = torch.cuda.is_available() and mp in ("bf16", "fp16")
@@ -3234,6 +3268,8 @@ Previous attempt feedback:
                 
                 if self.accelerator is None:
                     # === Single-process ===
+                    # ВАЖНО: НЕ используем merge_and_unload() напрямую!
+                    # Он модифицирует модель in-place и уничтожает LoRA адаптеры.
                     save_model = self.model
                     
                     if merge_lora:
@@ -3241,19 +3277,39 @@ Previous attempt feedback:
                             from peft import PeftModel
                             if isinstance(save_model, PeftModel):
                                 logger.info("🔄 Merging LoRA adapters into base model for final_model...")
-                                save_model = save_model.merge_and_unload()
-                                logger.info("✅ LoRA adapters merged successfully")
+                                
+                                # БЕЗОПАСНЫЙ MERGE: merge_adapter() НЕ удаляет адаптеры!
+                                save_model.merge_adapter()
+                                base_model = save_model.get_base_model()
+                                base_model.save_pretrained(final_tmp, safe_serialization=True)
+                                
+                                # КРИТИЧНО: восстанавливаем модель для продолжения обучения!
+                                save_model.unmerge_adapter()
+                                logger.info("✅ LoRA adapters merged, saved, and restored")
+                            else:
+                                save_model.save_pretrained(final_tmp, safe_serialization=True)
                         except ImportError:
-                            pass
+                            save_model.save_pretrained(final_tmp, safe_serialization=True)
                         except Exception as e:
                             logger.warning(f"⚠️ Could not merge LoRA: {e}. Saving as-is.")
-                    
-                    save_model.save_pretrained(final_tmp, safe_serialization=True)
+                            # Пробуем unmerge на случай если merge прошёл но save упал
+                            try:
+                                if hasattr(save_model, 'unmerge_adapter'):
+                                    save_model.unmerge_adapter()
+                            except:
+                                pass
+                            save_model.save_pretrained(final_tmp, safe_serialization=True)
+                    else:
+                        save_model.save_pretrained(final_tmp, safe_serialization=True)
                 
                 elif merge_lora and use_lora:
                     # === Distributed + LoRA + merge ===
                     # Только main process сохраняет (без NCCL коллективных операций)
                     # Другие процессы просто ждут
+                    # 
+                    # ВАЖНО: НЕ используем merge_and_unload() напрямую!
+                    # Он модифицирует модель in-place и уничтожает LoRA адаптеры.
+                    # Вместо этого используем merge_adapter() + unmerge_adapter()
                     if self.is_main_process:
                         try:
                             from peft import PeftModel
@@ -3265,9 +3321,19 @@ Previous attempt feedback:
                             
                             if isinstance(unwrapped, PeftModel):
                                 logger.info("🔄 Merging LoRA adapters for distributed final_model...")
-                                merged_model = unwrapped.merge_and_unload()
-                                merged_model.save_pretrained(final_tmp, safe_serialization=True)
+                                
+                                # БЕЗОПАСНЫЙ MERGE: merge_adapter() НЕ удаляет адаптеры!
+                                # После сохранения вызываем unmerge_adapter() для восстановления
+                                unwrapped.merge_adapter()
+                                
+                                # Получаем base model для сохранения (с уже merged весами)
+                                base_model = unwrapped.get_base_model()
+                                base_model.save_pretrained(final_tmp, safe_serialization=True)
                                 logger.info("✅ LoRA adapters merged and saved")
+                                
+                                # КРИТИЧНО: восстанавливаем модель для продолжения обучения!
+                                unwrapped.unmerge_adapter()
+                                logger.info("✅ LoRA adapters restored for continued training")
                             else:
                                 # Не PEFT модель - сохраняем как есть
                                 unwrapped.save_pretrained(final_tmp, safe_serialization=True)
@@ -3279,9 +3345,15 @@ Previous attempt feedback:
                             unwrapped.save_pretrained(final_tmp, safe_serialization=True)
                         except Exception as e:
                             logger.warning(f"⚠️ Could not merge LoRA: {e}. Saving as-is.")
-                            unwrapped = self.model
-                            while hasattr(unwrapped, "module"):
-                                unwrapped = unwrapped.module
+                            # Пробуем unmerge на случай если merge прошёл но save упал
+                            try:
+                                unwrapped = self.model
+                                while hasattr(unwrapped, "module"):
+                                    unwrapped = unwrapped.module
+                                if hasattr(unwrapped, 'unmerge_adapter'):
+                                    unwrapped.unmerge_adapter()
+                            except:
+                                pass
                             unwrapped.save_pretrained(final_tmp, safe_serialization=True)
                 else:
                     # === Distributed без merge (или без LoRA) ===

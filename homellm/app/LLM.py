@@ -3884,6 +3884,14 @@ def render_model_config():
     lora_target_modules = None
     
     if tuning_method in ("lora", "qlora"):
+        # Информация для QLoRA
+        if tuning_method == "qlora":
+            st.sidebar.info(
+                "💡 **QLoRA режим:**\n\n"
+                "• 4-bit квантизация базовой модели\n"
+                "• LoRA адаптеры в fp16/bf16\n"
+                "• ~60-70% экономии памяти!"
+            )
         st.sidebar.markdown("**LoRA параметры:**")
         lora_r = st.sidebar.slider(
             "LoRA r (rank)", 
