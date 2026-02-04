@@ -316,6 +316,18 @@ Self-Distillation
         
         st.markdown("---")
         st.markdown(t("docs.lora_content"))
+        
+        # LoRA Without Regret section
+        st.markdown("---")
+        st.markdown(t("docs.lora_without_regret_intro"))
+        
+        st.markdown(f"### 🔬 {t('docs.lora_without_regret_findings')}")
+        st.markdown(t("docs.lora_without_regret_findings_content"))
+        
+        st.markdown(f"### ⚙️ {t('docs.lora_without_regret_params')}")
+        st.markdown(t("docs.lora_without_regret_params_content"))
+        
+        st.info(t("docs.lora_without_regret_source"))
 
     # --- 8. DISTRIBUTED TRAINING ---
     with doc_tab8:
