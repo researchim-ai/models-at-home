@@ -1,7 +1,7 @@
 """
-DAPO (Dynamic sampling Asymmetric clipping Policy Optimization) конфигурация.
+DAPO (Dynamic sampling Policy Optimization) конфигурация.
 
-DAPO (GRPO++) — улучшенная версия GRPO из ByteDance:
+DAPO (GRPO++) — улучшенная версия GRPO от ByteDance:
 - Clip Higher: асимметричный клиппинг [0.8, 1.28] вместо [0.8, 1.2]
 - Dynamic Sampling: фильтрация zero-gradient групп + добор новых
 - Token-level Loss: каждый токен имеет равный вес

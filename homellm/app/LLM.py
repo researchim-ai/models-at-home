@@ -1680,7 +1680,7 @@ def render_grpo_sidebar_config():
         ["grpo", "dapo", "dr_grpo", "sdpo"],
         format_func=lambda x: {
             "grpo": "⭐ GRPO (рекомендуется)",
-            "dapo": "DAPO (Dynamic Advantage)",
+            "dapo": "DAPO (Dynamic sAmpling)",
             "dr_grpo": "Dr.GRPO (улучшенный)",
             "sdpo": "🎓 SDPO (Self-Distillation)",
         }[x],

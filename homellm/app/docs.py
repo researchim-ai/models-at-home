@@ -215,40 +215,65 @@ def render_docs():
     with doc_tab5:
         st.markdown(t("docs.data_prep_content"))
 
-    # --- 6. GRPO / RL TUTORIAL ---
+    # --- 6. RL ALGORITHMS ---
     with doc_tab6:
         st.markdown(t("docs.grpo_intro"))
         
-        # Algorithm comparison
+        # Policy Gradient formula
+        st.latex(r"\nabla J(\theta) = \mathbb{E}\left[\nabla \log \pi_\theta(a|s) \cdot A(s,a)\right]")
+        
+        # Algorithm cards - 4 columns
         st.markdown(f"### 🔬 {t('docs.grpo_algorithms')}")
         
-        algo_col1, algo_col2, algo_col3 = st.columns(3)
+        algo_col1, algo_col2, algo_col3, algo_col4 = st.columns(4)
         
         with algo_col1:
             st.markdown(f"""
 **GRPO**
-- {t('docs.grpo_algo_standard')}
-- ✅ {t('docs.grpo_algo_simple')}
-- ⚠️ {t('docs.grpo_algo_length_bias')}
+
+{t('docs.grpo_algo_standard')}
+
+✅ {t('docs.grpo_algo_simple')}
+
+⚠️ {t('docs.grpo_algo_length_bias')}
 """)
         
         with algo_col2:
             st.markdown(f"""
 **Dr.GRPO**
-- {t('docs.drgrpo_algo_improved')}
-- ✅ {t('docs.drgrpo_algo_no_bias')}
-- ✅ {t('docs.drgrpo_algo_stable')}
+
+{t('docs.drgrpo_algo_improved')}
+
+✅ {t('docs.drgrpo_algo_no_bias')}
+
+✅ {t('docs.drgrpo_algo_stable')}
 """)
         
         with algo_col3:
             st.markdown(f"""
+**DAPO**
+
+{t('docs.dapo_algo_advanced')}
+
+✅ {t('docs.dapo_algo_dynamic')}
+
+✅ {t('docs.dapo_algo_best')}
+""")
+        
+        with algo_col4:
+            st.markdown(f"""
 **SDPO**
-- {t('docs.dapo_algo_advanced')}
-- ✅ {t('docs.dapo_algo_dynamic')}
-- ✅ {t('docs.dapo_algo_best')}
+
+Self-Distillation
+
+✅ Teacher от лучших
+
+✅ Environment feedback
 """)
         
         st.markdown("---")
+        
+        # Main content with math
         st.markdown(t("docs.grpo_content"))
         
         st.markdown("---")
@@ -256,7 +281,7 @@ def render_docs():
         st.markdown(t("docs.grpo_rewards_content"))
         
         st.markdown("---")
-        st.markdown(f"### 💡 {t('docs.grpo_tips')}")
+        st.markdown(f"### 📊 {t('docs.grpo_tips')}")
         st.markdown(t("docs.grpo_tips_content"))
 
     # --- 7. LORA TUTORIAL ---
