@@ -363,15 +363,25 @@ class GRPOTrainer:
         if is_sdpo:
             # SDPO: используем SDPOLoss
             self.loss_fn = SDPOLoss(config=self.config)
+            
+            # 🔥 Получаем параметры из конфига (поддерживаем оба формата имён)
+            # Новый SDPOConfig использует имена без префикса
+            success_threshold = getattr(self.config, 'success_threshold', 
+                                        getattr(self.config, 'sdpo_success_threshold', 1.0))
+            alpha = getattr(self.config, 'alpha', 
+                           getattr(self.config, 'sdpo_alpha', 0.0))
+            loss_mode = getattr(self.config, 'loss_mode', 'sdpo')
+            
             logger.info("🎓 SDPOLoss активирован!")
-            logger.info("   - GRPO loss + Self-Distillation")
-            logger.info(f"   - success_threshold: {getattr(self.config, 'sdpo_success_threshold', 0.5)}")
-            logger.info(f"   - alpha (KL type): {getattr(self.config, 'sdpo_alpha', 0.5)}")
+            logger.info(f"   - loss_mode: {loss_mode}")
+            logger.info(f"   - success_threshold: {success_threshold}")
+            logger.info(f"   - alpha (KL type): {alpha} ({'forward' if alpha == 0 else 'reverse' if alpha == 1 else 'JSD'})")
             
             # ============================================================
             # 🔥 ОПТИМИЗАЦИЯ: Teacher Module Setup (из verl)
             # ============================================================
-            self.sdpo_ema_rate = getattr(self.config, 'sdpo_ema_rate', 0.0)
+            self.sdpo_ema_rate = getattr(self.config, 'ema_rate', 
+                                         getattr(self.config, 'sdpo_ema_rate', 0.05))
             
             # Определяем стратегию teacher:
             # 1. LoRA + EMA > 0: Teacher = Student с EMA LoRA весами (через context manager)
@@ -400,11 +410,14 @@ class GRPOTrainer:
                     logger.info("   ⚠️ Нет reference модели, teacher = student (detached)")
             
             # Top-K Distillation параметры
-            self.sdpo_distillation_topk = getattr(self.config, 'sdpo_distillation_topk', None)
-            self.sdpo_full_logit_distillation = getattr(self.config, 'sdpo_full_logit_distillation', False)
+            self.sdpo_distillation_topk = getattr(self.config, 'distillation_topk', 
+                                                   getattr(self.config, 'sdpo_distillation_topk', 100))
+            self.sdpo_full_logit_distillation = getattr(self.config, 'full_logit_distillation', 
+                                                         getattr(self.config, 'sdpo_full_logit_distillation', True))
+            self.sdpo_add_tail = getattr(self.config, 'distillation_add_tail', True)
             
             if self.sdpo_distillation_topk is not None:
-                logger.info(f"   🔥 Top-K Distillation: k={self.sdpo_distillation_topk}")
+                logger.info(f"   🔥 Top-K Distillation: k={self.sdpo_distillation_topk}, add_tail={self.sdpo_add_tail}")
                 logger.info(f"      Экономия памяти: ~99.97% vs full vocab!")
             
             if self.sdpo_ema_rate > 0:
@@ -415,8 +428,9 @@ class GRPOTrainer:
                     self._init_ema_for_lora()
                     logger.info("   🔥 EMA LoRA режим активирован!")
             
-            # Инициализируем хранилище успешных траекторий
-            self._successful_trajectories: Dict[int, List[str]] = {}
+            # 🔥 SDPO: Инициализируем хранилище траекторий
+            # Структура: {prompt_id: {'successful': [траектории], 'current': [траектории]}}
+            self._successful_trajectories: Dict[int, Dict[str, List[Dict]]] = {}
             return
         
         # GRPO/DrGRPO/DAPO с Liger Fused Loss
@@ -637,92 +651,130 @@ class GRPOTrainer:
                 self._restore_lora_weights()
     
     # =========================================================================
-    # 🎓 SDPO: Reprompting методы
+    # 🎓 SDPO: Reprompting методы (согласно оригинальной статье)
     # =========================================================================
+    
+    @staticmethod
+    def _remove_thinking_tags(text: str) -> str:
+        """
+        🔥 Убирает <think>...</think> теги из текста.
+        
+        Используется для удаления chain-of-thought из демонстраций,
+        чтобы teacher фокусировался на ответе, а не на reasoning.
+        """
+        import re
+        # Удаляем <think>...</think> (включая многострочные)
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        # Удаляем <reasoning>...</reasoning>
+        text = re.sub(r'<reasoning>.*?</reasoning>', '', text, flags=re.DOTALL)
+        # Убираем лишние пробелы/переносы
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
     
     def _create_reprompted_input(
         self,
         original_prompt: str,
-        successful_solution: str,
+        solution: Optional[str] = None,
         feedback: Optional[str] = None,
+        remove_thinking: bool = True,
     ) -> str:
         """
-        Создаёт reprompted контекст для teacher (SDPO).
+        🔥 Создаёт reprompted контекст для teacher (SDPO).
         
-        Формат:
-            Here is the problem:
-            {original_question}
-            
-            Here is a successful solution for reference:
-            {successful_solution}
-            
-            Now solve this problem step by step.
+        Согласно оригинальной статье, reprompt содержит:
+        - {prompt}: исходный вопрос
+        - {solution}: успешное решение (если есть)
+        - {feedback}: feedback от среды (если есть)
+        
+        Логика использования feedback:
+        - Если include_environment_feedback=True: добавляем feedback
+        - Если environment_feedback_only_without_solution=True: feedback только без solution
         
         Args:
             original_prompt: Исходный промпт с вопросом
-            successful_solution: Успешное решение (completion)
-            feedback: Опциональный feedback (ошибки и т.д.)
+            solution: Успешное решение (completion) или None
+            feedback: Feedback от среды (ошибки, тесты) или None
+            remove_thinking: Убирать <think> теги из solution
             
         Returns:
             Reprompted строка для teacher
         """
-        # Получаем шаблоны из конфига
+        # Получаем параметры из config
+        include_feedback = getattr(self.config, 'include_environment_feedback', True)
+        feedback_only_without_solution = getattr(self.config, 'environment_feedback_only_without_solution', True)
+        remove_thinking_flag = getattr(self.config, 'remove_thinking_from_demonstration', True) and remove_thinking
+        max_len = getattr(self.config, 'max_reprompt_len', 10240)
+        truncation = getattr(self.config, 'reprompt_truncation', 'right')
+        
+        # Шаблоны из конфига (с fallback на оригинальные)
         reprompt_template = getattr(
             self.config, 
-            'sdpo_reprompt_template',
-            """Here is the problem:
-{question}
+            'reprompt_template',
+            """{prompt}{solution}{feedback}
 
-Here is a successful solution for reference:
-{successful_solution}
+Correctly solve the original question."""
+        )
+        
+        solution_template = getattr(
+            self.config,
+            'solution_template',
+            """
 
-Now solve this problem step by step."""
+Correct solution:
+
+{successful_previous_attempt}
+
+"""
         )
         
         feedback_template = getattr(
             self.config,
-            'sdpo_feedback_template',
+            'feedback_template',
             """
-Previous attempt feedback:
-{feedback}
+
+The following is feedback from your unsuccessful earlier attempt:
+
+{feedback_raw}
+
 """
         )
         
-        # Извлекаем вопрос из original_prompt
-        # Обычно prompt содержит system message + user question
-        # Пытаемся извлечь только вопрос
-        question = original_prompt
+        # Определяем что использовать
+        has_solution = solution is not None and len(solution.strip()) > 0
+        has_feedback = feedback is not None and len(feedback.strip()) > 0
         
-        # Пытаемся найти вопрос в chat template формате
-        if "User:" in original_prompt:
-            parts = original_prompt.split("User:")
-            if len(parts) > 1:
-                question = parts[-1].split("Assistant:")[0].strip()
-        elif "<|user|>" in original_prompt:
-            parts = original_prompt.split("<|user|>")
-            if len(parts) > 1:
-                question = parts[-1].split("<|assistant|>")[0].strip()
-        elif "[INST]" in original_prompt:
-            parts = original_prompt.split("[INST]")
-            if len(parts) > 1:
-                question = parts[-1].split("[/INST]")[0].strip()
+        # 🔥 Логика согласно оригиналу:
+        # Если feedback_only_without_solution=True, используем feedback только когда нет solution
+        use_feedback = has_feedback and include_feedback and (not feedback_only_without_solution or not has_solution)
         
-        # Создаём reprompted текст
+        # Формируем solution секцию
+        solution_section = ""
+        if has_solution:
+            solution_text = solution
+            if remove_thinking_flag:
+                solution_text = self._remove_thinking_tags(solution_text)
+            solution_section = solution_template.format(successful_previous_attempt=solution_text)
+        
+        # Формируем feedback секцию
+        feedback_section = ""
+        if use_feedback:
+            feedback_section = feedback_template.format(feedback_raw=feedback)
+        
+        # Собираем reprompt
         reprompted = reprompt_template.format(
-            question=question,
-            successful_solution=successful_solution,
+            prompt=original_prompt,
+            solution=solution_section,
+            feedback=feedback_section,
         )
         
-        # Добавляем feedback если есть
-        include_feedback = getattr(self.config, 'sdpo_include_feedback', True)
-        if include_feedback and feedback:
-            feedback_text = feedback_template.format(feedback=feedback)
-            reprompted = reprompted + feedback_text
-        
-        # Обрезаем если слишком длинный
-        max_len = getattr(self.config, 'sdpo_max_reprompt_len', 4096)
+        # Обрезаем если превышает лимит
         if len(reprompted) > max_len:
-            reprompted = reprompted[:max_len]
+            if truncation == 'right':
+                reprompted = reprompted[:max_len]
+            elif truncation == 'left':
+                reprompted = reprompted[-max_len:]
+            else:
+                logger.warning(f"Reprompt превышает max_len ({len(reprompted)} > {max_len})")
         
         return reprompted
     
@@ -732,28 +784,22 @@ Previous attempt feedback:
         device: torch.device,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        🔥 ОПТИМИЗАЦИЯ: Вычисляет teacher_log_probs для SDPO (из verl).
-        
-        Ключевые оптимизации:
-        1. Использует teacher_module (шаринг с reference_model) — экономия памяти!
-        2. Top-K Distillation — вместо vocab=152k используем только k=50-100 токенов
-        3. Chunked processing — по одному reprompt за раз
-        
-        Для каждого сэмпла в batch:
-        1. Ищем успешную траекторию для его prompt_id
-        2. Создаём reprompted контекст (prompt + successful_solution)
-        3. Делаем forward pass через teacher_module
-        4. Получаем log_probs (и top-k если нужно)
+        1. Teacher forward делается для ВСЕХ сэмплов
+        2. Сэмплы с solution/feedback → reprompted input
+        3. Сэмплы без ничего → оригинальный промпт
+        4. self_distillation_mask указывает какие сэмплы "reprompted"
         
         Args:
             exp_batch: Batch Experience объектов
             device: Устройство для вычислений
             
         Returns:
-            (teacher_log_probs, distillation_mask, student_topk, teacher_topk) или (None, None, None, None)
+            (teacher_log_probs, distillation_mask, student_topk, teacher_topk)
         """
+        # 🔥 ВАЖНО: Даже если нет successful_trajectories, всё равно делаем teacher forward!
+        # Это как в оригинале SDPO — teacher просто видит оригинальный промпт
         if not hasattr(self, '_successful_trajectories'):
-            return None, None, None, None
+            self._successful_trajectories = {}
         
         batch_size = exp_batch.sequences.size(0)
         seq_len = exp_batch.action_log_probs.size(1)
@@ -792,7 +838,12 @@ Previous attempt feedback:
                    getattr(self, 'sdpo_distillation_topk', None) is not None
         topk = getattr(self, 'sdpo_distillation_topk', 50) if use_topk else None
         
-        # Проверяем какие сэмплы имеют успешные траектории
+        # 🔥 SDPO: Получаем параметры reprompting из конфига
+        include_feedback = getattr(self.config, 'include_environment_feedback', True)
+        feedback_only_without_solution = getattr(self.config, 'environment_feedback_only_without_solution', True)
+        dont_self_reprompt = getattr(self.config, 'dont_reprompt_on_self_success', True)
+        
+        # Проверяем какие сэмплы имеют траектории для distillation
         has_teacher = torch.zeros(batch_size, dtype=torch.bool, device=device)
         reprompted_inputs = []
         sample_to_reprompt_idx = {}
@@ -802,6 +853,19 @@ Previous attempt feedback:
         if prompt_ids is None:
             prompt_ids = [None] * batch_size
         
+        # 🔥 Также получаем completion текст для проверки self-success
+        completion_texts = getattr(exp_batch, 'completion_text', None)
+        
+        # 🔥 Получаем оригинальные промпты из exp_batch или траекторий
+        prompts = getattr(exp_batch, 'prompts', None)
+        if prompts is None:
+            prompts = [None] * batch_size
+            logger.warning(f"⚠️ SDPO: exp_batch.prompts is None! batch_size={batch_size}")
+        else:
+            none_count = sum(1 for p in prompts if p is None)
+            if none_count > 0:
+                logger.warning(f"⚠️ SDPO: {none_count}/{len(prompts)} prompts are None")
+        
         for idx in range(batch_size):
             pid = prompt_ids[idx] if prompt_ids is not None else None
             if pid is None:
@@ -809,92 +873,150 @@ Previous attempt feedback:
                 
             pid_int = int(pid) if torch.is_tensor(pid) else pid
             
-            if pid_int in self._successful_trajectories and self._successful_trajectories[pid_int]:
+            if pid_int not in self._successful_trajectories:
+                continue
+            
+            traj_data = self._successful_trajectories[pid_int]
+            
+            # Поддерживаем обе структуры: новую {'successful': [], 'current': []} и старую [list]
+            if isinstance(traj_data, dict):
+                successful_list = traj_data.get('successful', [])
+                current_list = traj_data.get('current', [])
+            else:
+                # Старая структура - просто список успешных
+                successful_list = traj_data if isinstance(traj_data, list) else []
+                current_list = []
+            
+            # 🔥 ЛОГИКА REPROMPTING (согласно оригиналу):
+            # 1. Ищем успешную траекторию для демонстрации
+            # 2. Ищем feedback от текущей неуспешной попытки
+            
+            solution = None
+            feedback = None
+            current_completion = completion_texts[idx] if completion_texts and idx < len(completion_texts) else None
+            
+            # Выбираем успешную траекторию для solution
+            if successful_list:
                 import random
-                trajectory = random.choice(self._successful_trajectories[pid_int])
                 
-                reprompted = self._create_reprompted_input(
-                    original_prompt=trajectory['prompt'],
-                    successful_solution=trajectory['completion'],
-                )
+                if dont_self_reprompt and current_completion:
+                    # 🔥 Не используем успешную траекторию как teacher для самой себя
+                    other_successful = [t for t in successful_list if t['completion'] != current_completion]
+                    if other_successful:
+                        traj = random.choice(other_successful)
+                        solution = traj['completion']
+                else:
+                    traj = random.choice(successful_list)
+                    solution = traj['completion']
+            
+            # Получаем feedback от текущей попытки (если есть)
+            if include_feedback and current_list:
+                # Ищем траекторию текущего completion
+                for current_traj in reversed(current_list):
+                    if current_completion and current_traj['completion'] == current_completion:
+                        feedback = current_traj.get('feedback')
+                        break
                 
-                has_teacher[idx] = True
+                # Если не нашли для текущего, берём последний feedback
+                if feedback is None and current_list:
+                    feedback = current_list[-1].get('feedback')
+            
+            # 🔥 Определяем что использовать согласно логике оригинала
+            # environment_feedback_only_without_solution: feedback используется только если нет solution
+            if feedback_only_without_solution:
+                if solution is not None:
+                    feedback = None  # Есть solution - не используем feedback
+            
+            # Нужен хотя бы solution ИЛИ feedback для distillation
+            if solution is None and feedback is None:
+                continue
+            
+            # Получаем prompt из траектории
+            prompt = successful_list[0]['prompt'] if successful_list else (
+                current_list[0]['prompt'] if current_list else None
+            )
+            
+            if prompt is None:
+                continue
+            
+            reprompted = self._create_reprompted_input(
+                original_prompt=prompt,
+                solution=solution,
+                feedback=feedback,
+            )
+            
+            has_teacher[idx] = True
+            sample_to_reprompt_idx[idx] = len(reprompted_inputs)
+            reprompted_inputs.append(reprompted)
+        
+        for idx in range(batch_size):
+            if idx not in sample_to_reprompt_idx:
+                # Нет solution/feedback → teacher видит оригинальный промпт
+                # Пробуем получить промпт из разных источников
+                prompt = None
+                
+                # 1. Из exp_batch.prompts (основной источник)
+                if prompts is not None and idx < len(prompts) and prompts[idx] is not None:
+                    prompt = prompts[idx]
+                
+                # 2. Из траекторий (если есть хоть какие-то)
+                if prompt is None:
+                    pid = prompt_ids[idx] if prompt_ids is not None and idx < len(prompt_ids) else None
+                    if pid is not None:
+                        pid_int = int(pid) if torch.is_tensor(pid) else pid
+                        if pid_int in self._successful_trajectories:
+                            traj_data = self._successful_trajectories[pid_int]
+                            if isinstance(traj_data, dict):
+                                s_list = traj_data.get('successful', [])
+                                c_list = traj_data.get('current', [])
+                                if s_list:
+                                    prompt = s_list[0].get('prompt')
+                                elif c_list:
+                                    prompt = c_list[0].get('prompt')
+                            elif isinstance(traj_data, list) and traj_data:
+                                prompt = traj_data[0].get('prompt')
+                
+                # 3. Пытаемся декодировать из sequences (как последний resort)
+                if prompt is None:
+                    try:
+                        # Декодируем prompt часть из sequences
+                        action_mask = exp_batch.action_mask[idx]
+                        prompt_end = (~action_mask.bool()).sum().item()
+                        if prompt_end > 0:
+                            prompt_tokens = exp_batch.sequences[idx, :prompt_end]
+                            prompt = self.tokenizer.decode(prompt_tokens, skip_special_tokens=True)
+                    except Exception as e:
+                        logger.debug(f"Не удалось декодировать prompt: {e}")
+                
+                # 4. Fallback — пустая строка (но это плохо)
+                if prompt is None:
+                    prompt = ""
+                    logger.warning(f"⚠️ SDPO: Не удалось получить промпт для сэмпла {idx}")
+                
+                reprompted = prompt  # Просто оригинальный промпт (без reprompting)
                 sample_to_reprompt_idx[idx] = len(reprompted_inputs)
                 reprompted_inputs.append(reprompted)
-        
-        if not reprompted_inputs:
-            return None, None, None, None
         
         # 🔥 Результаты
         teacher_log_probs = torch.zeros(batch_size, seq_len, device=device)
         
-        # Top-K tensors (только если используем full_logit_distillation)
+        # Top-K tensors
         student_topk_log_probs = None
         teacher_topk_log_probs = None
+        student_topk_indices = None
         if use_topk and topk is not None:
             student_topk_log_probs = torch.zeros(batch_size, seq_len, topk, device=device)
             teacher_topk_log_probs = torch.zeros(batch_size, seq_len, topk, device=device)
+            student_topk_indices = torch.zeros(batch_size, seq_len, topk, dtype=torch.long, device=device)
         
-        # 🔥 Forward pass через Teacher (с EMA LoRA весами если нужно)
-        with torch.no_grad():
-            # Используем context manager для EMA LoRA весов
-            with self._with_ema_lora_weights():
-                for idx in range(batch_size):
-                    if not has_teacher[idx]:
-                        continue
-                    
-                    reprompt_idx = sample_to_reprompt_idx[idx]
-                    reprompt_text = reprompted_inputs[reprompt_idx]
-                    
-                    # Токенизируем ОДИН reprompt
-                    reprompt_encoding = self.tokenizer(
-                        reprompt_text,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=getattr(self.config, 'sdpo_max_reprompt_len', 4096),
-                    ).to(device)
-                    
-                    # 🔥 Forward pass через TEACHER MODEL
-                    # При LoRA + EMA: student модель с EMA весами
-                    # При Full FT: reference модель
-                    output = teacher_model(
-                        input_ids=reprompt_encoding['input_ids'],
-                        attention_mask=reprompt_encoding['attention_mask'],
-                        use_cache=False,
-                    )
-                    
-                    logits = output.logits[0]  # [reprompt_seq, vocab]
-                    reprompt_seq_len = logits.size(0)
-                    completion_tokens = exp_batch.sequences[idx, 1:seq_len+1]
-                    
-                    for t in range(min(seq_len, reprompt_seq_len - 1)):
-                        pos = reprompt_seq_len - seq_len - 1 + t if reprompt_seq_len > seq_len else t
-                        if pos >= 0 and pos < reprompt_seq_len - 1:
-                            token_id = completion_tokens[t].item()
-                            if token_id < logits.size(-1):
-                                log_probs_pos = F.log_softmax(logits[pos], dim=-1)
-                                teacher_log_probs[idx, t] = log_probs_pos[token_id]
-                                
-                                # 🔥 TOP-K DISTILLATION
-                                if use_topk and teacher_topk_log_probs is not None:
-                                    topk_vals, topk_idxs = torch.topk(log_probs_pos, topk)
-                                    teacher_topk_log_probs[idx, t] = topk_vals
-                    
-                    del output, logits, reprompt_encoding
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-        
-        # 🔥 TOP-K для Student (нужно если используем full_logit_distillation)
-        # Вычисляем top-k student log_probs для тех же позиций
+        # 🔥 ШАГ 1: Student forward → получаем Top-K indices для ВСЕХ сэмплов
         if use_topk and student_topk_log_probs is not None:
-            # Unwrap student model
             if self.accelerator:
                 student_model = self.accelerator.unwrap_model(self.model)
             else:
                 student_model = self.model
             
             with torch.no_grad():
-                # Forward pass student на оригинальных sequences
                 student_output = student_model(
                     input_ids=exp_batch.sequences,
                     attention_mask=exp_batch.attention_mask,
@@ -903,18 +1025,108 @@ Previous attempt feedback:
                 student_logits = student_output.logits[:, :-1]  # [batch, seq, vocab]
                 
                 for idx in range(batch_size):
-                    if has_teacher[idx]:
-                        for t in range(seq_len):
-                            log_probs_t = F.log_softmax(student_logits[idx, t], dim=-1)
-                            topk_vals, _ = torch.topk(log_probs_t, topk)
-                            student_topk_log_probs[idx, t] = topk_vals
+                    for t in range(seq_len):
+                        log_probs_t = F.log_softmax(student_logits[idx, t], dim=-1)
+                        topk_vals, topk_idxs = torch.topk(log_probs_t, topk)
+                        student_topk_log_probs[idx, t] = topk_vals
+                        student_topk_indices[idx, t] = topk_idxs
                 
                 del student_output, student_logits
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        # Убеждаемся что ВСЕ сэмплы имеют reprompt_idx
+        assert len(sample_to_reprompt_idx) == batch_size, \
+            f"Not all samples have reprompt_idx: {len(sample_to_reprompt_idx)} vs {batch_size}"
+        
+        with torch.no_grad():
+            with self._with_ema_lora_weights():
+                for idx in range(batch_size):
+                    reprompt_text = reprompted_inputs[sample_to_reprompt_idx[idx]]
+                    
+                    max_reprompt_len = getattr(self.config, 'sdpo_max_reprompt_len', 4096)
+                    
+                    if hasattr(self.tokenizer, 'apply_chat_template'):
+                        messages = [{"role": "user", "content": reprompt_text}]
+                        try:
+                            reprompt_encoding = self.tokenizer.apply_chat_template(
+                                messages,
+                                tokenize=True,
+                                return_tensors="pt",
+                                return_dict=True,
+                                add_generation_prompt=True,
+                                max_length=max_reprompt_len,
+                                padding=False,
+                                truncation=True,
+                            )
+                            reprompt_encoding = {k: v.to(device) for k, v in reprompt_encoding.items()}
+                        except Exception:
+                            # Fallback на простую токенизацию
+                            reprompt_encoding = self.tokenizer(
+                                reprompt_text,
+                                return_tensors="pt",
+                                truncation=True,
+                                max_length=max_reprompt_len,
+                            ).to(device)
+                    else:
+                        reprompt_encoding = self.tokenizer(
+                            reprompt_text,
+                            return_tensors="pt",
+                            truncation=True,
+                            max_length=max_reprompt_len,
+                        ).to(device)
+                    
+                    # responses = completion tokens
+                    completion_tokens = exp_batch.sequences[idx, 1:seq_len+1]
+                    response_mask = exp_batch.action_mask[idx].float()
+                    
+                    full_input = torch.cat([
+                        reprompt_encoding['input_ids'][0],
+                        completion_tokens
+                    ]).unsqueeze(0)
+                    full_mask = torch.cat([
+                        reprompt_encoding['attention_mask'][0],
+                        response_mask
+                    ]).unsqueeze(0)
+                    
+                    position_ids = torch.clamp(full_mask.long().cumsum(dim=-1) - 1, min=0)
+                    
+                    output = teacher_model(
+                        input_ids=full_input,
+                        attention_mask=full_mask,
+                        position_ids=position_ids,
+                        use_cache=False,
+                    )
+                    
+                    logits = output.logits[0, :-1]  # [full_seq-1, vocab]
+                    full_seq_len = logits.size(0)
+                    prompt_len = reprompt_encoding['input_ids'].size(1)
+                    
+                    # Извлекаем log_probs для completion tokens
+                    for t in range(seq_len):
+                        pos = prompt_len - 1 + t  # Позиция в full sequence
+                        if pos >= 0 and pos < full_seq_len:
+                            token_id = completion_tokens[t].item()
+                            if token_id < logits.size(-1):
+                                log_probs_pos = F.log_softmax(logits[pos], dim=-1)
+                                teacher_log_probs[idx, t] = log_probs_pos[token_id]
+                                
+                                # 🔥 TOP-K: используем STUDENT indices!
+                                if use_topk and teacher_topk_log_probs is not None and student_topk_indices is not None:
+                                    indices_t = student_topk_indices[idx, t]
+                                    teacher_topk_log_probs[idx, t] = log_probs_pos[indices_t]
+                    
+                    del output, logits, reprompt_encoding
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         
         distillation_mask = has_teacher.float()
         
-        logger.debug(
-            f"🎓 SDPO: {has_teacher.sum().item()}/{batch_size} сэмплов с teacher, "
+        num_reprompted = int(has_teacher.sum().item())
+        logger.info(
+            f"🎓 SDPO: {num_reprompted}/{batch_size} reprompted "
+            f"(empty_batch={num_reprompted == 0}), "
+            f"ALL {batch_size} got teacher forward, "
             f"top-k={topk if use_topk else 'off'}"
         )
         
@@ -2635,29 +2847,50 @@ Previous attempt feedback:
             prompt_idx = rollout.metadata.get("prompt_id", rollout.metadata.get("prompt_idx", 0))
             rollout_completions_len = len(rollout.completions)
             
-            # 🎓 SDPO: сохраняем успешные траектории для self-distillation
+            # 🎓 SDPO: сохраняем траектории для self-distillation
+            # Сохраняем как успешные (для демонстраций), так и неуспешные (для feedback)
             if hasattr(self, '_successful_trajectories') and isinstance(self.loss_fn, SDPOLoss):
-                sdpo_threshold = getattr(self.config, 'sdpo_success_threshold', 0.5)
-                for comp_idx, (reward, completion) in enumerate(zip(rollout_rewards, rollout.completions)):
-                    if reward >= sdpo_threshold:
-                        # Сохраняем пару (prompt, completion) для reprompting
-                        if prompt_idx not in self._successful_trajectories:
-                            self._successful_trajectories[prompt_idx] = []
-                        
-                        trajectory_data = {
-                            'prompt': rollout.prompt,  # Исходный prompt (текст)
-                            'completion': completion,   # Успешный completion
-                            'reward': reward,
+                sdpo_threshold = getattr(self.config, 'success_threshold', 1.0)
+                feedbacks = rollout.feedbacks if rollout.feedbacks else [None] * len(rollout.completions)
+                
+                for comp_idx, (reward, completion, feedback) in enumerate(
+                    zip(rollout_rewards, rollout.completions, feedbacks)
+                ):
+                    trajectory_data = {
+                        'prompt': rollout.prompt,      # Исходный prompt (текст)
+                        'completion': completion,       # Completion
+                        'reward': reward,
+                        'feedback': feedback,           # 🔥 SDPO: feedback от среды
+                        'is_successful': reward >= sdpo_threshold,
+                    }
+                    
+                    # Инициализируем структуру если нужно
+                    if prompt_idx not in self._successful_trajectories:
+                        self._successful_trajectories[prompt_idx] = {
+                            'successful': [],  # Успешные траектории для демонстраций
+                            'current': [],     # Текущие траектории с feedback
                         }
-                        
-                        # Храним только последние N успешных (чтобы не раздувать память)
-                        if len(self._successful_trajectories[prompt_idx]) < 5:
-                            self._successful_trajectories[prompt_idx].append(trajectory_data)
+                    
+                    # Сохраняем текущую траекторию (для feedback)
+                    # Храним только последние N для экономии памяти
+                    current_list = self._successful_trajectories[prompt_idx]['current']
+                    if len(current_list) < 5:
+                        current_list.append(trajectory_data)
+                    else:
+                        # FIFO - удаляем самый старый
+                        current_list.pop(0)
+                        current_list.append(trajectory_data)
+                    
+                    # Сохраняем успешные траектории отдельно
+                    if reward >= sdpo_threshold:
+                        success_list = self._successful_trajectories[prompt_idx]['successful']
+                        if len(success_list) < 5:
+                            success_list.append(trajectory_data)
                         else:
                             # Заменяем случайный старый
                             import random
                             replace_idx = random.randint(0, 4)
-                            self._successful_trajectories[prompt_idx][replace_idx] = trajectory_data
+                            success_list[replace_idx] = trajectory_data
             
             # Явно удаляем rollout после использования
             del rollout

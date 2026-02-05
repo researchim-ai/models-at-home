@@ -1,9 +1,11 @@
 """
 Reward функции для математических задач.
+
+🔥 SDPO Support: Возвращают RewardResult с feedback для self-distillation.
 """
 import re
-from typing import Optional, List
-from .base import RewardFunction
+from typing import Optional, List, Union
+from .base import RewardFunction, RewardResult
 
 
 def extract_number_from_text(text: str) -> Optional[float]:
@@ -102,6 +104,8 @@ class MathReward(RewardFunction):
     """
     Базовый reward для математических задач.
     
+    🔥 SDPO Support: Возвращает feedback с объяснением ошибки.
+    
     Сравнивает числовой ответ с эталоном.
     """
     
@@ -112,6 +116,7 @@ class MathReward(RewardFunction):
         exact_reward: float = 1.0,
         partial_reward: float = 0.5,
         weight: float = 1.0,
+        generate_feedback: bool = True,
     ):
         """
         Args:
@@ -120,42 +125,73 @@ class MathReward(RewardFunction):
             exact_reward: Reward за точное совпадение
             partial_reward: Reward за частичное совпадение
             weight: Вес
+            generate_feedback: 🔥 Генерировать feedback для SDPO
         """
         super().__init__(weight)
         self.tolerance = tolerance
         self.partial_tolerance = partial_tolerance
         self.exact_reward = exact_reward
         self.partial_reward = partial_reward
+        self.generate_feedback = generate_feedback
     
     def __call__(
         self,
         completion: str,
         reference_answer: str,
         reasoning_format: str = "deepseek",
+        is_truncated: bool = False,
         **kwargs,
-    ) -> float:
-        """Сравнивает числовые ответы."""
+    ) -> RewardResult:
+        """
+        Сравнивает числовые ответы.
+        
+        🔥 SDPO: Возвращает feedback с объяснением ошибки.
+        """
         # Извлекаем числа
         pred_num = extract_answer_number(completion, reasoning_format)
         ref_num = extract_number_from_text(reference_answer)
         
-        if pred_num is None or ref_num is None:
-            return 0.0
+        feedback = None
+        score = 0.0
+        is_correct = False
         
-        # Сравниваем
-        diff = abs(pred_num - ref_num)
-        
-        if diff < self.tolerance:
-            return self.exact_reward
-        elif diff < self.partial_tolerance:
-            return self.partial_reward
+        # 🔥 Генерируем feedback для SDPO
+        if is_truncated:
+            feedback = "Your response was truncated because it exceeded the maximum length."
+            score = 0.0
+        elif pred_num is None:
+            feedback = "Your answer had the wrong format. The solution must contain a numerical answer in the format: <answer>your_number</answer>."
+            score = 0.0
+        elif ref_num is None:
+            # Reference не парсится - не можем сравнить
+            score = 0.0
         else:
-            return 0.0
+            # Сравниваем
+            diff = abs(pred_num - ref_num)
+            
+            if diff < self.tolerance:
+                score = self.exact_reward
+                is_correct = True
+            elif diff < self.partial_tolerance:
+                score = self.partial_reward
+                feedback = f"Your answer {pred_num} is close but not exactly correct. The correct answer is {ref_num}."
+            else:
+                score = 0.0
+                feedback = f"Your answer {pred_num} is incorrect. The correct answer is {ref_num}."
+        
+        return RewardResult(
+            score=score,
+            feedback=feedback if self.generate_feedback else None,
+            is_correct=is_correct,
+            metadata={"pred": pred_num, "ref": ref_num},
+        )
 
 
 class GSM8KReward(RewardFunction):
     """
     Reward функция специально для GSM8K датасета.
+    
+    🔥 SDPO Support: Возвращает feedback с объяснением ошибки.
     
     GSM8K особенности:
     - Ответы всегда целые числа
@@ -169,6 +205,7 @@ class GSM8KReward(RewardFunction):
         close_reward: float = 0.3,
         format_bonus: float = 0.1,
         weight: float = 1.0,
+        generate_feedback: bool = True,
     ):
         """
         Args:
@@ -176,11 +213,13 @@ class GSM8KReward(RewardFunction):
             close_reward: Reward за близкий ответ (±1)
             format_bonus: Бонус за правильный формат reasoning
             weight: Вес
+            generate_feedback: 🔥 Генерировать feedback для SDPO
         """
         super().__init__(weight)
         self.correct_reward = correct_reward
         self.close_reward = close_reward
         self.format_bonus = format_bonus
+        self.generate_feedback = generate_feedback
     
     def _extract_gsm8k_answer(self, text: str) -> Optional[int]:
         """Извлекает ответ в формате GSM8K."""
@@ -216,9 +255,23 @@ class GSM8KReward(RewardFunction):
         completion: str,
         reference_answer: str,
         reasoning_format: str = "deepseek",
+        is_truncated: bool = False,
         **kwargs,
-    ) -> float:
-        """Вычисляет reward для GSM8K."""
+    ) -> RewardResult:
+        """
+        Вычисляет reward для GSM8K.
+        
+        🔥 SDPO: Возвращает feedback с объяснением ошибки.
+        """
+        feedback = None
+        score = 0.0
+        is_correct = False
+        
+        # Проверяем truncation
+        if is_truncated:
+            feedback = "Your response was truncated because it exceeded the maximum length."
+            return RewardResult(score=0.0, feedback=feedback, is_correct=False)
+        
         # Извлекаем ответы
         pred_answer = self._extract_gsm8k_answer(completion)
         
@@ -228,32 +281,50 @@ class GSM8KReward(RewardFunction):
             ref_num = extract_number_from_text(reference_answer)
             ref_answer = int(ref_num) if ref_num is not None else None
         
-        if pred_answer is None or ref_answer is None:
-            return 0.0
-        
-        reward = 0.0
-        
-        # Основной reward за правильный ответ
-        if pred_answer == ref_answer:
-            reward = self.correct_reward
-        elif abs(pred_answer - ref_answer) == 1:
-            # Близкий ответ (ошибка на 1)
-            reward = self.close_reward
-        
-        # Бонус за правильный формат
+        # Проверяем формат
+        has_correct_format = False
         if reasoning_format == "deepseek":
-            if "<think>" in completion and "</think>" in completion:
-                reward += self.format_bonus
+            has_correct_format = "<think>" in completion and "</think>" in completion
         else:
-            if "<reasoning>" in completion and "</reasoning>" in completion:
-                reward += self.format_bonus
+            has_correct_format = "<reasoning>" in completion and "</reasoning>" in completion
         
-        return min(reward, 1.0)
+        # 🔥 Генерируем feedback
+        if pred_answer is None:
+            feedback = "Your answer had the wrong format. Please provide a clear numerical answer. You can use format: #### your_answer or <answer>your_answer</answer>."
+            score = 0.0
+        elif ref_answer is None:
+            # Reference не парсится
+            score = 0.0
+        else:
+            # Основной reward за правильный ответ
+            if pred_answer == ref_answer:
+                score = self.correct_reward
+                is_correct = True
+            elif abs(pred_answer - ref_answer) == 1:
+                # Близкий ответ (ошибка на 1)
+                score = self.close_reward
+                feedback = f"Your answer {pred_answer} is very close but off by 1. The correct answer is {ref_answer}. Check your arithmetic."
+            else:
+                score = 0.0
+                feedback = f"Your answer {pred_answer} is incorrect. The correct answer is {ref_answer}."
+            
+            # Бонус за правильный формат
+            if has_correct_format:
+                score += self.format_bonus
+        
+        return RewardResult(
+            score=min(score, 1.0),
+            feedback=feedback if self.generate_feedback else None,
+            is_correct=is_correct,
+            metadata={"pred": pred_answer, "ref": ref_answer, "has_format": has_correct_format},
+        )
 
 
 class MathExpressionReward(RewardFunction):
     """
     Reward для математических выражений и уравнений.
+    
+    🔥 SDPO Support: Возвращает feedback с объяснением ошибки.
     
     Может сравнивать:
     - Числа
@@ -265,9 +336,11 @@ class MathExpressionReward(RewardFunction):
         self,
         tolerance: float = 1e-4,
         weight: float = 1.0,
+        generate_feedback: bool = True,
     ):
         super().__init__(weight)
         self.tolerance = tolerance
+        self.generate_feedback = generate_feedback
     
     def _parse_roots(self, text: str) -> List[float]:
         """Парсит список корней уравнения."""
@@ -288,15 +361,33 @@ class MathExpressionReward(RewardFunction):
         completion: str,
         reference_answer: str,
         reasoning_format: str = "deepseek",
+        is_truncated: bool = False,
         **kwargs,
-    ) -> float:
-        """Сравнивает математические выражения."""
+    ) -> RewardResult:
+        """
+        Сравнивает математические выражения.
+        
+        🔥 SDPO: Возвращает feedback с объяснением ошибки.
+        """
+        feedback = None
+        
+        if is_truncated:
+            return RewardResult(
+                score=0.0,
+                feedback="Your response was truncated because it exceeded the maximum length.",
+                is_correct=False,
+            )
+        
         # Извлекаем ответ из completion
         pattern = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
         match = pattern.search(completion)
         
         if not match:
-            return 0.0
+            return RewardResult(
+                score=0.0,
+                feedback="Your answer had the wrong format. The solution must contain an answer in the format: <answer>your_answer</answer>.",
+                is_correct=False,
+            )
         
         pred_text = match.group(1).strip()
         
@@ -306,8 +397,13 @@ class MathExpressionReward(RewardFunction):
         
         if pred_num is not None and ref_num is not None:
             if abs(pred_num - ref_num) < self.tolerance:
-                return 1.0
-            return 0.0
+                return RewardResult(score=1.0, is_correct=True)
+            feedback = f"Your answer {pred_num} is incorrect. The correct answer is {ref_num}."
+            return RewardResult(
+                score=0.0,
+                feedback=feedback if self.generate_feedback else None,
+                is_correct=False,
+            )
         
         # Пробуем как список корней
         pred_roots = self._parse_roots(pred_text)
@@ -315,17 +411,40 @@ class MathExpressionReward(RewardFunction):
         
         if pred_roots and ref_roots:
             if len(pred_roots) != len(ref_roots):
-                return 0.0
+                feedback = f"Expected {len(ref_roots)} roots, but got {len(pred_roots)}. Correct roots: {ref_roots}."
+                return RewardResult(
+                    score=0.0,
+                    feedback=feedback if self.generate_feedback else None,
+                    is_correct=False,
+                )
             
             matches = 0
             for p, r in zip(pred_roots, ref_roots):
                 if abs(p - r) < self.tolerance:
                     matches += 1
             
-            return matches / len(ref_roots)
+            score = matches / len(ref_roots)
+            is_correct = score == 1.0
+            
+            if not is_correct:
+                feedback = f"Your roots {pred_roots} are partially incorrect. The correct roots are {ref_roots}."
+            
+            return RewardResult(
+                score=score,
+                feedback=feedback if self.generate_feedback else None,
+                is_correct=is_correct,
+            )
         
         # Fallback: строковое сравнение
         pred_norm = normalize_math_answer(pred_text)
         ref_norm = normalize_math_answer(reference_answer)
         
-        return 1.0 if pred_norm == ref_norm else 0.0
+        is_correct = pred_norm == ref_norm
+        if not is_correct:
+            feedback = f"Your answer '{pred_text}' is incorrect. The correct answer is '{reference_answer}'."
+        
+        return RewardResult(
+            score=1.0 if is_correct else 0.0,
+            feedback=feedback if self.generate_feedback else None,
+            is_correct=is_correct,
+        )

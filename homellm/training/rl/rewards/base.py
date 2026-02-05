@@ -1,17 +1,60 @@
 """
 Базовые классы для reward функций.
+
+🔥 SDPO Support: Reward функции возвращают RewardResult с feedback
+для использования в self-distillation (rich environment feedback).
 """
 from abc import ABC, abstractmethod
-from typing import List, Optional, Any, Dict, Callable
+from typing import List, Optional, Any, Dict, Callable, Union, NamedTuple
+from dataclasses import dataclass
 import torch
 import re
+
+
+@dataclass
+class RewardResult:
+    """
+    Результат вычисления reward с опциональным feedback.
+    
+    🔥 Для SDPO: feedback используется в reprompting для self-distillation.
+    Модель получает feedback своей попытки и учится исправлять ошибки.
+    
+    Attributes:
+        score: Числовое значение reward (0-1)
+        feedback: Текстовый feedback для SDPO (ошибки, пояснения)
+        is_correct: Была ли попытка успешной
+        metadata: Дополнительные данные для логирования
+    """
+    score: float
+    feedback: Optional[str] = None
+    is_correct: bool = False
+    metadata: Optional[Dict[str, Any]] = None
+    
+    def __float__(self) -> float:
+        """Для обратной совместимости: позволяет использовать как float."""
+        return self.score
+    
+    def __add__(self, other: Union["RewardResult", float]) -> float:
+        if isinstance(other, RewardResult):
+            return self.score + other.score
+        return self.score + other
+    
+    def __radd__(self, other: Union["RewardResult", float]) -> float:
+        return self.__add__(other)
+    
+    def __mul__(self, other: float) -> float:
+        return self.score * other
+    
+    def __rmul__(self, other: float) -> float:
+        return self.__mul__(other)
 
 
 class RewardFunction(ABC):
     """
     Базовый класс для reward функций.
     
-    Наследники должны реализовать метод __call__ для вычисления reward.
+    🔥 SDPO Support: Метод __call__ может возвращать RewardResult с feedback.
+    Для обратной совместимости также поддерживается возврат float.
     """
     
     def __init__(self, weight: float = 1.0):
@@ -29,7 +72,7 @@ class RewardFunction(ABC):
         reasoning_format: str = "deepseek",
         is_truncated: bool = False,
         **kwargs,
-    ) -> float:
+    ) -> Union[float, RewardResult]:
         """
         Вычисляет reward для одного completion.
         
@@ -41,36 +84,59 @@ class RewardFunction(ABC):
             **kwargs: Дополнительные параметры
             
         Returns:
-            Значение reward (обычно 0-1)
+            float или RewardResult с feedback для SDPO
         """
         pass
+    
+    def _to_reward_result(
+        self,
+        result: Union[float, RewardResult],
+    ) -> RewardResult:
+        """Конвертирует результат в RewardResult."""
+        if isinstance(result, RewardResult):
+            return result
+        return RewardResult(score=float(result), is_correct=float(result) >= 0.99)
     
     def batch_call(
         self,
         completions: List[str],
         reference_answers: List[str],
+        return_feedback: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, tuple]:
         """
         Вычисляет rewards для батча.
         
         Args:
             completions: Список completions
             reference_answers: Список эталонных ответов
+            return_feedback: 🔥 Если True, возвращает также feedback list
             
         Returns:
-            Tensor rewards [batch_size]
+            Если return_feedback=False: Tensor rewards [batch_size]
+            Если return_feedback=True: (Tensor rewards, List[str|None] feedbacks)
         """
         rewards = []
+        feedbacks = []
+        
         for completion, ref in zip(completions, reference_answers):
-            reward = self(completion, ref, **kwargs)
-            rewards.append(reward)
-        return torch.tensor(rewards, dtype=torch.float32)
+            result = self(completion, ref, **kwargs)
+            reward_result = self._to_reward_result(result)
+            rewards.append(reward_result.score)
+            feedbacks.append(reward_result.feedback)
+        
+        reward_tensor = torch.tensor(rewards, dtype=torch.float32)
+        
+        if return_feedback:
+            return reward_tensor, feedbacks
+        return reward_tensor
 
 
 class CombinedReward(RewardFunction):
     """
     Комбинация нескольких reward функций.
+    
+    🔥 SDPO Support: Комбинирует feedback от всех функций.
     
     Итоговый reward = sum(weight_i * reward_i) / sum(weights)
     или взвешенная сумма без нормализации.
@@ -97,32 +163,63 @@ class CombinedReward(RewardFunction):
         completion: str,
         reference_answer: str,
         **kwargs,
-    ) -> float:
-        """Вычисляет комбинированный reward."""
+    ) -> RewardResult:
+        """
+        Вычисляет комбинированный reward с объединённым feedback.
+        
+        🔥 SDPO: Feedback комбинируется от всех функций (непустые).
+        """
         total_reward = 0.0
+        feedbacks = []
+        all_correct = True
+        metadata = {}
         
         for rf in self.reward_functions:
-            reward = rf(completion, reference_answer, **kwargs)
-            total_reward += rf.weight * reward
+            result = rf(completion, reference_answer, **kwargs)
+            reward_result = self._to_reward_result(result)
+            
+            total_reward += rf.weight * reward_result.score
+            
+            # Собираем feedback
+            if reward_result.feedback:
+                feedbacks.append(reward_result.feedback)
+            
+            # Собираем metadata
+            if reward_result.metadata:
+                metadata[rf.__class__.__name__] = reward_result.metadata
+            
+            if not reward_result.is_correct:
+                all_correct = False
         
         if self.normalize and self._total_weight > 0:
-            return total_reward / self._total_weight
-        return total_reward
+            total_reward = total_reward / self._total_weight
+        
+        # Комбинируем feedback
+        combined_feedback = None
+        if feedbacks:
+            combined_feedback = "\n\n".join(feedbacks)
+        
+        return RewardResult(
+            score=total_reward,
+            feedback=combined_feedback,
+            is_correct=all_correct,
+            metadata=metadata if metadata else None,
+        )
     
     def get_component_rewards(
         self,
         completion: str,
         reference_answer: str,
         **kwargs,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, RewardResult]:
         """
-        Возвращает rewards по компонентам (для логирования).
+        Возвращает RewardResults по компонентам (для логирования).
         """
         component_rewards = {}
         for rf in self.reward_functions:
             name = rf.__class__.__name__
-            reward = rf(completion, reference_answer, **kwargs)
-            component_rewards[name] = reward
+            result = rf(completion, reference_answer, **kwargs)
+            component_rewards[name] = self._to_reward_result(result)
         return component_rewards
 
 

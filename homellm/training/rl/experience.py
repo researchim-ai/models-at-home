@@ -74,6 +74,7 @@ class Experience:
     prompt_id: Optional[int] = None
     prompt_ids: Optional[List[int]] = None  # Список prompt_ids для batch (для SDPO)
     completion_text: Optional[str] = None  # Для отладки
+    prompts: Optional[List[str]] = None  # 🔥 SDPO: оригинальные промпты (тексты)
     
     def to(self, device: torch.device) -> "ReplayBuffer":
         """Перемещает все тензоры на указанное устройство."""
@@ -152,6 +153,15 @@ def join_experience_batch(items: List[Experience]) -> Experience:
     # 🎓 SDPO: сохраняем все prompt_ids для batch
     batch_data["prompt_ids"] = [item.prompt_id for item in items] if items else None
     batch_data["completion_text"] = None
+    
+    # 🔥 SDPO: объединяем prompts из всех items
+    all_prompts = []
+    for item in items:
+        if item.prompts:
+            all_prompts.extend(item.prompts)
+        else:
+            all_prompts.append(None)
+    batch_data["prompts"] = all_prompts if all_prompts else None
     
     return Experience(**batch_data)
 

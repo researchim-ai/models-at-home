@@ -96,6 +96,7 @@ def ds3_gather_for_generation(model, accelerator):
 
 from .experience import Experience
 from .legacy_config import GRPOConfig
+from .rewards.base import RewardResult
 
 
 @dataclass
@@ -110,6 +111,7 @@ class Rollout:
         completion_ids: Token IDs ответов
         rewards: Rewards для каждого ответа
         is_truncated: Флаги обрезки (если достигнут max_length)
+        feedbacks: 🔥 SDPO: feedback от reward функций для каждого completion
     """
     prompt: str
     prompt_ids: torch.Tensor
@@ -117,6 +119,10 @@ class Rollout:
     completion_ids: List[torch.Tensor]
     rewards: torch.Tensor
     is_truncated: List[bool]
+    
+    # 🔥 SDPO: feedback от reward функций (ошибки, пояснения)
+    # Используется для rich environment feedback в self-distillation
+    feedbacks: Optional[List[Optional[str]]] = None
     
     # Метаданные для вычисления reward
     metadata: Optional[Dict[str, Any]] = None
@@ -559,25 +565,34 @@ def generate_rollouts(
                         completion_length = (generated_ids[j, prompt_length:] != tokenizer.pad_token_id).sum().item()
                         is_truncated.append(completion_length >= config.max_new_tokens)
                     
-                    # Вычисляем rewards
+                    # 🔥 SDPO: Вычисляем rewards и собираем feedback
                     rewards = torch.zeros(config.group_size, dtype=torch.float32, device=device)
+                    feedbacks: List[Optional[str]] = []
                     # Получаем metadata для текущего промпта
                     prompt_metadata = metadata_list[batch_idx * batch_size + i] if metadata_list else {}
                     for j, completion in enumerate(completions):
                         try:
-                            reward = reward_fn(
+                            result = reward_fn(
                                 completion=completion,
                                 reference_answer=ref_answer,
                                 reasoning_format=config.reasoning_format,
                                 is_truncated=is_truncated[j],
                                 metadata=prompt_metadata,
                             )
-                            if not isinstance(reward, (int, float)):
-                                reward = 0.0
-                            rewards[j] = float(reward)
+                            # 🔥 SDPO: обрабатываем RewardResult с feedback
+                            if isinstance(result, RewardResult):
+                                rewards[j] = float(result.score)
+                                feedbacks.append(result.feedback)
+                            elif isinstance(result, (int, float)):
+                                rewards[j] = float(result)
+                                feedbacks.append(None)
+                            else:
+                                rewards[j] = 0.0
+                                feedbacks.append(None)
                         except Exception as e:
                             logger.error(f"Ошибка reward для completion {j}: {e}")
                             rewards[j] = 0.0
+                            feedbacks.append(f"Error computing reward: {str(e)}")
                     
                     # Создаём Rollout
                     # Нужно получить prompt_ids для этого промпта
@@ -596,6 +611,7 @@ def generate_rollouts(
                         completion_ids=[generated_ids[j, prompt_length:] for j in range(config.group_size)],
                         rewards=rewards,
                         is_truncated=is_truncated,
+                        feedbacks=feedbacks,  # 🔥 SDPO
                         metadata={
                             "reference_answer": ref_answer,
                             "prompt_idx": prompt_idx,
@@ -765,35 +781,41 @@ def generate_rollouts(
                 completion_length = (generated_ids[i, prompt_length:] != tokenizer.pad_token_id).sum().item()
                 is_truncated.append(completion_length >= config.max_new_tokens)
             
-            # Вычисляем rewards
+            # 🔥 SDPO: Вычисляем rewards и собираем feedback
             rewards = torch.zeros(config.group_size, dtype=torch.float32, device=device)
+            feedbacks: List[Optional[str]] = []
             # Получаем metadata для текущего промпта
             prompt_metadata = metadata_list[prompt_idx] if metadata_list else {}
             for i, completion in enumerate(completions):
                 try:
-                    reward = reward_fn(
+                    result = reward_fn(
                         completion=completion,
                         reference_answer=ref_answer,
                         reasoning_format=config.reasoning_format,
                         is_truncated=is_truncated[i],
                         metadata=prompt_metadata,
                     )
-                    # Проверяем что reward - число
-                    if not isinstance(reward, (int, float)):
-                        import logging
-                        logging.warning(
-                            f"Reward не число: {type(reward)} = {reward} для completion: {completion[:100]}..."
+                    # 🔥 SDPO: обрабатываем RewardResult с feedback
+                    if isinstance(result, RewardResult):
+                        rewards[i] = float(result.score)
+                        feedbacks.append(result.feedback)
+                    elif isinstance(result, (int, float)):
+                        rewards[i] = float(result)
+                        feedbacks.append(None)
+                    else:
+                        logger.warning(
+                            f"Reward не число: {type(result)} = {result} для completion: {completion[:100]}..."
                         )
-                        reward = 0.0
-                    rewards[i] = float(reward)
+                        rewards[i] = 0.0
+                        feedbacks.append(None)
                 except Exception as e:
-                    import logging
-                    logging.error(
+                    logger.error(
                         f"Ошибка при вычислении reward для completion {i}: {e}\n"
                         f"Completion: {completion[:200]}...\n"
                         f"Reference: {ref_answer[:100]}..."
                     )
                     rewards[i] = 0.0
+                    feedbacks.append(f"Error computing reward: {str(e)}")
             
             # Создаём Rollout
             rollout = Rollout(
@@ -803,6 +825,7 @@ def generate_rollouts(
                 completion_ids=[generated_ids[i, prompt_length:] for i in range(config.group_size)],
                 rewards=rewards,
                 is_truncated=is_truncated,
+                feedbacks=feedbacks,  # 🔥 SDPO
                 metadata={
                     "reference_answer": ref_answer,
                     "prompt_idx": prompt_idx,
@@ -878,23 +901,34 @@ def generate_rollouts_vllm(
             finish_reason = getattr(cand, "finish_reason", None)
             is_truncated.append(finish_reason == "length")
 
-        # Rewards
+        # 🔥 SDPO: Rewards и feedback
         rewards = torch.zeros(len(completions), dtype=torch.float)
+        feedbacks: List[Optional[str]] = []
         # Получаем metadata для текущего промпта
         prompt_metadata = metadata_list[prompt_idx] if metadata_list else {}
         for i, comp in enumerate(completions):
             try:
-                r = reward_fn(
+                result = reward_fn(
                     completion=comp,
                     reference_answer=ref_answer,
                     reasoning_format=config.reasoning_format,
                     is_truncated=is_truncated[i],
                     metadata=prompt_metadata,
                 )
-                rewards[i] = float(r) if isinstance(r, (int, float)) else 0.0
+                # 🔥 SDPO: обрабатываем RewardResult с feedback
+                if isinstance(result, RewardResult):
+                    rewards[i] = float(result.score)
+                    feedbacks.append(result.feedback)
+                elif isinstance(result, (int, float)):
+                    rewards[i] = float(result)
+                    feedbacks.append(None)
+                else:
+                    rewards[i] = 0.0
+                    feedbacks.append(None)
             except Exception as e:
                 logger.error(f"Ошибка reward_fn: {e}")
                 rewards[i] = 0.0
+                feedbacks.append(f"Error computing reward: {str(e)}")
 
         rollouts.append(
             Rollout(
@@ -904,6 +938,7 @@ def generate_rollouts_vllm(
                 completion_ids=completion_ids,
                 rewards=rewards,
                 is_truncated=is_truncated,
+                feedbacks=feedbacks,  # 🔥 SDPO
                 metadata={
                     "reference_answer": ref_answer,
                     "prompt_idx": prompt_idx,
@@ -1051,6 +1086,11 @@ def rollout_to_experiences(
         log_probs = batch_log_probs[i, : L - 1]
         log_probs_ref = batch_log_probs_ref[i, : L - 1] if batch_log_probs_ref is not None else None
         
+        # 🔥 SDPO: передаём prompt для teacher reprompting
+        prompt_id = None
+        if rollout.metadata:
+            prompt_id = rollout.metadata.get('prompt_id')
+        
         exp = Experience(
             sequences=sequence_ids,
             prompt_length=prompt_length,
@@ -1061,6 +1101,8 @@ def rollout_to_experiences(
             attention_mask=attn,
             action_mask=action_mask,
             completion_text=rollout.completions[i],
+            prompts=[rollout.prompt],  # 🔥 SDPO: оригинальный промпт
+            prompt_ids=[prompt_id] if prompt_id is not None else None,  # 🔥 SDPO
         )
         experiences.append(exp)
     
