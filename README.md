@@ -74,7 +74,7 @@ The easiest way to run the studio without dealing with CUDA and PyTorch installa
 
 2. **Run with Docker Compose:**
    ```bash
-   docker-compose up --build
+   docker compose up --build
    ```
 
 3. **Open in browser:**

@@ -572,5 +572,24 @@
   "common.control": "Управление",
   
   "visual_builder.subtitle": "Редактор архитектур моделей",
-  "visual_builder.footer": "🚀 Model Builder поддерживает стандартные блоки PyTorch и пользовательские операции."
+  "visual_builder.footer": "🚀 Model Builder поддерживает стандартные блоки PyTorch и пользовательские операции.",
+
+  "study_center.title": "Study Center",
+  "study_center.subtitle": "Учебный раздел с актуальными материалами по ИИ",
+  "study_center.repo_link_label": "Репозиторий state-of-ai",
+  "study_center.refresh_button": "Обновить список из GitHub",
+  "study_center.cache_refreshed": "Кэш обновлен",
+  "study_center.loading": "Загружаю материалы state-of-ai...",
+  "study_center.source.github": "GitHub",
+  "study_center.source.local_copy": "Локальная копия",
+  "study_center.error.no_docs": "Не удалось загрузить markdown-файлы ни из GitHub, ни из локальной папки `state-of-ai`.",
+  "study_center.error.github_details": "Ошибка GitHub: `{error}`",
+  "study_center.error.open_doc": "Не удалось открыть `{path}`: {error}",
+  "study_center.warning.local_fallback": "GitHub сейчас недоступен. Показана локальная копия материалов.",
+  "study_center.github_error_details_title": "Подробности ошибки GitHub",
+  "study_center.file_label": "Файл: `{path}`",
+  "study_center.sidebar.source": "Источник: **{source}**",
+  "study_center.sidebar.section_state_of_ai": "state-of-ai",
+  "study_center.sidebar.documents_count": "Документов: {count}",
+  "study_center.sidebar.materials": "Материалы"
 }

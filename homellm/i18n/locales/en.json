@@ -574,5 +574,24 @@
   "common.control": "Control",
   
   "visual_builder.subtitle": "Model Architecture Editor",
-  "visual_builder.footer": "🚀 Model Builder supports standard PyTorch blocks and custom operations."
+  "visual_builder.footer": "🚀 Model Builder supports standard PyTorch blocks and custom operations.",
+
+  "study_center.title": "Study Center",
+  "study_center.subtitle": "Large educational section with up-to-date AI materials",
+  "study_center.repo_link_label": "state-of-ai repository",
+  "study_center.refresh_button": "Refresh list from GitHub",
+  "study_center.cache_refreshed": "Cache refreshed",
+  "study_center.loading": "Loading state-of-ai materials...",
+  "study_center.source.github": "GitHub",
+  "study_center.source.local_copy": "Local copy",
+  "study_center.error.no_docs": "Could not load markdown files from GitHub or from local `state-of-ai` folder.",
+  "study_center.error.github_details": "GitHub error: `{error}`",
+  "study_center.error.open_doc": "Could not open `{path}`: {error}",
+  "study_center.warning.local_fallback": "GitHub is currently unavailable. Showing local copy of materials.",
+  "study_center.github_error_details_title": "GitHub error details",
+  "study_center.file_label": "File: `{path}`",
+  "study_center.sidebar.source": "Source: **{source}**",
+  "study_center.sidebar.section_state_of_ai": "state-of-ai",
+  "study_center.sidebar.documents_count": "Documents: {count}",
+  "study_center.sidebar.materials": "Materials"
 }
