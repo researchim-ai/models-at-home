@@ -62,6 +62,9 @@ def _find_project_root(start: Path) -> Path:
 
 
 PROJECT_ROOT = _find_project_root(Path(__file__).parent)
+# Внутренние учебные материалы (свои MD в репозитории)
+STUDY_MATERIALS_DIR = PROJECT_ROOT / "study_materials"
+# Внешний репозиторий state-of-ai (клонируется отдельно или грузится с GitHub)
 LOCAL_STATE_OF_AI_DIR = PROJECT_ROOT / "state-of-ai"
 
 
@@ -137,27 +140,81 @@ def load_local_markdown(rel_path: str) -> str:
     return target.read_text(encoding="utf-8")
 
 
-def _init_page_state(default_doc_id: str) -> None:
-    if "study_selected_doc" not in st.session_state:
-        st.session_state.study_selected_doc = default_doc_id
+def load_internal_markdown_index() -> List[Dict[str, str]]:
+    """Наши внутренние учебные материалы из study_materials/."""
+    if not STUDY_MATERIALS_DIR.exists():
+        return []
+    md_paths = [str(p.relative_to(STUDY_MATERIALS_DIR)) for p in STUDY_MATERIALS_DIR.rglob("*.md")]
+    docs = []
+    for rel_path in _sort_docs(md_paths):
+        docs.append({"path": rel_path, "title": _display_title_from_path(rel_path)})
+    return docs
 
 
-def _render_sidebar_docs(source_label: str, docs: List[Dict[str, str]]) -> str:
+def load_internal_markdown(rel_path: str) -> str:
+    target = STUDY_MATERIALS_DIR / rel_path
+    return target.read_text(encoding="utf-8")
+
+
+def _init_page_state(
+    default_section: str,
+    internal_docs: List[Dict[str, str]],
+    state_of_ai_docs: List[Dict[str, str]],
+) -> None:
+    if "study_section" not in st.session_state:
+        st.session_state.study_section = default_section
+    if "study_selected_doc_internal" not in st.session_state:
+        st.session_state.study_selected_doc_internal = internal_docs[0]["path"] if internal_docs else ""
+    if "study_selected_doc_state_of_ai" not in st.session_state:
+        st.session_state.study_selected_doc_state_of_ai = state_of_ai_docs[0]["path"] if state_of_ai_docs else ""
+
+
+def _render_sidebar(
+    internal_docs: List[Dict[str, str]],
+    state_of_ai_docs: List[Dict[str, str]],
+    state_of_ai_source_label: str,
+) -> Tuple[str, str]:
+    """Возвращает (section, selected_path)."""
     st.sidebar.header(f"🎓 {t('study_center.title')}")
-    st.sidebar.caption(t("study_center.sidebar.source", source=source_label))
-    st.sidebar.markdown(f"### {t('study_center.sidebar.section_state_of_ai')}")
-    st.sidebar.caption(t("study_center.sidebar.documents_count", count=len(docs)))
 
-    options = [doc["path"] for doc in docs]
-    labels = {doc["path"]: doc["title"] for doc in docs}
-
-    selected = st.sidebar.radio(
-        t("study_center.sidebar.materials"),
-        options=options,
-        format_func=lambda p: labels[p],
-        key="study_selected_doc",
+    section_options = [t("study_center.section.internal"), t("study_center.section.state_of_ai")]
+    section = st.sidebar.radio(
+        t("study_center.sidebar.choose_section"),
+        options=section_options,
+        key="study_section",
     )
-    return selected
+
+    if section == t("study_center.section.internal"):
+        st.sidebar.markdown(f"### {t('study_center.sidebar.section_internal')}")
+        st.sidebar.caption(t("study_center.sidebar.documents_count", count=len(internal_docs)))
+        if not internal_docs:
+            st.sidebar.info(t("study_center.sidebar.no_internal_docs"))
+            return section, ""
+        options = [doc["path"] for doc in internal_docs]
+        labels = {doc["path"]: doc["title"] for doc in internal_docs}
+        selected = st.sidebar.radio(
+            t("study_center.sidebar.materials"),
+            options=options,
+            format_func=lambda p: labels[p],
+            key="study_selected_doc_internal",
+        )
+        return section, selected
+    else:
+        st.sidebar.caption(t("study_center.sidebar.source", source=state_of_ai_source_label))
+        st.sidebar.markdown(f"### {t('study_center.sidebar.section_state_of_ai')}")
+        st.sidebar.caption(t("study_center.sidebar.documents_count", count=len(state_of_ai_docs)))
+        if not state_of_ai_docs:
+            st.sidebar.warning(t("study_center.sidebar.no_state_of_ai_docs"))
+            return section, ""
+        options = [doc["path"] for doc in state_of_ai_docs]
+        labels = {doc["path"]: doc["title"] for doc in state_of_ai_docs}
+        selected = st.sidebar.radio(
+            t("study_center.sidebar.materials"),
+            options=options,
+            format_func=lambda p: labels[p],
+            key="study_selected_doc_state_of_ai",
+        )
+        return section, selected
 
 
 def main() -> None:
@@ -168,50 +225,77 @@ def main() -> None:
     st.caption(t("study_center.subtitle"))
     st.markdown(f"[{t('study_center.repo_link_label')}]({REPO_URL})")
 
+    # Внутренние материалы — всегда из папки study_materials/
+    internal_docs = load_internal_markdown_index()
+
+    # state-of-ai — внешний репозиторий (GitHub или локальный клон)
     refresh = st.sidebar.button(f"🔄 {t('study_center.refresh_button')}", use_container_width=True)
     if refresh:
         load_remote_markdown_index.clear()
         load_remote_markdown.clear()
         st.sidebar.success(t("study_center.cache_refreshed"))
 
-    docs: List[Dict[str, str]]
-    source = t("study_center.source.github")
+    state_of_ai_docs: List[Dict[str, str]] = []
+    state_of_ai_source = t("study_center.source.github")
     branch = "main"
     remote_error = None
 
     with st.spinner(t("study_center.loading")):
         try:
-            branch, docs = load_remote_markdown_index()
+            branch, state_of_ai_docs = load_remote_markdown_index()
         except Exception as exc:  # noqa: BLE001 - user-facing fallback logic
             remote_error = str(exc)
-            docs = load_local_markdown_index()
-            source = t("study_center.source.local_copy")
+            state_of_ai_docs = load_local_markdown_index()
+            state_of_ai_source = t("study_center.source.local_copy")
 
-    if not docs:
+    state_of_ai_source_label = (
+        state_of_ai_source if state_of_ai_source != t("study_center.source.github")
+        else f"{t('study_center.source.github')} ({branch})"
+    )
+
+    if not internal_docs and not state_of_ai_docs:
         st.error(t("study_center.error.no_docs"))
         if remote_error:
             st.caption(t("study_center.error.github_details", error=remote_error))
+        st.info(t("study_center.sidebar.no_internal_docs"))
         return
 
-    _init_page_state(docs[0]["path"])
-    source_label = source if source != t("study_center.source.github") else f"{t('study_center.source.github')} ({branch})"
-    selected_path = _render_sidebar_docs(source_label, docs)
-    current_doc = next(doc for doc in docs if doc["path"] == selected_path)
+    default_section = t("study_center.section.internal") if internal_docs else t("study_center.section.state_of_ai")
+    _init_page_state(default_section, internal_docs, state_of_ai_docs)
 
-    if source == t("study_center.source.local_copy"):
-        st.warning(t("study_center.warning.local_fallback"))
-        if remote_error:
-            with st.expander(t("study_center.github_error_details_title")):
-                st.code(remote_error)
+    section, selected_path = _render_sidebar(
+        internal_docs, state_of_ai_docs, state_of_ai_source_label
+    )
 
-    try:
-        if source == "GitHub":
-            content = load_remote_markdown(current_doc["raw_url"])
+    if not selected_path:
+        if section == t("study_center.section.internal"):
+            st.info(t("study_center.sidebar.no_internal_docs"))
         else:
-            content = load_local_markdown(current_doc["path"])
-    except Exception as exc:  # noqa: BLE001 - user-facing message
-        st.error(t("study_center.error.open_doc", path=current_doc["path"], error=exc))
+            st.warning(t("study_center.sidebar.no_state_of_ai_docs"))
         return
+
+    if section == t("study_center.section.internal"):
+        current_doc = next(doc for doc in internal_docs if doc["path"] == selected_path)
+        try:
+            content = load_internal_markdown(current_doc["path"])
+        except Exception as exc:  # noqa: BLE001
+            st.error(t("study_center.error.open_doc", path=current_doc["path"], error=exc))
+            return
+    else:
+        current_doc = next(doc for doc in state_of_ai_docs if doc["path"] == selected_path)
+        if state_of_ai_source == t("study_center.source.local_copy"):
+            st.warning(t("study_center.warning.local_fallback"))
+            if remote_error:
+                with st.expander(t("study_center.github_error_details_title")):
+                    st.code(remote_error)
+        try:
+            if state_of_ai_source == t("study_center.source.github"):
+                content = load_remote_markdown(current_doc["raw_url"])
+            else:
+                content = load_local_markdown(current_doc["path"])
+        except Exception as exc:  # noqa: BLE001
+            st.error(t("study_center.error.open_doc", path=current_doc["path"], error=exc))
+            return
 
     st.subheader(f"📄 {current_doc['title']}")
     st.caption(t("study_center.file_label", path=current_doc["path"]))

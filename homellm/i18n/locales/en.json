@@ -593,5 +593,11 @@
   "study_center.sidebar.source": "Source: **{source}**",
   "study_center.sidebar.section_state_of_ai": "state-of-ai",
   "study_center.sidebar.documents_count": "Documents: {count}",
-  "study_center.sidebar.materials": "Materials"
+  "study_center.sidebar.materials": "Materials",
+  "study_center.section.internal": "Models at home materials",
+  "study_center.section.state_of_ai": "state-of-ai",
+  "study_center.sidebar.choose_section": "Section",
+  "study_center.sidebar.section_internal": "Models At Home materials",
+  "study_center.sidebar.no_internal_docs": "Add .md files to the study_materials/ folder",
+  "study_center.sidebar.no_state_of_ai_docs": "No state-of-ai documents. Refresh list or clone the repository."
 }

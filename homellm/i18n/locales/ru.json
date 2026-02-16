@@ -591,5 +591,11 @@
   "study_center.sidebar.source": "Источник: **{source}**",
   "study_center.sidebar.section_state_of_ai": "state-of-ai",
   "study_center.sidebar.documents_count": "Документов: {count}",
-  "study_center.sidebar.materials": "Материалы"
+  "study_center.sidebar.materials": "Материалы",
+  "study_center.section.internal": "Наши материалы",
+  "study_center.section.state_of_ai": "state-of-ai",
+  "study_center.sidebar.choose_section": "Раздел",
+  "study_center.sidebar.section_internal": "Наши материалы",
+  "study_center.sidebar.no_internal_docs": "Добавьте .md файлы в папку study_materials/",
+  "study_center.sidebar.no_state_of_ai_docs": "Нет документов state-of-ai. Обновите список или клонируйте репозиторий."
 }
