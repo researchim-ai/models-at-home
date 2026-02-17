@@ -73,13 +73,13 @@ LOCAL_STATE_OF_AI_DIR = PROJECT_ROOT / "state-of-ai"
 
 def _http_get_json(url: str) -> Any:
     req = Request(url, headers={"User-Agent": "models-at-home-study-center"})
-    with urlopen(req, timeout=20) as resp:
+    with urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def _http_get_text(url: str) -> str:
     req = Request(url, headers={"User-Agent": "models-at-home-study-center"})
-    with urlopen(req, timeout=20) as resp:
+    with urlopen(req, timeout=10) as resp:
         return resp.read().decode("utf-8")
 
 
@@ -289,37 +289,29 @@ def main() -> None:
     current_lang = get_current_language()
     internal_docs = load_internal_markdown_index(current_lang)
 
-    # state-of-ai — внешний репозиторий (GitHub или локальный клон)
-    refresh = st.sidebar.button(f"🔄 {t('study_center.refresh_button')}", use_container_width=True)
-    if refresh:
-        load_remote_markdown_index.clear()
-        load_remote_markdown.clear()
-        st.sidebar.success(t("study_center.cache_refreshed"))
+    # state-of-ai — загрузка только по кнопке, одна попытка
+    if "study_state_of_ai_remote" not in st.session_state:
+        st.session_state.study_state_of_ai_remote = None  # (branch, docs) or None
+    if "study_state_of_ai_remote_error" not in st.session_state:
+        st.session_state.study_state_of_ai_remote_error = None
 
+    # Берём данные из session_state (уже загружены по кнопке) или локальную копию; без автоматического запроса
     state_of_ai_docs: List[Dict[str, str]] = []
     state_of_ai_source = t("study_center.source.github")
     branch = "main"
-    remote_error = None
+    remote_error = st.session_state.study_state_of_ai_remote_error
 
-    with st.spinner(t("study_center.loading")):
-        try:
-            branch, state_of_ai_docs = load_remote_markdown_index()
-        except Exception as exc:  # noqa: BLE001 - user-facing fallback logic
-            remote_error = str(exc)
-            state_of_ai_docs = load_local_markdown_index()
+    if st.session_state.study_state_of_ai_remote is not None:
+        branch, state_of_ai_docs = st.session_state.study_state_of_ai_remote
+    else:
+        state_of_ai_docs = load_local_markdown_index()
+        if state_of_ai_docs:
             state_of_ai_source = t("study_center.source.local_copy")
 
     state_of_ai_source_label = (
         state_of_ai_source if state_of_ai_source != t("study_center.source.github")
         else f"{t('study_center.source.github')} ({branch})"
     )
-
-    if not internal_docs and not state_of_ai_docs:
-        st.error(t("study_center.error.no_docs"))
-        if remote_error:
-            st.caption(t("study_center.error.github_details", error=remote_error))
-        st.info(t("study_center.sidebar.no_internal_docs"))
-        return
 
     internal_section_label = t("study_center.section.internal")
     state_of_ai_section_label = t("study_center.section.state_of_ai")
@@ -332,6 +324,28 @@ def main() -> None:
 
     default_section = internal_section_label if internal_docs else state_of_ai_section_label
     _init_page_state(default_section, internal_docs, state_of_ai_docs)
+
+    # Кнопка «Загрузить с GitHub» только когда выбран раздел state-of-ai
+    if st.session_state.study_section == state_of_ai_section_label:
+        load_clicked = st.sidebar.button(f"📥 {t('study_center.load_button')}", use_container_width=True)
+        if load_clicked:
+            st.session_state.study_state_of_ai_remote_error = None
+            with st.spinner(t("study_center.loading")):
+                try:
+                    branch, docs = load_remote_markdown_index()
+                    st.session_state.study_state_of_ai_remote = (branch, docs)
+                except Exception as exc:  # noqa: BLE001 - user-facing fallback logic
+                    st.session_state.study_state_of_ai_remote_error = str(exc)
+
+    if remote_error:
+        st.sidebar.error(t("study_center.error.load_failed"))
+
+    if not internal_docs and not state_of_ai_docs:
+        st.error(t("study_center.error.no_docs"))
+        if remote_error:
+            st.caption(t("study_center.error.github_details", error=remote_error))
+        st.info(t("study_center.sidebar.no_internal_docs"))
+        return
 
     section, selected_path = _render_sidebar(
         internal_docs, state_of_ai_docs, state_of_ai_source_label
