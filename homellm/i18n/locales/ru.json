@@ -596,6 +596,6 @@
   "study_center.section.state_of_ai": "state-of-ai",
   "study_center.sidebar.choose_section": "Раздел",
   "study_center.sidebar.section_internal": "Наши материалы",
-  "study_center.sidebar.no_internal_docs": "Добавьте .md файлы в папку study_materials/",
+  "study_center.sidebar.no_internal_docs": "Добавьте .md файлы в study_materials/ru/ или study_materials/en/ (по языку)",
   "study_center.sidebar.no_state_of_ai_docs": "Нет документов state-of-ai. Обновите список или клонируйте репозиторий."
 }

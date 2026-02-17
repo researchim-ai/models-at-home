@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -13,11 +13,14 @@ import streamlit as st
 
 # Internationalization (i18n)
 try:
-    from homellm.i18n import t
+    from homellm.i18n import t, get_current_language
 except ImportError:
     # Fallback for direct run
     def t(key, **kwargs):
         return key
+
+    def get_current_language() -> str:
+        return "en"
 
 REPO_OWNER = "researchim-ai"
 REPO_NAME = "state-of-ai"
@@ -140,20 +143,77 @@ def load_local_markdown(rel_path: str) -> str:
     return target.read_text(encoding="utf-8")
 
 
-def load_internal_markdown_index() -> List[Dict[str, str]]:
-    """Наши внутренние учебные материалы из study_materials/."""
-    if not STUDY_MATERIALS_DIR.exists():
+def _internal_materials_dir_for_lang(lang: str) -> Path:
+    """Папка с учебными материалами для языка: study_materials/{lang}/."""
+    return STUDY_MATERIALS_DIR / lang
+
+
+def load_internal_markdown_index(lang: Optional[str] = None) -> List[Dict[str, str]]:
+    """Внутренние учебные материалы из study_materials/{lang}/. Язык — из i18n, если не передан."""
+    if lang is None:
+        lang = get_current_language()
+    root = _internal_materials_dir_for_lang(lang)
+    if not root.exists():
+        # Fallback: другой поддерживаемый язык
+        other = "ru" if lang == "en" else "en"
+        root = _internal_materials_dir_for_lang(other)
+    if not root.exists():
         return []
-    md_paths = [str(p.relative_to(STUDY_MATERIALS_DIR)) for p in STUDY_MATERIALS_DIR.rglob("*.md")]
+    md_paths = [str(p.relative_to(root)) for p in root.rglob("*.md")]
     docs = []
     for rel_path in _sort_docs(md_paths):
         docs.append({"path": rel_path, "title": _display_title_from_path(rel_path)})
     return docs
 
 
-def load_internal_markdown(rel_path: str) -> str:
-    target = STUDY_MATERIALS_DIR / rel_path
+def load_internal_markdown(rel_path: str, lang: Optional[str] = None) -> str:
+    """Читает markdown из study_materials/{lang}/{rel_path}."""
+    if lang is None:
+        lang = get_current_language()
+    root = _internal_materials_dir_for_lang(lang)
+    if not root.exists():
+        root = _internal_materials_dir_for_lang("ru" if lang == "en" else "en")
+    target = root / rel_path
     return target.read_text(encoding="utf-8")
+
+
+def rewrite_internal_md_links(content: str, internal_doc_paths: List[str]) -> str:
+    """Заменяет ссылки на внутренние .md файлы на query-параметры, чтобы по клику открывался нужный документ в Study Center."""
+    if not internal_doc_paths:
+        return content
+    # Сортируем по длине (убывание), чтобы сначала матчить более длинные пути (на случай подстрок)
+    for path in sorted(internal_doc_paths, key=len, reverse=True):
+        escaped = re.escape(path)
+        # Матчим ](path) или ](path#anchor)
+        pattern = rf"\]\({escaped}(#.*?)?\)"
+        replacement = rf"](?internal_doc={path}\1)"
+        content = re.sub(pattern, replacement, content)
+    return content
+
+
+def _apply_query_params(
+    internal_docs: List[Dict[str, str]],
+    state_of_ai_docs: List[Dict[str, str]],
+    internal_section_label: str,
+    state_of_ai_section_label: str,
+) -> None:
+    """Читает query-параметры (?internal_doc=LLM.md или ?state_of_ai_doc=...) и выставляет выбор документа в session_state."""
+    try:
+        q = st.query_params
+    except Exception:
+        return
+    internal_paths = {d["path"] for d in internal_docs}
+    state_of_ai_paths = {d["path"] for d in state_of_ai_docs}
+    if "internal_doc" in q:
+        doc = q["internal_doc"]
+        if doc in internal_paths:
+            st.session_state.study_section = internal_section_label
+            st.session_state.study_selected_doc_internal = doc
+    if "state_of_ai_doc" in q:
+        doc = q["state_of_ai_doc"]
+        if doc in state_of_ai_paths:
+            st.session_state.study_section = state_of_ai_section_label
+            st.session_state.study_selected_doc_state_of_ai = doc
 
 
 def _init_page_state(
@@ -225,8 +285,9 @@ def main() -> None:
     st.caption(t("study_center.subtitle"))
     st.markdown(f"[{t('study_center.repo_link_label')}]({REPO_URL})")
 
-    # Внутренние материалы — всегда из папки study_materials/
-    internal_docs = load_internal_markdown_index()
+    # Внутренние материалы — из study_materials/{lang}/ по текущему языку интерфейса
+    current_lang = get_current_language()
+    internal_docs = load_internal_markdown_index(current_lang)
 
     # state-of-ai — внешний репозиторий (GitHub или локальный клон)
     refresh = st.sidebar.button(f"🔄 {t('study_center.refresh_button')}", use_container_width=True)
@@ -260,7 +321,16 @@ def main() -> None:
         st.info(t("study_center.sidebar.no_internal_docs"))
         return
 
-    default_section = t("study_center.section.internal") if internal_docs else t("study_center.section.state_of_ai")
+    internal_section_label = t("study_center.section.internal")
+    state_of_ai_section_label = t("study_center.section.state_of_ai")
+    _apply_query_params(
+        internal_docs,
+        state_of_ai_docs,
+        internal_section_label,
+        state_of_ai_section_label,
+    )
+
+    default_section = internal_section_label if internal_docs else state_of_ai_section_label
     _init_page_state(default_section, internal_docs, state_of_ai_docs)
 
     section, selected_path = _render_sidebar(
@@ -277,7 +347,10 @@ def main() -> None:
     if section == t("study_center.section.internal"):
         current_doc = next(doc for doc in internal_docs if doc["path"] == selected_path)
         try:
-            content = load_internal_markdown(current_doc["path"])
+            content = load_internal_markdown(current_doc["path"], current_lang)
+            content = rewrite_internal_md_links(
+                content, [d["path"] for d in internal_docs]
+            )
         except Exception as exc:  # noqa: BLE001
             st.error(t("study_center.error.open_doc", path=current_doc["path"], error=exc))
             return
