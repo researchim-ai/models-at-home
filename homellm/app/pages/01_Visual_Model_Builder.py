@@ -22,6 +22,10 @@ except ImportError:
     def t(key, **kwargs):
         return key
 from homellm.models.blocks import BLOCK_REGISTRY
+try:
+    from homellm.app.ui_preferences import DEFAULT_THEME, init_user_preferences, apply_theme_css
+except ImportError:
+    from ..ui_preferences import DEFAULT_THEME, init_user_preferences, apply_theme_css
 
 def _find_project_root(start: Path) -> Path:
     """Find repo root by walking up until we see docker-compose.yml or pyproject.toml."""
@@ -42,6 +46,9 @@ def _find_project_root(start: Path) -> Path:
 PROJECT_ROOT = _find_project_root(Path(__file__).parent)
 BLUEPRINTS_DIR = PROJECT_ROOT / "blueprints"
 BLUEPRINTS_DIR.mkdir(exist_ok=True)
+RUNS_DIR = PROJECT_ROOT / ".runs"
+RUNS_DIR.mkdir(exist_ok=True)
+USER_PREFS_FILE = RUNS_DIR / "ui_preferences.json"
 
 # Port for the sidecar save server
 SIDECAR_PORT = 8502
@@ -1009,6 +1016,8 @@ DRAWFLOW_HTML = f"""
 
 def main():
     st.set_page_config(page_title="Visual Model Builder", page_icon="🧪", layout="wide")
+    init_user_preferences(USER_PREFS_FILE)
+    apply_theme_css(st.session_state.get("ui_theme", DEFAULT_THEME))
     
     st.title("🧪 Visual Model Builder")
     st.caption(t("visual_builder.subtitle"))

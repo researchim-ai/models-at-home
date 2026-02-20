@@ -21,6 +21,10 @@ except ImportError:
 
     def get_current_language() -> str:
         return "en"
+try:
+    from homellm.app.ui_preferences import DEFAULT_THEME, init_user_preferences, apply_theme_css
+except ImportError:
+    from ..ui_preferences import DEFAULT_THEME, init_user_preferences, apply_theme_css
 
 REPO_OWNER = "researchim-ai"
 REPO_NAME = "state-of-ai"
@@ -69,6 +73,9 @@ PROJECT_ROOT = _find_project_root(Path(__file__).parent)
 STUDY_MATERIALS_DIR = PROJECT_ROOT / "study_materials"
 # Внешний репозиторий state-of-ai (клонируется отдельно или грузится с GitHub)
 LOCAL_STATE_OF_AI_DIR = PROJECT_ROOT / "state-of-ai"
+RUNS_DIR = PROJECT_ROOT / ".runs"
+RUNS_DIR.mkdir(exist_ok=True)
+USER_PREFS_FILE = RUNS_DIR / "ui_preferences.json"
 
 
 def _http_get_json(url: str) -> Any:
@@ -279,6 +286,8 @@ def _render_sidebar(
 
 def main() -> None:
     st.set_page_config(page_title=t("study_center.title"), page_icon="🎓", layout="wide")
+    init_user_preferences(USER_PREFS_FILE)
+    apply_theme_css(st.session_state.get("ui_theme", DEFAULT_THEME))
     _apply_page_typography()
 
     st.title(f"🎓 {t('study_center.title')}")

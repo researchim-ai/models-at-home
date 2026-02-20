@@ -196,6 +196,7 @@
   "tabs.data": "Данные",
   "tabs.models": "Модели",
   "tabs.docs": "Справка",
+  "tabs.settings": "Настройки",
   "tabs.history": "История",
   
   "history.title": "История запусков",
@@ -573,6 +574,26 @@
   
   "visual_builder.subtitle": "Редактор архитектур моделей",
   "visual_builder.footer": "🚀 Model Builder поддерживает стандартные блоки PyTorch и пользовательские операции.",
+
+  "onboarding.title": "Добро пожаловать в Models at Home Studio!",
+  "onboarding.subtitle": "Похоже, это ваш первый запуск. Давайте настроим язык и тему.",
+  "onboarding.info": "Эти параметры сохранятся и применятся автоматически при следующем запуске. Позже их можно изменить во вкладке настроек.",
+  "onboarding.language": "Язык интерфейса",
+  "onboarding.theme": "Тема",
+  "onboarding.start_button": "Запустить студию",
+
+  "settings.title": "Настройки студии",
+  "settings.subtitle": "Здесь можно в любой момент изменить язык и тему интерфейса.",
+  "settings.language": "Язык",
+  "settings.theme": "Тема",
+  "settings.theme.streamlit_dark": "Streamlit Dark",
+  "settings.theme.streamlit_light": "Streamlit Light",
+  "settings.theme.ocean_mist": "Ocean Mist",
+  "settings.theme.forest_night": "Forest Night",
+  "settings.theme.sunset_warm": "Sunset Warm",
+  "settings.save_button": "Сохранить настройки",
+  "settings.saved": "Настройки сохранены",
+  "settings.theme_restart_required": "Тема применится после полной перезагрузки вкладки браузера (Ctrl+Shift+R) или перезапуска Streamlit.",
 
   "study_center.title": "Study Center",
   "study_center.subtitle": "Учебный раздел с актуальными материалами по ИИ",

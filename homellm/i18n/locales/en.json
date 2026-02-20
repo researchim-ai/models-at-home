@@ -199,6 +199,7 @@
   "tabs.data": "Data",
   "tabs.models": "Models",
   "tabs.docs": "Docs",
+  "tabs.settings": "Settings",
   
   "history.title": "Run History",
   "tabs.history": "History",
@@ -575,6 +576,26 @@
   
   "visual_builder.subtitle": "Model Architecture Editor",
   "visual_builder.footer": "🚀 Model Builder supports standard PyTorch blocks and custom operations.",
+
+  "onboarding.title": "Welcome to Models at Home Studio!",
+  "onboarding.subtitle": "Looks like this is your first launch. Let's configure language and theme.",
+  "onboarding.info": "These settings will be saved and applied automatically next time. You can change them later in Settings.",
+  "onboarding.language": "Interface language",
+  "onboarding.theme": "Theme",
+  "onboarding.start_button": "Start Studio",
+
+  "settings.title": "Studio Settings",
+  "settings.subtitle": "Change interface preferences at any time.",
+  "settings.language": "Language",
+  "settings.theme": "Theme",
+  "settings.theme.streamlit_dark": "Streamlit Dark",
+  "settings.theme.streamlit_light": "Streamlit Light",
+  "settings.theme.ocean_mist": "Ocean Mist",
+  "settings.theme.forest_night": "Forest Night",
+  "settings.theme.sunset_warm": "Sunset Warm",
+  "settings.save_button": "Save settings",
+  "settings.saved": "Settings saved",
+  "settings.theme_restart_required": "Theme applies after a full browser tab reload (Ctrl+Shift+R) or Streamlit restart.",
 
   "study_center.title": "Study Center",
   "study_center.subtitle": "Large educational section with up-to-date AI materials",

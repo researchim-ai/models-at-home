@@ -38,9 +38,26 @@ except ImportError:
 
 # Internationalization (i18n)
 try:
-    from homellm.i18n import t, language_selector, load_translations
+    from homellm.i18n import t, load_translations
 except ImportError:
-    from ..i18n import t, language_selector, load_translations
+    from ..i18n import t, load_translations
+
+try:
+    from .ui_preferences import (
+        DEFAULT_THEME,
+        init_user_preferences,
+        persist_user_preferences_if_changed,
+        apply_theme_css,
+        render_first_run_setup,
+    )
+except ImportError:
+    from ui_preferences import (
+        DEFAULT_THEME,
+        init_user_preferences,
+        persist_user_preferences_if_changed,
+        apply_theme_css,
+        render_first_run_setup,
+    )
 
 # Пути
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -66,105 +83,14 @@ st.set_page_config(
 # Load translations for i18n
 load_translations()
 
-# Custom CSS — чистая тёмная тема с хорошим контрастом
-st.markdown("""
-<style>
-    /* Заголовок */
-    .main-header {
-        color: #ff6b6b;
-        font-size: 2.5rem;
-        font-weight: 800;
-        text-align: center;
-        margin-bottom: 0.5rem;
-    }
-    
-    .sub-header {
-        color: #888888;
-        text-align: center;
-        font-size: 1.1rem;
-        margin-bottom: 2rem;
-    }
-    
-    /* Статус */
-    .status-running {
-        color: #22c55e !important;
-        font-weight: bold;
-    }
-    
-    .status-completed {
-        color: #3b82f6 !important;
-        font-weight: bold;
-    }
-    
-    .status-error {
-        color: #ef4444 !important;
-        font-weight: bold;
-    }
-    
-    /* ASCII art блок */
-    .model-ascii {
-        background: #1e1e1e;
-        border: 1px solid #333;
-        border-radius: 8px;
-        padding: 1rem;
-        font-family: 'Courier New', monospace;
-        color: #00ff88;
-        white-space: pre;
-        overflow-x: auto;
-    }
-    
-    /* Карточки метрик */
-    div[data-testid="metric-container"] {
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 8px;
-        padding: 0.5rem;
-    }
-    
-    /* Кнопки запуска */
-    .stButton > button[kind="primary"] {
-        background: linear-gradient(90deg, #e94560, #ff6b6b);
-        color: white !important;
-        border: none;
-        font-weight: 600;
-    }
-    
-    /* Code блоки */
-    pre {
-        background: #0d1117 !important;
-        color: #c9d1d9 !important;
-        border: 1px solid #30363d !important;
-    }
-    
-    /* Inline code - контрастный стиль с чёткой читаемостью */
-    code {
-        color: #1a1a2e !important;
-        background-color: #e8f4f8 !important;
-        padding: 2px 8px !important;
-        border-radius: 4px !important;
-        font-weight: 600 !important;
-        border: 1px solid #b8d4e3 !important;
-        font-size: 0.9em !important;
-    }
-    
-    /* Code внутри pre блоков - стандартный стиль для code blocks */
-    pre code {
-        color: #c9d1d9 !important;
-        background-color: transparent !important;
-        padding: 0 !important;
-        font-weight: normal !important;
-        border: none !important;
-        font-size: inherit !important;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-
 # ============================================================================
 # Persistence — сохранение состояния между перезагрузками
 # ============================================================================
 
 ACTIVE_RUN_FILE = RUNS_DIR / "active_run.json"
+USER_PREFS_FILE = RUNS_DIR / "ui_preferences.json"
+init_user_preferences(USER_PREFS_FILE)
+apply_theme_css(st.session_state.get("ui_theme", DEFAULT_THEME))
 
 
 def save_active_run(run_id: str, config: dict = None):
@@ -1154,13 +1080,8 @@ def is_process_running(run_id: str) -> bool:
 # ============================================================================
 
 def render_header():
-    # Header with language selector on the right
-    col_title, col_lang = st.columns([6, 1])
-    with col_title:
-        st.markdown(f"# 🏠 {t('app.title')}")
-        st.caption(t("app.subtitle"))
-    with col_lang:
-        language_selector()
+    st.markdown(f"# 🏠 {t('app.title')}")
+    st.caption(t("app.subtitle"))
 
 
 def get_nested_value(data: dict, path: str):
@@ -6724,6 +6645,10 @@ def export_model_to_hf(model, tokenizer, source_path: str):
 # ============================================================================
 
 def main():
+    if not st.session_state.get("onboarding_done", False):
+        render_first_run_setup(USER_PREFS_FILE)
+        return
+
     render_header()
     
     # Sidebar configs
@@ -7899,6 +7824,8 @@ def main():
             - `out/*/final_model/` — финальные модели
             - `out/*/checkpoint_*/` — чекпоинты
             """)
+
+    persist_user_preferences_if_changed(USER_PREFS_FILE)
 
 
 if __name__ == "__main__":
