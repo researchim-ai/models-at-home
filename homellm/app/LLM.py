@@ -4524,7 +4524,7 @@ def render_distributed_config(training_config: dict | None = None, is_grpo: bool
             ),
         )
 
-    default_gc = bool(training_config.get("grad_checkpoint", False)) if training_config else False
+    default_gc = bool(training_config.get("grad_checkpoint", True)) if training_config else True
     grad_checkpoint = st.sidebar.checkbox(
         "Gradient Checkpointing",
         value=default_gc,
@@ -6750,7 +6750,7 @@ def main():
     # Иначе пользователь выбирает одно, а в ран уезжает другое (как было с mixed_precision=no -> bf16).
     full_config["mixed_precision"] = distributed_config.get("mixed_precision", "bf16")
     full_config["fp16_pure"] = distributed_config.get("fp16_pure", False)
-    full_config["grad_checkpoint"] = distributed_config.get("grad_checkpoint", False)
+    full_config["grad_checkpoint"] = distributed_config.get("grad_checkpoint", True)
     full_config["use_flash_attention"] = distributed_config.get("use_flash_attention", True)
     full_config["use_liger"] = distributed_config.get("use_liger", True)
     full_config["liger_fused_ce"] = distributed_config.get("liger_fused_ce", False)  # Fused CE для pretrain/SFT
