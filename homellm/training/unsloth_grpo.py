@@ -490,7 +490,10 @@ The assistant first thinks about the reasoning process in the mind and then prov
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Параметры из UI (с правильными именами!)
-    batch_size = config.get("grpo_train_batch_size", config.get("batch_size", 1))
+    # В GRPO per_device_train_batch_size соответствует rollout/prompt batch.
+    # Исторически у нас мог использоваться grpo_train_batch_size, поэтому оставляем fallback.
+    prompt_batch_size = config.get("grpo_prompt_batch_size", config.get("grpo_train_batch_size", config.get("batch_size", 1)))
+    train_batch_size_ui = config.get("grpo_train_batch_size", None)
     gradient_accumulation = config.get("gradient_accumulation", 4)
     num_generations = config.get("grpo_group_size", config.get("grpo_num_generations", 8))
     max_new_tokens = config.get("grpo_max_new_tokens", 512)
@@ -500,17 +503,40 @@ The assistant first thinks about the reasoning process in the mind and then prov
     clip_eps = config.get("grpo_clip_eps_low", 0.2)
     algorithm = config.get("grpo_algorithm", "grpo")  # grpo, dapo, dr_grpo
     
-    logger.info(f"🦥 GRPO Config from UI:")
-    logger.info(f"   learning_rate={learning_rate}, batch_size={batch_size}, grad_accum={gradient_accumulation}")
+    # Разрешаем max_steps явно и предсказуемо:
+    # 1) приоритет GRPO-специфичных ключей
+    # 2) generic max_steps используем только если нет prompt-лимита
+    #    (иначе generic max_steps может случайно обрубить обучение раньше max_prompts)
+    max_prompts = config.get("grpo_max_prompts", None)
+    explicit_grpo_max_steps = config.get("grpo_max_optim_steps", config.get("grpo_max_steps", None))
+    generic_max_steps = config.get("max_steps", None)
+    if explicit_grpo_max_steps not in (None, "", 0):
+        resolved_max_steps = int(explicit_grpo_max_steps)
+        max_steps_source = "grpo_max_optim_steps/grpo_max_steps"
+    elif generic_max_steps not in (None, "", 0) and max_prompts in (None, "", 0):
+        resolved_max_steps = int(generic_max_steps)
+        max_steps_source = "max_steps"
+    else:
+        resolved_max_steps = -1
+        max_steps_source = "auto (no hard cap)"
+
+    logger.info("🦥 GRPO Config from UI:")
+    logger.info(
+        f"   learning_rate={learning_rate}, prompt_batch_size={prompt_batch_size}, "
+        f"train_batch_size_ui={train_batch_size_ui}, grad_accum={gradient_accumulation}"
+    )
     logger.info(f"   num_generations={num_generations}, temperature={temperature}, kl_weight={kl_weight}")
-    logger.info(f"   algorithm={algorithm}, clip_eps={clip_eps}")
+    logger.info(
+        f"   algorithm={algorithm}, clip_eps={clip_eps}, max_prompts={max_prompts}, "
+        f"max_steps={resolved_max_steps} ({max_steps_source})"
+    )
     
     # Базовые параметры GRPOConfig (совместимо с разными версиями trl)
     grpo_kwargs = dict(
         output_dir=str(output_dir),
         num_train_epochs=config.get("epochs", 1),
-        max_steps=config.get("max_steps", -1),
-        per_device_train_batch_size=batch_size,
+        max_steps=resolved_max_steps,
+        per_device_train_batch_size=prompt_batch_size,
         gradient_accumulation_steps=gradient_accumulation,
         learning_rate=learning_rate,
         weight_decay=config.get("weight_decay", 0.001),  # Как в примере Unsloth
@@ -1085,6 +1111,12 @@ The assistant first thinks about the reasoning process in the mind and then prov
             self.sample_log_interval = 50  # Логировать сэмплы каждые N шагов
         
         def on_train_begin(self, args, state, control, **kwargs):
+            # Уточняем total_steps из TrainerState, если доступно.
+            if getattr(state, "max_steps", None):
+                try:
+                    self.total_steps = int(state.max_steps)
+                except Exception:
+                    pass
             self.metrics_logger.update(
                 status="training",
                 total_steps=self.total_steps,
@@ -1130,6 +1162,8 @@ The assistant first thinks about the reasoning process in the mind and then prov
             # Дополнительные метрики для UI
             eta_seconds = (self.total_steps - step) / samples_per_sec if samples_per_sec > 0 else 0
             self.metrics_logger.update(
+                # UI читает elapsed_seconds, оставляем также legacy-ключ для совместимости.
+                elapsed_seconds=elapsed,
                 elapsed_time=elapsed,
                 eta_seconds=eta_seconds,
                 samples_per_second=samples_per_sec,

@@ -298,9 +298,12 @@ def main():
                     class SimpleMetricsLogger:
                         def __init__(self, path):
                             self.path = Path(path)
+                            self.start_ts = time.time()
                             self.metrics = {
                                 "status": "initializing", 
                                 "start_time": datetime.now().isoformat(),
+                                "elapsed_seconds": 0.0,
+                                "eta_seconds": 0.0,
                                 "steps_history": [],
                                 "loss_history": [],
                                 "lr_history": [],
@@ -322,6 +325,16 @@ def main():
                             self.metrics["current_step"] = step
                             self.metrics["current_loss"] = loss
                             self.metrics["current_lr"] = lr
+                            self.metrics["samples_per_second"] = samples_per_sec
+                            elapsed = max(0.0, time.time() - self.start_ts)
+                            self.metrics["elapsed_seconds"] = elapsed
+                            total_steps = self.metrics.get("total_steps")
+                            if samples_per_sec and total_steps:
+                                try:
+                                    remaining_steps = max(0.0, float(total_steps) - float(step))
+                                    self.metrics["eta_seconds"] = remaining_steps / float(samples_per_sec)
+                                except Exception:
+                                    pass
                             
                             # Добавляем в историю
                             self.metrics["steps_history"].append(step)

@@ -3296,6 +3296,45 @@ def render_model_config():
         format_func=get_stage_label,
         help=t("help.training_stage")
     )
+
+    # === Training Backend (только для GRPO) ===
+    # Ставим наверх, чтобы остальные настройки строились от выбранного backend.
+    training_backend = "models-at-home"
+    if selected_stage == "grpo":
+        st.sidebar.subheader("⚙️ Training Backend")
+
+        backend_options = ["🏠 models-at-home", "🦥 Unsloth"]
+        selected_backend_display = st.sidebar.radio(
+            "Backend",
+            backend_options,
+            index=0,  # По умолчанию models-at-home
+            help=(
+                "**🏠 models-at-home** (рекомендуется):\n"
+                "• Multi-GPU поддержка (DDP)\n"
+                "• Full fine-tuning + LoRA/QLoRA\n"
+                "• FlashAttention + Liger Kernels\n\n"
+                "**🦥 Unsloth** (быстрее на 1 GPU):\n"
+                "• ⚡ 2x быстрее на **одной GPU**\n"
+                "• 💾 До 70% меньше VRAM\n"
+                "• ⚠️ **Только LoRA/QLoRA** (не full)\n"
+                "• ⚠️ Multi-GPU: работает, но без fast_inference"
+            ),
+            key="training_backend_radio"
+        )
+        training_backend = "unsloth" if "Unsloth" in selected_backend_display else "models-at-home"
+
+        # Показываем информацию о backend
+        if training_backend == "unsloth":
+            try:
+                import unsloth
+                st.sidebar.success("🦥 **Unsloth**: 2x быстрее, 70% меньше VRAM")
+                st.sidebar.caption("⚠️ Только LoRA/QLoRA • 1 GPU для fast_inference")
+            except ImportError:
+                st.sidebar.error("🦥 **Unsloth не установлен!**")
+        else:
+            st.sidebar.info("🏠 **models-at-home**: Multi-GPU, Full/LoRA/QLoRA")
+
+        st.sidebar.markdown("---")
     
     # Имя модели (для папки эксперимента)
     if selected_stage == "pretrain":
@@ -3737,47 +3776,6 @@ def render_model_config():
                     "⚠️ **Безопасность**: Загрузка моделей с `trust_remote_code=True` может выполнять "
                     "чужой код. Используйте только проверенные репозитории."
                 )
-    
-    # === Training Backend (только для GRPO!) ===
-    # Для pretrain/sft используем models-at-home по умолчанию
-    if selected_stage == "grpo":
-        st.sidebar.subheader("⚙️ Training Backend")
-        
-        backend_options = ["🏠 models-at-home", "🦥 Unsloth"]
-        selected_backend_display = st.sidebar.radio(
-            "Backend",
-            backend_options,
-            index=0,  # По умолчанию models-at-home
-            help=(
-                "**🏠 models-at-home** (рекомендуется):\n"
-                "• Multi-GPU поддержка (DDP)\n"
-                "• Full fine-tuning + LoRA/QLoRA\n"
-                "• FlashAttention + Liger Kernels\n\n"
-                "**🦥 Unsloth** (быстрее на 1 GPU):\n"
-                "• ⚡ 2x быстрее на **одной GPU**\n"
-                "• 💾 До 70% меньше VRAM\n"
-                "• ⚠️ **Только LoRA/QLoRA** (не full)\n"
-                "• ⚠️ Multi-GPU: работает, но без fast_inference"
-            ),
-            key="training_backend_radio"
-        )
-        training_backend = "unsloth" if "Unsloth" in selected_backend_display else "models-at-home"
-        
-        # Показываем информацию о backend
-        if training_backend == "unsloth":
-            try:
-                import unsloth
-                st.sidebar.success("🦥 **Unsloth**: 2x быстрее, 70% меньше VRAM")
-                st.sidebar.caption("⚠️ Только LoRA/QLoRA • 1 GPU для fast_inference")
-            except ImportError:
-                st.sidebar.error("🦥 **Unsloth не установлен!**")
-        else:
-            st.sidebar.info("🏠 **models-at-home**: Multi-GPU, Full/LoRA/QLoRA")
-        
-        st.sidebar.markdown("---")
-    else:
-        # Для pretrain/sft — всегда models-at-home
-        training_backend = "models-at-home"
     
     # Метод тюнинга (full/LoRA/QLoRA)
     st.sidebar.subheader(f"🎯 {t('sidebar.tuning_method')}")
@@ -4449,53 +4447,9 @@ def render_distributed_config(training_config: dict | None = None, is_grpo: bool
     st.sidebar.markdown("---")
     st.sidebar.subheader(f"🧠 {t('sidebar.precision_memory')}")
     
-    # === Backend selector ===
-    # Для GRPO backend выбирается в render_grpo_sidebar_config(), здесь не показываем
-    if not is_grpo:
-        backend_options = ["🏠 models-at-home", "🦥 Unsloth (2x faster)"]
-        default_backend = training_config.get("training_backend", "models-at-home") if training_config else "models-at-home"
-        default_idx = 1 if default_backend == "unsloth" else 0
-        
-        selected_backend_display = st.sidebar.radio(
-            "Training Backend",
-            backend_options,
-            index=default_idx,
-            help=(
-                "**🏠 models-at-home**: Наш backend с FlashAttention + Liger Kernels\n\n"
-                "**🦥 Unsloth**: Оптимизированный backend от Unsloth AI:\n"
-                "• 2x быстрее обучение\n"
-                "• До 70% меньше VRAM\n"
-                "• Triton ядра (RMSNorm, RoPE, MLP)\n"
-                "• Умный gradient checkpointing\n\n"
-                "⚠️ Unsloth пока не поддерживает multi-GPU"
-            ),
-        )
-        training_backend = "unsloth" if "Unsloth" in selected_backend_display else "models-at-home"
-        
-        # Показываем информацию о выбранном backend
-        if training_backend == "unsloth":
-            # Проверяем доступность Unsloth
-            try:
-                import unsloth
-                unsloth_available = True
-            except ImportError:
-                unsloth_available = False
-            
-            if unsloth_available:
-                st.sidebar.success("🦥 **Unsloth режим**: ускорение + экономия памяти")
-            else:
-                st.sidebar.error("🦥 **Unsloth не установлен!**")
-                st.sidebar.caption("Пересоберите Docker образ: `docker compose build`")
-            
-            if num_gpus > 1:
-                st.sidebar.warning("⚠️ Unsloth пока не поддерживает multi-GPU. Будет использована 1 GPU.")
-        else:
-            st.sidebar.info("🏠 **models-at-home режим**: FlashAttn + Liger")
-        
-        st.sidebar.markdown("---")
-    else:
-        # Для GRPO backend передаётся из model_config (выбран в render_model_config)
-        training_backend = grpo_backend if grpo_backend else "models-at-home"
+    # Backend выбирается только в render_model_config() для GRPO.
+    # Здесь используем уже выбранное значение (или дефолт для остальных стадий).
+    training_backend = grpo_backend if is_grpo else "models-at-home"
 
     # Если training_config передан (SFT/Pretrain) — берём дефолт из него, иначе bf16 (GRPO дефолт)
     default_mp = (training_config.get("mixed_precision") if training_config else None) or "bf16"

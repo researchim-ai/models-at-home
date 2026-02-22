@@ -34,7 +34,7 @@ safetensors>=0.4.0
 # (см. Dockerfile — ставится после основных пакетов)
 
 # Liger Kernel
-liger-kernel==0.6.4
+liger-kernel==0.7.0
 
 # bitsandbytes для QLoRA
 bitsandbytes>=0.45.0
