@@ -44,6 +44,7 @@ from transformers import (
 from homellm.models.home_model import HomeConfig, HomeForCausalLM
 from homellm.models.gpt2_model import GPT2HomeConfig, GPT2HomeForCausalLM
 from homellm.models.home_model_moe import HomeMoEConfig, HomeMoEForCausalLM
+from homellm.training.optimizers import MagmaAdamW
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -393,6 +394,11 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay для AdamW")
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "magma_adamw"], help="Оптимизатор")
+    parser.add_argument("--magma_prob", type=float, default=0.5, help="Magma sampling ratio p")
+    parser.add_argument("--magma_tau", type=float, default=2.0, help="Magma temperature tau")
+    parser.add_argument("--magma_ema_beta", type=float, default=0.9, help="Magma EMA beta")
+    parser.add_argument("--magma_cosine_eps", type=float, default=1e-12, help="Magma cosine epsilon")
     parser.add_argument("--fp16", action="store_true", help="Использовать fp16")
     parser.add_argument("--bf16", action="store_true", help="Использовать bf16 (Ampere+)")
     parser.add_argument("--grad_checkpoint", action="store_true", help="Включить torch.gradient_checkpointing для экономии VRAM")
@@ -553,13 +559,26 @@ def main():
     num_update_steps_per_epoch = math.ceil(dataset_len / args.gradient_accumulation)
     max_train_steps = args.epochs * num_update_steps_per_epoch
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=args.learning_rate, 
-        betas=(0.9, 0.95), 
-        eps=1e-8,
-        weight_decay=args.weight_decay
-    )
+    if args.optimizer == "magma_adamw":
+        optimizer = MagmaAdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=args.weight_decay,
+            magma_prob=args.magma_prob,
+            magma_tau=args.magma_tau,
+            magma_ema_beta=args.magma_ema_beta,
+            magma_cosine_eps=args.magma_cosine_eps,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=args.weight_decay
+        )
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,

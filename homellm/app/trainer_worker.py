@@ -29,6 +29,7 @@ from transformers import (
 from homellm.models.adapters import resolve_adapter
 from homellm.training.pretrain import StreamingTextDataset
 from homellm.training.sft import SFTDataset
+from homellm.training.optimizers import MagmaAdamW, HybridMuonAdamW
 
 # Liger Kernel интеграция (оптимизированные Triton kernels)
 try:
@@ -747,12 +748,91 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         logger.info(f"Optimizing {len(trainable_params)} trainable parameters "
                    f"(total: {sum(p.numel() for p in model.parameters())})")
         
-        optimizer = torch.optim.AdamW(
-            trainable_params,  # ✅ Только trainable параметры (критично для LoRA/QLoRA)
-            lr=config["learning_rate"], 
-            betas=(0.9, 0.95), 
-            eps=1e-8,
-            weight_decay=config.get("weight_decay", 0.1)
+        uses_deepspeed = getattr(accelerator.state, "deepspeed_plugin", None) is not None
+        optimizer_name = str(config.get("optimizer", "adamw")).strip().lower()
+        lr = float(config["learning_rate"])
+        wd = float(config.get("weight_decay", 0.1))
+        betas = tuple(config.get("betas", (0.9, 0.95)))
+        eps = float(config.get("eps", 1e-8))
+
+        if optimizer_name in ("adamw_8bit", "adamw8bit"):
+            if uses_deepspeed:
+                raise RuntimeError(
+                    "Optimizer 'adamw_8bit' is not supported with DeepSpeed in this training path."
+                )
+            else:
+                try:
+                    from bitsandbytes.optim import AdamW8bit
+                    optimizer = AdamW8bit(
+                        trainable_params,
+                        lr=lr,
+                        betas=betas,
+                        eps=eps,
+                        weight_decay=wd,
+                    )
+                except ImportError:
+                    raise RuntimeError(
+                        "Optimizer 'adamw_8bit' requested, but bitsandbytes is not installed."
+                    )
+        elif optimizer_name in ("magma_adamw", "magma"):
+            optimizer_name = "magma_adamw"
+            optimizer = MagmaAdamW(
+                trainable_params,
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=wd,
+                magma_prob=float(config.get("magma_prob", 0.5)),
+                magma_tau=float(config.get("magma_tau", 2.0)),
+                magma_ema_beta=float(config.get("magma_ema_beta", 0.9)),
+                magma_cosine_eps=float(config.get("magma_cosine_eps", 1e-12)),
+            )
+        elif optimizer_name == "muon":
+            if uses_deepspeed:
+                raise RuntimeError(
+                    "Optimizer 'muon' currently does not support DeepSpeed mode in this training path."
+                )
+            ns_coeff = config.get("muon_ns_coefficients", [3.4445, -4.775, 2.0315])
+            if not isinstance(ns_coeff, (list, tuple)) or len(ns_coeff) != 3:
+                raise ValueError(
+                    f"muon_ns_coefficients must be a list/tuple of 3 floats, got: {ns_coeff}"
+                )
+
+            adjust_lr_fn = config.get("muon_adjust_lr_fn", None)
+            if adjust_lr_fn not in (None, "original", "match_rms_adamw"):
+                raise ValueError(
+                    f"muon_adjust_lr_fn must be one of None|'original'|'match_rms_adamw', got: {adjust_lr_fn}"
+                )
+
+            optimizer = HybridMuonAdamW(
+                trainable_params,
+                lr=lr,
+                weight_decay=wd,
+                muon_momentum=float(config.get("muon_momentum", 0.95)),
+                muon_nesterov=bool(config.get("muon_nesterov", True)),
+                muon_ns_coefficients=(float(ns_coeff[0]), float(ns_coeff[1]), float(ns_coeff[2])),
+                muon_eps=eps,
+                muon_ns_steps=int(config.get("muon_ns_steps", 5)),
+                muon_adjust_lr_fn=adjust_lr_fn,
+                adamw_betas=betas,
+                adamw_eps=eps,
+            )
+        else:
+            optimizer_name = "adamw"
+            optimizer = torch.optim.AdamW(
+                trainable_params,  # ✅ Только trainable параметры (критично для LoRA/QLoRA)
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=wd,
+            )
+
+        logger.info(f"Using optimizer: {optimizer_name}")
+        metrics.update(
+            optimizer=optimizer_name,
+            weight_decay=wd,
+            betas=[float(betas[0]), float(betas[1])],
+            eps=eps,
         )
         # LR scheduler
         # ВАЖНО: мы шагаем scheduler на UPDATE-step (когда accelerator.sync_gradients=True).

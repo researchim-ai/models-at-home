@@ -3920,6 +3920,23 @@ def render_model_config():
 def render_training_config():
     """Training hyperparameters configuration."""
     st.sidebar.header(f"📈 {t('sidebar.hyperparams')}")
+
+    optimizer = st.sidebar.selectbox(
+        "Optimizer",
+        options=[
+            "adamw",
+            "adamw_8bit",
+            "muon",
+            "magma_adamw",
+        ],
+        index=0,
+        help=(
+            "adamw — стандартный optimizer.\n"
+            "adamw_8bit — экономия памяти (требует bitsandbytes, без DeepSpeed).\n"
+            "muon — гибрид: Muon для 2D параметров, AdamW для остальных (PyTorch 2.9+).\n"
+            "magma_adamw — AdamW + стохастическое masking обновлений."
+        ),
+    )
     
     batch_size = st.sidebar.slider(
         "Batch Size",
@@ -4027,11 +4044,129 @@ def render_training_config():
         step=0.1,
         help="Gradient clipping для стабильности (0 = отключить)"
     )
+
+    weight_decay = st.sidebar.number_input(
+        "Weight Decay",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.1,
+        step=0.01,
+        help="Коэффициент decoupled weight decay для AdamW-подобных оптимизаторов.",
+    )
+
+    betas = st.sidebar.text_input(
+        "Adam Betas",
+        value="0.9,0.95",
+        help="Формат: beta1,beta2",
+    )
+    try:
+        b1_str, b2_str = [x.strip() for x in betas.split(",", 1)]
+        beta1 = float(b1_str)
+        beta2 = float(b2_str)
+    except Exception:
+        beta1, beta2 = 0.9, 0.95
+        st.sidebar.warning("Некорректный формат betas, использую 0.9, 0.95")
+
+    eps_default = 1e-7 if optimizer == "muon" else 1e-8
+    eps = st.sidebar.number_input(
+        "Optimizer Epsilon",
+        min_value=1e-12,
+        max_value=1e-4,
+        value=eps_default,
+        format="%.1e",
+        help="Epsilon для численной стабильности оптимизатора.",
+    )
+
+    muon_momentum = 0.95
+    muon_nesterov = True
+    muon_ns_steps = 5
+    muon_ns_coefficients = [3.4445, -4.775, 2.0315]
+    muon_adjust_lr_fn = None
+    if optimizer == "muon":
+        st.sidebar.markdown("**Muon параметры**")
+        muon_momentum = st.sidebar.slider(
+            "Muon momentum",
+            min_value=0.0,
+            max_value=0.999,
+            value=0.95,
+            step=0.001,
+        )
+        muon_nesterov = st.sidebar.checkbox(
+            "Muon nesterov",
+            value=True,
+        )
+        muon_ns_steps = st.sidebar.slider(
+            "Muon ns_steps",
+            min_value=1,
+            max_value=10,
+            value=5,
+            step=1,
+        )
+        muon_ns_coeff_input = st.sidebar.text_input(
+            "Muon ns_coefficients (a,b,c)",
+            value="3.4445,-4.775,2.0315",
+            help="Формат: a,b,c",
+        )
+        try:
+            ca, cb, cc = [x.strip() for x in muon_ns_coeff_input.split(",", 2)]
+            muon_ns_coefficients = [float(ca), float(cb), float(cc)]
+        except Exception:
+            muon_ns_coefficients = [3.4445, -4.775, 2.0315]
+            st.sidebar.warning("Некорректные ns_coefficients, использую дефолтные.")
+
+        muon_adjust_lr_mode = st.sidebar.selectbox(
+            "Muon adjust_lr_fn",
+            options=["original", "match_rms_adamw", "default(None)"],
+            index=0,
+            help="Из документации Muon: original / match_rms_adamw, либо дефолт (None).",
+        )
+        muon_adjust_lr_fn = None if muon_adjust_lr_mode == "default(None)" else muon_adjust_lr_mode
+
+    magma_prob = 0.5
+    magma_tau = 2.0
+    magma_ema_beta = 0.9
+    magma_cosine_eps = 1e-12
+    if optimizer == "magma_adamw":
+        st.sidebar.markdown("**Magma параметры**")
+        magma_prob = st.sidebar.slider(
+            "Magma sampling ratio (p)",
+            min_value=0.1,
+            max_value=1.0,
+            value=0.5,
+            step=0.05,
+            help="Вероятность оставить update блока на шаге.",
+        )
+        magma_tau = st.sidebar.select_slider(
+            "Magma temperature (tau)",
+            options=[0.5, 1.0, 2.0, 4.0],
+            value=2.0,
+            help="Температура для sigmoid(cos/tau).",
+        )
+        magma_ema_beta = st.sidebar.slider(
+            "Magma EMA beta",
+            min_value=0.0,
+            max_value=0.99,
+            value=0.9,
+            step=0.01,
+            help="Сглаживание коэффициента масштаба s_t.",
+        )
+        magma_cosine_eps = st.sidebar.number_input(
+            "Magma cosine epsilon",
+            min_value=1e-16,
+            max_value=1e-6,
+            value=1e-12,
+            format="%.1e",
+            help="Стабилизатор в знаменателе cosine similarity.",
+        )
     
     return {
+        "optimizer": optimizer,
         "batch_size": batch_size,
         "gradient_accumulation": grad_accum,
         "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "betas": [beta1, beta2],
+        "eps": eps,
         "lr_schedule": lr_schedule,
         "min_lr_ratio": min_lr_ratio,
         "warmup_steps": warmup_steps,
@@ -4039,6 +4174,15 @@ def render_training_config():
         "epochs": epochs,
         "max_steps": max_steps,
         "max_grad_norm": max_grad_norm,
+        "muon_momentum": muon_momentum,
+        "muon_nesterov": muon_nesterov,
+        "muon_ns_steps": muon_ns_steps,
+        "muon_ns_coefficients": muon_ns_coefficients,
+        "muon_adjust_lr_fn": muon_adjust_lr_fn,
+        "magma_prob": magma_prob,
+        "magma_tau": magma_tau,
+        "magma_ema_beta": magma_ema_beta,
+        "magma_cosine_eps": magma_cosine_eps,
     }
 
 
