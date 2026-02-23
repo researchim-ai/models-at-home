@@ -741,7 +741,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         
         # ВАЖНО: Для LoRA/QLoRA оптимизатор должен брать только trainable параметры
         # Это критично для QLoRA, где базовые веса заморожены и огромные
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        trainable_named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        trainable_params = [p for _, p in trainable_named_params]
         if len(trainable_params) == 0:
             raise ValueError("No trainable parameters found in model. Check LoRA/QLoRA configuration.")
         
@@ -798,22 +799,54 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     f"muon_ns_coefficients must be a list/tuple of 3 floats, got: {ns_coeff}"
                 )
 
-            adjust_lr_fn = config.get("muon_adjust_lr_fn", None)
+            adjust_lr_fn = config.get("muon_adjust_lr_fn", "match_rms_adamw")
             if adjust_lr_fn not in (None, "original", "match_rms_adamw"):
                 raise ValueError(
                     f"muon_adjust_lr_fn must be one of None|'original'|'match_rms_adamw', got: {adjust_lr_fn}"
                 )
 
+            muon_exclude_patterns = config.get(
+                "muon_exclude_patterns",
+                [
+                    r"(^|\.)(embed|embeddings|embed_tokens)(\.|$)",
+                    r"(^|\.)(lm_head|output|classifier|head)(\.|$)",
+                ],
+            )
+            if not isinstance(muon_exclude_patterns, (list, tuple)) or not all(
+                isinstance(x, str) for x in muon_exclude_patterns
+            ):
+                raise ValueError(
+                    f"muon_exclude_patterns must be a list[str], got: {muon_exclude_patterns}"
+                )
+
+            muon_lr = float(config.get("muon_lr", lr))
+            muon_weight_decay = float(config.get("muon_weight_decay", wd))
+            muon_aux_adamw_lr = float(
+                config.get("muon_aux_adamw_lr", config.get("muon_adamw_lr", lr))
+            )
+            muon_aux_adamw_weight_decay = float(
+                config.get(
+                    "muon_aux_adamw_weight_decay",
+                    config.get("muon_adamw_weight_decay", wd),
+                )
+            )
+
             optimizer = HybridMuonAdamW(
                 trainable_params,
+                named_params=trainable_named_params,
                 lr=lr,
                 weight_decay=wd,
+                muon_lr=muon_lr,
+                muon_weight_decay=muon_weight_decay,
+                adamw_lr=muon_aux_adamw_lr,
+                adamw_weight_decay=muon_aux_adamw_weight_decay,
                 muon_momentum=float(config.get("muon_momentum", 0.95)),
                 muon_nesterov=bool(config.get("muon_nesterov", True)),
                 muon_ns_coefficients=(float(ns_coeff[0]), float(ns_coeff[1]), float(ns_coeff[2])),
                 muon_eps=eps,
                 muon_ns_steps=int(config.get("muon_ns_steps", 5)),
                 muon_adjust_lr_fn=adjust_lr_fn,
+                muon_exclude_patterns=tuple(muon_exclude_patterns),
                 adamw_betas=betas,
                 adamw_eps=eps,
             )
@@ -834,6 +867,26 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             betas=[float(betas[0]), float(betas[1])],
             eps=eps,
         )
+        if optimizer_name == "muon" and isinstance(optimizer, HybridMuonAdamW):
+            logger.info(
+                "Muon split: muon_params=%s, adamw_params=%s, muon_lr=%.3e, aux_adamw_lr=%.3e, muon_wd=%.4g, aux_adamw_wd=%.4g",
+                f"{optimizer.muon_param_count:,}",
+                f"{optimizer.adamw_param_count:,}",
+                optimizer.muon_lr,
+                optimizer.adamw_lr,
+                optimizer.muon_weight_decay,
+                optimizer.adamw_weight_decay,
+            )
+            metrics.update(
+                muon_param_count=int(optimizer.muon_param_count),
+                muon_aux_adamw_param_count=int(optimizer.adamw_param_count),
+                muon_adjust_lr_fn=adjust_lr_fn,
+                muon_exclude_patterns=list(muon_exclude_patterns),
+                muon_lr=float(optimizer.muon_lr),
+                muon_weight_decay=float(optimizer.muon_weight_decay),
+                muon_aux_adamw_lr=float(optimizer.adamw_lr),
+                muon_aux_adamw_weight_decay=float(optimizer.adamw_weight_decay),
+            )
         # LR scheduler
         # ВАЖНО: мы шагаем scheduler на UPDATE-step (когда accelerator.sync_gradients=True).
         # Для resume из старых чекпоинтов это критично: раньше scheduler мог шагать по micro-step,

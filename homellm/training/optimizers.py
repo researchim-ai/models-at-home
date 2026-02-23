@@ -143,29 +143,74 @@ class HybridMuonAdamW(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.nn.Parameter],
+        named_params: list[tuple[str, torch.nn.Parameter]] | None = None,
         lr: float = 1e-3,
         weight_decay: float = 0.1,
+        muon_lr: float | None = None,
+        muon_weight_decay: float | None = None,
+        adamw_lr: float | None = None,
+        adamw_weight_decay: float | None = None,
         muon_momentum: float = 0.95,
         muon_nesterov: bool = True,
         muon_ns_coefficients: tuple[float, float, float] = (3.4445, -4.775, 2.0315),
         muon_eps: float = 1e-7,
         muon_ns_steps: int = 5,
         muon_adjust_lr_fn: str | None = None,
+        muon_exclude_patterns: tuple[str, ...] = (
+            r"(^|\.)(embed|embeddings|embed_tokens)(\.|$)",
+            r"(^|\.)(lm_head|output|classifier|head)(\.|$)",
+        ),
         adamw_betas: tuple[float, float] = (0.9, 0.95),
         adamw_eps: float = 1e-8,
     ) -> None:
-        params_list = list(params)
+        params_list = [p for p in params if p.requires_grad]
         if len(params_list) == 0:
             raise ValueError("HybridMuonAdamW received empty params list")
 
-        muon_params = [p for p in params_list if p.requires_grad and p.ndim == 2]
-        adamw_params = [p for p in params_list if p.requires_grad and p.ndim != 2]
+        # Build a name map to support robust exclusions (embeddings/lm_head).
+        name_by_id: dict[int, str] = {}
+        if named_params:
+            for n, p in named_params:
+                if p.requires_grad:
+                    name_by_id[id(p)] = n
+
+        exclude_regex = [re.compile(p) for p in muon_exclude_patterns]
+
+        def should_use_muon(p: torch.nn.Parameter) -> bool:
+            if p.ndim != 2:
+                return False
+            name = name_by_id.get(id(p), "")
+            if not name:
+                return True
+            for rx in exclude_regex:
+                if rx.search(name):
+                    return False
+            return True
+
+        muon_params = [p for p in params_list if should_use_muon(p)]
+        muon_ids = {id(p) for p in muon_params}
+        adamw_params = [p for p in params_list if id(p) not in muon_ids]
         if len(muon_params) == 0:
             raise ValueError(
                 "HybridMuonAdamW requires at least one trainable 2D parameter for Muon."
             )
 
-        super().__init__(params_list, defaults={"lr": lr})
+        muon_lr_resolved = float(lr if muon_lr is None else muon_lr)
+        muon_wd_resolved = float(weight_decay if muon_weight_decay is None else muon_weight_decay)
+        adamw_lr_resolved = float(lr if adamw_lr is None else adamw_lr)
+        adamw_wd_resolved = float(
+            weight_decay if adamw_weight_decay is None else adamw_weight_decay
+        )
+        if muon_lr_resolved <= 0.0:
+            raise ValueError(f"muon_lr must be > 0, got: {muon_lr_resolved}")
+        if adamw_lr_resolved <= 0.0:
+            raise ValueError(f"adamw_lr must be > 0, got: {adamw_lr_resolved}")
+        if muon_wd_resolved < 0.0:
+            raise ValueError(f"muon_weight_decay must be >= 0, got: {muon_wd_resolved}")
+        if adamw_wd_resolved < 0.0:
+            raise ValueError(f"adamw_weight_decay must be >= 0, got: {adamw_wd_resolved}")
+
+        super().__init__(params_list, defaults={"lr": muon_lr_resolved})
 
         muon_cls = getattr(torch.optim, "Muon", None)
         if muon_cls is None:
@@ -176,8 +221,8 @@ class HybridMuonAdamW(Optimizer):
 
         self.muon_optimizer = muon_cls(
             muon_params,
-            lr=lr,
-            weight_decay=weight_decay,
+            lr=muon_lr_resolved,
+            weight_decay=muon_wd_resolved,
             momentum=muon_momentum,
             nesterov=muon_nesterov,
             ns_coefficients=muon_ns_coefficients,
@@ -188,14 +233,21 @@ class HybridMuonAdamW(Optimizer):
         self.adamw_optimizer = (
             torch.optim.AdamW(
                 adamw_params,
-                lr=lr,
+                lr=adamw_lr_resolved,
                 betas=adamw_betas,
                 eps=adamw_eps,
-                weight_decay=weight_decay,
+                weight_decay=adamw_wd_resolved,
             )
             if len(adamw_params) > 0
             else None
         )
+
+        self.muon_param_count = sum(p.numel() for p in muon_params)
+        self.adamw_param_count = sum(p.numel() for p in adamw_params)
+        self.muon_lr = muon_lr_resolved
+        self.muon_weight_decay = muon_wd_resolved
+        self.adamw_lr = adamw_lr_resolved
+        self.adamw_weight_decay = adamw_wd_resolved
 
         # Expose both groups so external schedulers update both optimizers.
         self.param_groups = list(self.muon_optimizer.param_groups)
