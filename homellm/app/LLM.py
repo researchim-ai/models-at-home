@@ -3933,7 +3933,7 @@ def render_training_config():
         help=(
             "adamw — стандартный optimizer.\n"
             "adamw_8bit — экономия памяти (требует bitsandbytes, без DeepSpeed).\n"
-            "muon — гибрид: Muon для 2D параметров, AdamW для остальных (PyTorch 2.9+).\n"
+            "muon — MuonWithAuxAdam: Muon для hidden 2D параметров, AdamW для остальных.\n"
             "magma_adamw — AdamW + стохастическое masking обновлений."
         ),
     )
@@ -4037,11 +4037,12 @@ def render_training_config():
             help="Максимальное количество шагов обучения"
         )
     
+    max_grad_norm_default = 0.0 if optimizer == "muon" else 1.0
     max_grad_norm = st.sidebar.number_input(
         "Max Gradient Norm",
         min_value=0.0,
         max_value=10.0,
-        value=1.0,
+        value=max_grad_norm_default,
         step=0.1,
         help="Gradient clipping для стабильности (0 = отключить)"
     )
@@ -4082,14 +4083,19 @@ def render_training_config():
     muon_nesterov = True
     muon_ns_steps = 5
     muon_ns_coefficients = [3.4445, -4.775, 2.0315]
-    muon_adjust_lr_fn = "match_rms_adamw"
+    muon_adjust_lr_fn = "original"
     muon_lr = float(learning_rate)
     muon_weight_decay = float(weight_decay)
     muon_aux_adamw_lr = float(learning_rate)
     muon_aux_adamw_weight_decay = float(weight_decay)
+    muon_aux_adamw_eps = 1e-10
     muon_exclude_patterns = [
-        r"(^|\.)(embed|embeddings|embed_tokens)(\.|$)",
+        r"(^|\.)(embed|embeddings|embed_tokens|tok_embeddings|token_embeddings|wte|wpe|word_embeddings|position_embeddings)(\.|$)",
         r"(^|\.)(lm_head|output|classifier|head)(\.|$)",
+        r"(^|\.)(lora(_[AaBb])?|lora[AaBb]?|adapter|adapters|ia3|prompt|prefix)(\.|$)",
+    ]
+    muon_hidden_patterns = [
+        r"(^|\.)(layers|h|blocks)(\.|$)",
     ]
     if optimizer == "muon":
         st.sidebar.markdown("**Muon параметры**")
@@ -4126,7 +4132,7 @@ def render_training_config():
         muon_adjust_lr_mode = st.sidebar.selectbox(
             "Muon adjust_lr_fn",
             options=["match_rms_adamw", "original", "default(None)"],
-            index=0,
+            index=1,
             help=(
                 "Рекомендуется match_rms_adamw для LLM: позволяет использовать LR/WD ближе к AdamW.\n"
                 "original — классический вариант Keller."
@@ -4138,7 +4144,7 @@ def render_training_config():
         muon_lr = st.sidebar.select_slider(
             "Muon LR (2D hidden params)",
             options=[1e-5, 3e-5, 5e-5, 1e-4, 3e-4, 5e-4, 1e-3, 3e-3, 5e-3, 1e-2, 2e-2],
-            value=3e-4 if muon_adjust_lr_fn == "match_rms_adamw" else 1e-3,
+            value=2e-2,
             format_func=lambda x: f"{x:.0e}",
             help=(
                 "Для match_rms_adamw обычно стартуют с AdamW-подобного LR (например 3e-4). "
@@ -4156,28 +4162,48 @@ def render_training_config():
             "Muon Weight Decay",
             min_value=0.0,
             max_value=1.0,
-            value=0.1,
+            value=0.01,
             step=0.01,
         )
         muon_aux_adamw_weight_decay = st.sidebar.number_input(
             "Muon Aux AdamW Weight Decay",
             min_value=0.0,
             max_value=1.0,
-            value=0.1,
+            value=0.01,
             step=0.01,
+        )
+        muon_aux_adamw_eps = st.sidebar.number_input(
+            "Muon Aux AdamW Epsilon",
+            min_value=1e-12,
+            max_value=1e-6,
+            value=1e-10,
+            format="%.1e",
+            help="В README Muon в примере для aux AdamW используют eps=1e-10.",
         )
 
         muon_exclude_text = st.sidebar.text_input(
             "Muon exclude patterns (regex, comma-separated)",
             value=", ".join(muon_exclude_patterns),
             help=(
-                "Параметры, которые НЕ должны идти в Muon (обычно embeddings/lm_head). "
+                "Параметры, которые НЕ должны идти в Muon (обычно embeddings/lm_head и LoRA/adapters). "
                 "Они будут оптимизироваться AdamW в гибридном режиме."
             ),
         )
         parsed_patterns = [x.strip() for x in muon_exclude_text.split(",") if x.strip()]
         if parsed_patterns:
             muon_exclude_patterns = parsed_patterns
+
+        muon_hidden_text = st.sidebar.text_input(
+            "Muon hidden patterns (regex, comma-separated)",
+            value=", ".join(muon_hidden_patterns),
+            help=(
+                "Паттерны для hidden transformer-блоков, куда можно применять Muon "
+                "(обычно слои типа layers/h/blocks)."
+            ),
+        )
+        parsed_hidden_patterns = [x.strip() for x in muon_hidden_text.split(",") if x.strip()]
+        if parsed_hidden_patterns:
+            muon_hidden_patterns = parsed_hidden_patterns
 
     magma_prob = 0.5
     magma_tau = 2.0
@@ -4240,6 +4266,8 @@ def render_training_config():
         "muon_weight_decay": muon_weight_decay,
         "muon_aux_adamw_lr": muon_aux_adamw_lr,
         "muon_aux_adamw_weight_decay": muon_aux_adamw_weight_decay,
+        "muon_aux_adamw_eps": muon_aux_adamw_eps,
+        "muon_hidden_patterns": muon_hidden_patterns,
         "muon_exclude_patterns": muon_exclude_patterns,
         "magma_prob": magma_prob,
         "magma_tau": magma_tau,

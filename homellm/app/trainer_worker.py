@@ -29,7 +29,7 @@ from transformers import (
 from homellm.models.adapters import resolve_adapter
 from homellm.training.pretrain import StreamingTextDataset
 from homellm.training.sft import SFTDataset
-from homellm.training.optimizers import MagmaAdamW, HybridMuonAdamW
+from homellm.training.optimizers import MagmaAdamW, MuonWithAuxAdam
 
 # Liger Kernel интеграция (оптимизированные Triton kernels)
 try:
@@ -799,7 +799,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     f"muon_ns_coefficients must be a list/tuple of 3 floats, got: {ns_coeff}"
                 )
 
-            adjust_lr_fn = config.get("muon_adjust_lr_fn", "match_rms_adamw")
+            adjust_lr_fn = config.get("muon_adjust_lr_fn", "original")
             if adjust_lr_fn not in (None, "original", "match_rms_adamw"):
                 raise ValueError(
                     f"muon_adjust_lr_fn must be one of None|'original'|'match_rms_adamw', got: {adjust_lr_fn}"
@@ -808,8 +808,15 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             muon_exclude_patterns = config.get(
                 "muon_exclude_patterns",
                 [
-                    r"(^|\.)(embed|embeddings|embed_tokens)(\.|$)",
+                    r"(^|\.)(embed|embeddings|embed_tokens|tok_embeddings|token_embeddings|wte|wpe|word_embeddings|position_embeddings)(\.|$)",
                     r"(^|\.)(lm_head|output|classifier|head)(\.|$)",
+                    r"(^|\.)(lora(_[AaBb])?|lora[AaBb]?|adapter|adapters|ia3|prompt|prefix)(\.|$)",
+                ],
+            )
+            muon_hidden_patterns = config.get(
+                "muon_hidden_patterns",
+                [
+                    r"(^|\.)(layers|h|blocks)(\.|$)",
                 ],
             )
             if not isinstance(muon_exclude_patterns, (list, tuple)) or not all(
@@ -818,20 +825,29 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 raise ValueError(
                     f"muon_exclude_patterns must be a list[str], got: {muon_exclude_patterns}"
                 )
+            if not isinstance(muon_hidden_patterns, (list, tuple)) or not all(
+                isinstance(x, str) for x in muon_hidden_patterns
+            ):
+                raise ValueError(
+                    f"muon_hidden_patterns must be a list[str], got: {muon_hidden_patterns}"
+                )
 
-            muon_lr = float(config.get("muon_lr", lr))
-            muon_weight_decay = float(config.get("muon_weight_decay", wd))
+            muon_lr = float(config.get("muon_lr", 0.02))
+            muon_weight_decay = float(config.get("muon_weight_decay", 0.01))
             muon_aux_adamw_lr = float(
-                config.get("muon_aux_adamw_lr", config.get("muon_adamw_lr", lr))
+                config.get("muon_aux_adamw_lr", config.get("muon_adamw_lr", 3e-4))
+            )
+            muon_aux_adamw_eps = float(
+                config.get("muon_aux_adamw_eps", config.get("muon_adamw_eps", 1e-10))
             )
             muon_aux_adamw_weight_decay = float(
                 config.get(
                     "muon_aux_adamw_weight_decay",
-                    config.get("muon_adamw_weight_decay", wd),
+                    config.get("muon_adamw_weight_decay", 0.01),
                 )
             )
 
-            optimizer = HybridMuonAdamW(
+            optimizer = MuonWithAuxAdam(
                 trainable_params,
                 named_params=trainable_named_params,
                 lr=lr,
@@ -846,9 +862,10 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 muon_eps=eps,
                 muon_ns_steps=int(config.get("muon_ns_steps", 5)),
                 muon_adjust_lr_fn=adjust_lr_fn,
+                muon_hidden_patterns=tuple(muon_hidden_patterns),
                 muon_exclude_patterns=tuple(muon_exclude_patterns),
                 adamw_betas=betas,
-                adamw_eps=eps,
+                adamw_eps=muon_aux_adamw_eps,
             )
         else:
             optimizer_name = "adamw"
@@ -867,7 +884,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             betas=[float(betas[0]), float(betas[1])],
             eps=eps,
         )
-        if optimizer_name == "muon" and isinstance(optimizer, HybridMuonAdamW):
+        if optimizer_name == "muon" and isinstance(optimizer, MuonWithAuxAdam):
             logger.info(
                 "Muon split: muon_params=%s, adamw_params=%s, muon_lr=%.3e, aux_adamw_lr=%.3e, muon_wd=%.4g, aux_adamw_wd=%.4g",
                 f"{optimizer.muon_param_count:,}",
@@ -877,15 +894,32 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 optimizer.muon_weight_decay,
                 optimizer.adamw_weight_decay,
             )
+            logger.info(
+                "Muon split detail: total_2d_tensors=%s, nonhidden_2d=%s, excluded_2d_by_pattern=%s, unnamed_2d=%s",
+                optimizer.total_2d_param_tensors,
+                optimizer.nonhidden_2d_param_tensors,
+                optimizer.excluded_2d_param_tensors,
+                optimizer.unnamed_2d_param_tensors,
+            )
+            logger.info("Muon sample param names: %s", optimizer.muon_param_names_sample)
+            logger.info("Aux AdamW sample param names: %s", optimizer.adamw_param_names_sample)
             metrics.update(
+                muon_impl="muon_with_aux_adam",
                 muon_param_count=int(optimizer.muon_param_count),
                 muon_aux_adamw_param_count=int(optimizer.adamw_param_count),
+                muon_total_2d_param_tensors=int(optimizer.total_2d_param_tensors),
+                muon_nonhidden_2d_param_tensors=int(optimizer.nonhidden_2d_param_tensors),
+                muon_excluded_2d_param_tensors=int(optimizer.excluded_2d_param_tensors),
+                muon_unnamed_2d_param_tensors=int(optimizer.unnamed_2d_param_tensors),
                 muon_adjust_lr_fn=adjust_lr_fn,
+                muon_hidden_patterns=list(muon_hidden_patterns),
                 muon_exclude_patterns=list(muon_exclude_patterns),
                 muon_lr=float(optimizer.muon_lr),
                 muon_weight_decay=float(optimizer.muon_weight_decay),
                 muon_aux_adamw_lr=float(optimizer.adamw_lr),
                 muon_aux_adamw_weight_decay=float(optimizer.adamw_weight_decay),
+                muon_param_names_sample=list(optimizer.muon_param_names_sample),
+                muon_aux_adamw_param_names_sample=list(optimizer.adamw_param_names_sample),
             )
         # LR scheduler
         # ВАЖНО: мы шагаем scheduler на UPDATE-step (когда accelerator.sync_gradients=True).
@@ -1382,7 +1416,9 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                                 logger.warning(f"[CUDA PEAK] failed: {e}")
 
                         # Gradient clipping для стабильности
-                        max_grad_norm = config.get("max_grad_norm", 1.0)
+                        # Muon часто деградирует при жёстком глобальном clip_grad_norm=1.0.
+                        max_grad_norm_default = 0.0 if optimizer_name == "muon" else 1.0
+                        max_grad_norm = config.get("max_grad_norm", max_grad_norm_default)
                         if max_grad_norm > 0:
                             accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                         
