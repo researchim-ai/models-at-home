@@ -115,6 +115,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libaio-dev \
  && rm -rf /var/lib/apt/lists/*
 
+# Гарантируем запись в /etc/passwd для uid/gid=1000 (нужно для getpass.getuser()).
+# Это важно при запуске контейнера с user: "1000:1000" в docker-compose.
+RUN getent group 1000 >/dev/null || groupadd -g 1000 appgroup \
+ && id -u 1000 >/dev/null 2>&1 || useradd -m -u 1000 -g 1000 -s /bin/bash appuser
+
 # Подхватываем venv из builder
 ENV VENV_PATH=/opt/venv
 COPY --from=builder ${VENV_PATH} ${VENV_PATH}

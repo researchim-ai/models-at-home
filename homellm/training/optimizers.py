@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 import re
+import time
+from contextlib import nullcontext
 from typing import Iterable
 
 import torch
@@ -160,7 +162,7 @@ def _repo_zeropower_via_newtonschulz(
 
 
 class MuonWithAuxAdam(Optimizer):
-    """Single-device MuonWithAuxAdam adapted from @Muon reference implementation."""
+    """MuonWithAuxAdam adapted from @Muon, extended for DeepSpeed ZeRO modes."""
 
     def __init__(
         self,
@@ -178,6 +180,11 @@ class MuonWithAuxAdam(Optimizer):
         muon_eps: float = 1e-7,
         muon_ns_steps: int = 5,
         muon_adjust_lr_fn: str | None = None,  # kept for interface compatibility
+        muon_ds_zero_stage: int = 0,
+        muon_ds_offload_optimizer: str | None = None,
+        muon_ds_offload_param: str | None = None,
+        muon_ds_strict_mode: bool = True,
+        muon_ds_profile_optimizer_step: bool = False,
         muon_hidden_patterns: tuple[str, ...] = (
             r"(^|\.)(layers|h|blocks)(\.|$)",
         ),
@@ -193,6 +200,39 @@ class MuonWithAuxAdam(Optimizer):
             raise ValueError(
                 f"muon_adjust_lr_fn must be one of None|'original'|'match_rms_adamw', got: {muon_adjust_lr_fn}"
             )
+        self.muon_ds_zero_stage = int(muon_ds_zero_stage or 0)
+        self.muon_ds_offload_optimizer = str(muon_ds_offload_optimizer or "none").lower()
+        self.muon_ds_offload_param = str(muon_ds_offload_param or "none").lower()
+        self.muon_ds_strict_mode = bool(muon_ds_strict_mode)
+        self.muon_ds_profile_optimizer_step = bool(muon_ds_profile_optimizer_step)
+        self._use_ds_gather = (
+            self.muon_ds_zero_stage >= 2
+            or self.muon_ds_offload_optimizer not in ("none", "")
+            or self.muon_ds_offload_param not in ("none", "")
+        )
+        self._safe_get_full_grad = None
+        self._safe_get_full_fp32_param = None
+        self._safe_set_full_fp32_param = None
+        self._GatheredParameters = None
+        if self._use_ds_gather:
+            try:
+                from deepspeed.runtime.zero.partition_parameters import GatheredParameters
+                from deepspeed.utils import (
+                    safe_get_full_fp32_param,
+                    safe_get_full_grad,
+                    safe_set_full_fp32_param,
+                )
+
+                self._GatheredParameters = GatheredParameters
+                self._safe_get_full_grad = safe_get_full_grad
+                self._safe_get_full_fp32_param = safe_get_full_fp32_param
+                self._safe_set_full_fp32_param = safe_set_full_fp32_param
+            except Exception as exc:
+                if self.muon_ds_strict_mode:
+                    raise RuntimeError(
+                        "MuonWithAuxAdam requires DeepSpeed ZeRO gather APIs for this DS mode."
+                    ) from exc
+
         params_list = [p for p in params if p.requires_grad]
         if len(params_list) == 0:
             raise ValueError("MuonWithAuxAdam received empty params list")
@@ -277,6 +317,8 @@ class MuonWithAuxAdam(Optimizer):
                 }
             )
         super().__init__(param_groups, defaults={})
+        self._muon_params = muon_params
+        self._adamw_params = adamw_params
 
         self.muon_param_count = sum(p.numel() for p in muon_params)
         self.adamw_param_count = sum(p.numel() for p in adamw_params)
@@ -290,6 +332,225 @@ class MuonWithAuxAdam(Optimizer):
         self.adamw_weight_decay = adamw_wd_resolved
         self.muon_param_names_sample = [name_by_id.get(id(p), "<unnamed>") for p in muon_params[:8]]
         self.adamw_param_names_sample = [name_by_id.get(id(p), "<unnamed>") for p in adamw_params[:8]]
+        self._muon_group_cfg = {
+            "lr": muon_lr_resolved,
+            "weight_decay": muon_wd_resolved,
+            "momentum": float(muon_momentum),
+            "nesterov": bool(muon_nesterov),
+            "ns_coefficients": muon_ns_coefficients,
+            "ns_steps": int(muon_ns_steps),
+            "eps": float(muon_eps),
+        }
+        self._adamw_group_cfg = {
+            "lr": adamw_lr_resolved,
+            "weight_decay": adamw_wd_resolved,
+            "betas": adamw_betas,
+            "eps": float(adamw_eps),
+        }
+        self.last_step_profile: dict[str, float | int] = {
+            "muon_gather_ms": 0.0,
+            "muon_ns_ms": 0.0,
+            "muon_scatter_ms": 0.0,
+            "muon_gathered_param_tensors": 0,
+            "muon_gathered_param_bytes_est": 0,
+        }
+
+    def _fail_or_warn(self, message: str) -> bool:
+        if self.muon_ds_strict_mode:
+            raise RuntimeError(message)
+        return False
+
+    def _maybe_gather_context(self, params: list[torch.nn.Parameter]):
+        if not self._use_ds_gather:
+            return nullcontext()
+        if self._GatheredParameters is None:
+            self._fail_or_warn("DeepSpeed GatheredParameters is unavailable for Muon step.")
+            return nullcontext()
+        # Some DeepSpeed setups (or world_size=1) keep regular tensors without all_gather().
+        if not any(hasattr(p, "all_gather") for p in params):
+            return nullcontext()
+        return self._GatheredParameters(params, modifier_rank=None)
+
+    def _get_full_grad_like_param(
+        self, p: torch.nn.Parameter, expected_shape: torch.Size | None = None
+    ) -> torch.Tensor | None:
+        grad = None
+        if self._safe_get_full_grad is not None:
+            try:
+                grad = self._safe_get_full_grad(p)
+            except Exception:
+                grad = None
+        if grad is None:
+            grad = p.grad
+        if grad is None:
+            return None
+        target_shape = expected_shape if expected_shape is not None else p.shape
+        if grad.shape != target_shape:
+            target_numel = math.prod(target_shape) if len(target_shape) > 0 else 1
+            if grad.numel() == target_numel:
+                grad = grad.reshape(target_shape)
+            else:
+                self._fail_or_warn(
+                    f"MuonWithAuxAdam expected full grad shape {tuple(target_shape)}, got {tuple(grad.shape)}"
+                )
+                return None
+        return grad
+
+    def _get_full_param(self, p: torch.nn.Parameter) -> torch.Tensor | None:
+        full_param = None
+        if self._safe_get_full_fp32_param is not None:
+            try:
+                full_param = self._safe_get_full_fp32_param(p)
+            except Exception:
+                full_param = None
+        if full_param is None and self._use_ds_gather and self._GatheredParameters is not None:
+            # Fallback path for ZeRO-3/offload when safe_get_full_fp32_param returns None.
+            try:
+                with self._GatheredParameters([p], modifier_rank=None):
+                    full_param = p.detach().float().clone()
+            except Exception:
+                full_param = None
+        if full_param is None:
+            if self._use_ds_gather:
+                self._fail_or_warn("Failed to get full param in DeepSpeed mode.")
+                return None
+            full_param = p.detach()
+        return full_param
+
+    @torch.no_grad()
+    def _step_distributed(self) -> None:
+        cfg_m = self._muon_group_cfg
+        cfg_a = self._adamw_group_cfg
+
+        t_gather = 0.0
+        t_ns = 0.0
+        t_total_start = time.perf_counter()
+
+        # Muon branch: operate on original model params via DS safe full-param APIs.
+        for p in self._muon_params:
+            tg0 = time.perf_counter()
+            full_param = self._get_full_param(p)
+            t_gather += time.perf_counter() - tg0
+            if full_param is None:
+                continue
+            grad = self._get_full_grad_like_param(p, expected_shape=full_param.shape)
+            if grad is None:
+                continue
+
+            state = self.state[p]
+            if "momentum_buffer" not in state or tuple(state["momentum_buffer"].shape) != tuple(
+                full_param.shape
+            ):
+                state["momentum_buffer"] = torch.zeros_like(full_param)
+
+            momentum_buf = state["momentum_buffer"]
+            work_device = full_param.device
+            if work_device.type == "cpu" and torch.cuda.is_available():
+                work_device = torch.device("cuda", torch.cuda.current_device())
+
+            grad_work = grad if grad.device == work_device else grad.to(work_device)
+            param_work = full_param if full_param.device == work_device else full_param.to(work_device)
+            if grad_work.ndim < 2 and param_work.ndim >= 2 and grad_work.numel() == param_work.numel():
+                grad_work = grad_work.reshape_as(param_work)
+
+            mom_work = momentum_buf if momentum_buf.device == work_device else momentum_buf.to(work_device)
+            mom_work.lerp_(grad_work, 1 - float(cfg_m["momentum"]))
+            update = (
+                grad_work.lerp(mom_work, float(cfg_m["momentum"]))
+                if bool(cfg_m["nesterov"])
+                else mom_work
+            )
+            if update.ndim == 4:
+                update = update.view(len(update), -1)
+
+            tns0 = time.perf_counter()
+            update = _repo_zeropower_via_newtonschulz(
+                update,
+                ns_coefficients=cfg_m["ns_coefficients"],  # type: ignore[arg-type]
+                ns_steps=int(cfg_m["ns_steps"]),
+                eps=float(cfg_m["eps"]),
+            )
+            t_ns += time.perf_counter() - tns0
+            update *= math.sqrt(max(1.0, update.size(-2) / update.size(-1)))
+
+            if mom_work.data_ptr() != momentum_buf.data_ptr():
+                momentum_buf.copy_(mom_work.to(momentum_buf.device))
+
+            param_work.mul_(1 - float(cfg_m["lr"]) * float(cfg_m["weight_decay"]))
+            param_work.add_(update.reshape_as(param_work), alpha=-float(cfg_m["lr"]))
+
+            if self._safe_set_full_fp32_param is not None:
+                self._safe_set_full_fp32_param(p, param_work.to(full_param.dtype))
+            else:
+                if param_work.device != p.device:
+                    param_work = param_work.to(p.device)
+                p.copy_(param_work.reshape_as(p))
+
+        # Aux AdamW branch on original params too (for ZeRO-3 consistency).
+        beta1, beta2 = cfg_a["betas"]  # type: ignore[assignment]
+        for p in self._adamw_params:
+            tg0 = time.perf_counter()
+            full_param = self._get_full_param(p)
+            t_gather += time.perf_counter() - tg0
+            if full_param is None:
+                continue
+            grad = self._get_full_grad_like_param(p, expected_shape=full_param.shape)
+            if grad is None:
+                continue
+
+            state = self.state[p]
+            if "exp_avg" not in state or tuple(state["exp_avg"].shape) != tuple(full_param.shape):
+                state["exp_avg"] = torch.zeros_like(full_param)
+                state["exp_avg_sq"] = torch.zeros_like(full_param)
+                state["step"] = 0
+
+            exp_avg = state["exp_avg"]
+            exp_avg_sq = state["exp_avg_sq"]
+            state["step"] += 1
+            step_t = state["step"]
+
+            work_device = full_param.device
+            if work_device.type == "cpu" and torch.cuda.is_available():
+                work_device = torch.device("cuda", torch.cuda.current_device())
+            grad_work = grad if grad.device == work_device else grad.to(work_device)
+            param_work = full_param if full_param.device == work_device else full_param.to(work_device)
+            exp_avg_work = exp_avg if exp_avg.device == work_device else exp_avg.to(work_device)
+            exp_avg_sq_work = (
+                exp_avg_sq if exp_avg_sq.device == work_device else exp_avg_sq.to(work_device)
+            )
+
+            exp_avg_work.lerp_(grad_work, 1 - beta1)
+            exp_avg_sq_work.lerp_(grad_work.square(), 1 - beta2)
+            exp_avg_hat = exp_avg_work / (1 - beta1**step_t)
+            exp_avg_sq_hat = exp_avg_sq_work / (1 - beta2**step_t)
+            update = exp_avg_hat / (exp_avg_sq_hat.sqrt() + float(cfg_a["eps"]))
+
+            param_work.mul_(1 - float(cfg_a["lr"]) * float(cfg_a["weight_decay"]))
+            param_work.add_(update, alpha=-float(cfg_a["lr"]))
+
+            if exp_avg_work.data_ptr() != exp_avg.data_ptr():
+                exp_avg.copy_(exp_avg_work.to(exp_avg.device))
+            if exp_avg_sq_work.data_ptr() != exp_avg_sq.data_ptr():
+                exp_avg_sq.copy_(exp_avg_sq_work.to(exp_avg_sq.device))
+
+            if self._safe_set_full_fp32_param is not None:
+                self._safe_set_full_fp32_param(p, param_work.to(full_param.dtype))
+            else:
+                if param_work.device != p.device:
+                    param_work = param_work.to(p.device)
+                p.copy_(param_work.reshape_as(p))
+
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        total_ms = (time.perf_counter() - t_total_start) * 1000.0
+        self.last_step_profile = {
+            "muon_gather_ms": float(t_gather * 1000.0),
+            "muon_ns_ms": float(t_ns * 1000.0),
+            "muon_scatter_ms": float(max(0.0, total_ms - (t_gather * 1000.0) - (t_ns * 1000.0))),
+            "muon_gathered_param_tensors": int(len(self._muon_params)),
+            "muon_gathered_param_bytes_est": int(
+                sum(p.numel() * p.element_size() for p in self._muon_params) * max(1, world_size)
+            ),
+        }
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -297,6 +558,14 @@ class MuonWithAuxAdam(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        if self._use_ds_gather:
+            self._step_distributed()
+            return loss
+
+        t_step_start = time.perf_counter()
+        t_gather = 0.0
+        t_ns = 0.0
 
         for group in self.param_groups:
             if group.get("use_muon", False):
@@ -307,28 +576,65 @@ class MuonWithAuxAdam(Optimizer):
                 ns_coefficients = tuple(group["ns_coefficients"])
                 ns_steps = int(group["ns_steps"])
                 eps = float(group["eps"])
+                params = list(group["params"])
+                if len(params) == 0:
+                    continue
 
-                for p in group["params"]:
-                    if p.grad is None:
-                        continue
-                    grad = p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(p)
-                    momentum_buf = state["momentum_buffer"]
-                    momentum_buf.lerp_(grad, 1 - momentum)
-                    update = grad.lerp(momentum_buf, momentum) if nesterov else momentum_buf
-                    if update.ndim == 4:
-                        update = update.view(len(update), -1)
-                    update = _repo_zeropower_via_newtonschulz(
-                        update,
-                        ns_coefficients=ns_coefficients,  # type: ignore[arg-type]
-                        ns_steps=ns_steps,
-                        eps=eps,
-                    )
-                    update *= math.sqrt(max(1.0, update.size(-2) / update.size(-1)))
-                    p.mul_(1 - lr * wd)
-                    p.add_(update.reshape_as(p), alpha=-lr)
+                t0 = time.perf_counter()
+                with self._maybe_gather_context(params):
+                    t_gather += time.perf_counter() - t0
+                    for p in params:
+                        full_param = self._get_full_param(p)
+                        if full_param is None:
+                            continue
+                        grad = self._get_full_grad_like_param(p, expected_shape=full_param.shape)
+                        if grad is None:
+                            continue
+                        state = self.state[p]
+                        if "momentum_buffer" not in state or tuple(state["momentum_buffer"].shape) != tuple(full_param.shape):
+                            state["momentum_buffer"] = torch.zeros_like(full_param)
+
+                        momentum_buf = state["momentum_buffer"]
+                        work_device = full_param.device
+                        if work_device.type == "cpu" and torch.cuda.is_available():
+                            work_device = torch.device("cuda", torch.cuda.current_device())
+
+                        grad_work = grad if grad.device == work_device else grad.to(work_device)
+                        param_work = full_param if full_param.device == work_device else full_param.to(work_device)
+                        if grad_work.ndim < 2 and param_work.ndim >= 2 and grad_work.numel() == param_work.numel():
+                            grad_work = grad_work.reshape_as(param_work)
+                        mom_work = (
+                            momentum_buf
+                            if momentum_buf.device == work_device
+                            else momentum_buf.to(work_device)
+                        )
+                        mom_work.lerp_(grad_work, 1 - momentum)
+                        update = grad_work.lerp(mom_work, momentum) if nesterov else mom_work
+                        if update.ndim == 4:
+                            update = update.view(len(update), -1)
+
+                        tns0 = time.perf_counter()
+                        update = _repo_zeropower_via_newtonschulz(
+                            update,
+                            ns_coefficients=ns_coefficients,  # type: ignore[arg-type]
+                            ns_steps=ns_steps,
+                            eps=eps,
+                        )
+                        t_ns += time.perf_counter() - tns0
+                        update *= math.sqrt(max(1.0, update.size(-2) / update.size(-1)))
+
+                        if mom_work.data_ptr() != momentum_buf.data_ptr():
+                            momentum_buf.copy_(mom_work.to(momentum_buf.device))
+
+                        param_work.mul_(1 - lr * wd)
+                        param_work.add_(update.reshape_as(param_work), alpha=-lr)
+
+                        if self._safe_set_full_fp32_param is not None and self._use_ds_gather:
+                            self._safe_set_full_fp32_param(p, param_work.to(full_param.dtype))
+                        else:
+                            if param_work.device != p.device:
+                                param_work = param_work.to(p.device)
+                            p.copy_(param_work.reshape_as(p))
             else:
                 lr = float(group["lr"])
                 wd = float(group["weight_decay"])
@@ -356,6 +662,20 @@ class MuonWithAuxAdam(Optimizer):
                     p.mul_(1 - lr * wd)
                     p.add_(update, alpha=-lr)
 
+        t_total = time.perf_counter() - t_step_start
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        gathered_param_bytes = int(
+            sum(p.numel() * p.element_size() for p in self._muon_params) * max(1, world_size)
+            if self._use_ds_gather
+            else 0
+        )
+        self.last_step_profile = {
+            "muon_gather_ms": float(t_gather * 1000.0),
+            "muon_ns_ms": float(t_ns * 1000.0),
+            "muon_scatter_ms": float(max(0.0, t_total - t_gather - t_ns) * 1000.0),
+            "muon_gathered_param_tensors": int(len(self._muon_params) if self._use_ds_gather else 0),
+            "muon_gathered_param_bytes_est": gathered_param_bytes,
+        }
         return loss
 
 

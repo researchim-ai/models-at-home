@@ -3933,7 +3933,8 @@ def render_training_config():
         help=(
             "adamw — стандартный optimizer.\n"
             "adamw_8bit — экономия памяти (требует bitsandbytes, без DeepSpeed).\n"
-            "muon — MuonWithAuxAdam: Muon для hidden 2D параметров, AdamW для остальных.\n"
+            "muon — MuonWithAuxAdam: Muon для hidden 2D параметров, AdamW для остальных. "
+            "Поддерживает DeepSpeed (включая ZeRO-3/offload), но может быть медленнее AdamW из-за gather/scatter.\n"
             "magma_adamw — AdamW + стохастическое masking обновлений."
         ),
     )
@@ -4089,6 +4090,8 @@ def render_training_config():
     muon_aux_adamw_lr = float(learning_rate)
     muon_aux_adamw_weight_decay = float(weight_decay)
     muon_aux_adamw_eps = 1e-10
+    muon_ds_strict_mode = True
+    muon_ds_profile_optimizer_step = False
     muon_exclude_patterns = [
         r"(^|\.)(embed|embeddings|embed_tokens|tok_embeddings|token_embeddings|wte|wpe|word_embeddings|position_embeddings)(\.|$)",
         r"(^|\.)(lm_head|output|classifier|head)(\.|$)",
@@ -4180,6 +4183,20 @@ def render_training_config():
             format="%.1e",
             help="В README Muon в примере для aux AdamW используют eps=1e-10.",
         )
+        st.sidebar.markdown("**Muon + DeepSpeed (advanced)**")
+        muon_ds_strict_mode = st.sidebar.checkbox(
+            "Muon DS strict mode",
+            value=True,
+            help=(
+                "Если включено, Muon остановит обучение при нарушении distributed-инвариантов "
+                "(например, когда full grad недоступен для Muon-параметра)."
+            ),
+        )
+        muon_ds_profile_optimizer_step = st.sidebar.checkbox(
+            "Muon DS profile optimizer step",
+            value=False,
+            help="Логировать время gather/NS/scatter и оценку объема собранных параметров.",
+        )
 
         muon_exclude_text = st.sidebar.text_input(
             "Muon exclude patterns (regex, comma-separated)",
@@ -4267,6 +4284,8 @@ def render_training_config():
         "muon_aux_adamw_lr": muon_aux_adamw_lr,
         "muon_aux_adamw_weight_decay": muon_aux_adamw_weight_decay,
         "muon_aux_adamw_eps": muon_aux_adamw_eps,
+        "muon_ds_strict_mode": muon_ds_strict_mode,
+        "muon_ds_profile_optimizer_step": muon_ds_profile_optimizer_step,
         "muon_hidden_patterns": muon_hidden_patterns,
         "muon_exclude_patterns": muon_exclude_patterns,
         "magma_prob": magma_prob,

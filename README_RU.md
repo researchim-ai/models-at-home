@@ -74,6 +74,8 @@
 
 2. **Запустите через Docker Compose:**
    ```bash
+   export UID=$(id -u)
+   export GID=$(id -g)
    docker-compose up --build
    ```
 
@@ -81,6 +83,11 @@
    Перейдите по адресу: [http://localhost:8501](http://localhost:8501)
 
 Все данные (датасеты, веса моделей, логи) сохраняются в папках `datasets/`, `out/` и `.runs/` на вашем компьютере.
+
+Если раньше Docker создавал файлы от root, один раз поправьте владельца:
+```bash
+sudo chown -R "$(id -u):$(id -g)" datasets out .runs models .cache
+```
 
 ---
 

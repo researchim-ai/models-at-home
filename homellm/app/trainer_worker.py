@@ -749,7 +749,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         logger.info(f"Optimizing {len(trainable_params)} trainable parameters "
                    f"(total: {sum(p.numel() for p in model.parameters())})")
         
-        uses_deepspeed = getattr(accelerator.state, "deepspeed_plugin", None) is not None
+        ds_plugin = getattr(accelerator.state, "deepspeed_plugin", None)
+        uses_deepspeed = ds_plugin is not None
         optimizer_name = str(config.get("optimizer", "adamw")).strip().lower()
         lr = float(config["learning_rate"])
         wd = float(config.get("weight_decay", 0.1))
@@ -789,10 +790,6 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 magma_cosine_eps=float(config.get("magma_cosine_eps", 1e-12)),
             )
         elif optimizer_name == "muon":
-            if uses_deepspeed:
-                raise RuntimeError(
-                    "Optimizer 'muon' currently does not support DeepSpeed mode in this training path."
-                )
             ns_coeff = config.get("muon_ns_coefficients", [3.4445, -4.775, 2.0315])
             if not isinstance(ns_coeff, (list, tuple)) or len(ns_coeff) != 3:
                 raise ValueError(
@@ -846,6 +843,26 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                     config.get("muon_adamw_weight_decay", 0.01),
                 )
             )
+            muon_ds_zero_stage = int(getattr(ds_plugin, "zero_stage", 0) or 0)
+            muon_ds_offload_optimizer = str(
+                getattr(ds_plugin, "offload_optimizer_device", "none") or "none"
+            ).lower()
+            muon_ds_offload_param = str(
+                getattr(ds_plugin, "offload_param_device", "none") or "none"
+            ).lower()
+            muon_ds_strict_mode = bool(config.get("muon_ds_strict_mode", True))
+            muon_ds_profile_optimizer_step = bool(
+                config.get("muon_ds_profile_optimizer_step", False)
+            )
+            if uses_deepspeed and (
+                muon_ds_offload_optimizer not in ("none", "")
+                or muon_ds_offload_param not in ("none", "")
+            ):
+                try:
+                    ds_cfg = accelerator.state.deepspeed_plugin.deepspeed_config
+                    ds_cfg["zero_force_ds_cpu_optimizer"] = False
+                except Exception:
+                    pass
 
             optimizer = MuonWithAuxAdam(
                 trainable_params,
@@ -862,6 +879,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 muon_eps=eps,
                 muon_ns_steps=int(config.get("muon_ns_steps", 5)),
                 muon_adjust_lr_fn=adjust_lr_fn,
+                muon_ds_zero_stage=muon_ds_zero_stage,
+                muon_ds_offload_optimizer=muon_ds_offload_optimizer,
+                muon_ds_offload_param=muon_ds_offload_param,
+                muon_ds_strict_mode=muon_ds_strict_mode,
+                muon_ds_profile_optimizer_step=muon_ds_profile_optimizer_step,
                 muon_hidden_patterns=tuple(muon_hidden_patterns),
                 muon_exclude_patterns=tuple(muon_exclude_patterns),
                 adamw_betas=betas,
@@ -920,6 +942,11 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 muon_aux_adamw_weight_decay=float(optimizer.adamw_weight_decay),
                 muon_param_names_sample=list(optimizer.muon_param_names_sample),
                 muon_aux_adamw_param_names_sample=list(optimizer.adamw_param_names_sample),
+                muon_ds_zero_stage=int(muon_ds_zero_stage),
+                muon_ds_offload_optimizer=muon_ds_offload_optimizer,
+                muon_ds_offload_param=muon_ds_offload_param,
+                muon_ds_strict_mode=bool(muon_ds_strict_mode),
+                muon_ds_profile_optimizer_step=bool(muon_ds_profile_optimizer_step),
             )
         # LR scheduler
         # ВАЖНО: мы шагаем scheduler на UPDATE-step (когда accelerator.sync_gradients=True).
@@ -1423,6 +1450,23 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                             accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                         
                         optimizer.step()
+                        if (
+                            optimizer_name == "muon"
+                            and getattr(optimizer, "muon_ds_profile_optimizer_step", False)
+                        ):
+                            prof = getattr(optimizer, "last_step_profile", None)
+                            if isinstance(prof, dict) and accelerator.is_main_process:
+                                metrics.update(
+                                    muon_gather_ms=float(prof.get("muon_gather_ms", 0.0)),
+                                    muon_ns_ms=float(prof.get("muon_ns_ms", 0.0)),
+                                    muon_scatter_ms=float(prof.get("muon_scatter_ms", 0.0)),
+                                    muon_gathered_param_tensors=int(
+                                        prof.get("muon_gathered_param_tensors", 0)
+                                    ),
+                                    muon_gathered_param_bytes_est=int(
+                                        prof.get("muon_gathered_param_bytes_est", 0)
+                                    ),
+                                )
                         lr_scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
                 

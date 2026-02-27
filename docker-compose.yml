@@ -9,6 +9,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: models-at-home
+    user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "8501:8501"
       - "8502:8502"
@@ -22,6 +23,19 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - MKL_THREADING_LAYER=GNU
+      # Единый writable cache root (избегаем permission проблем на bind-mounted /app)
+      - HOME=/tmp
+      - XDG_CACHE_HOME=/tmp/.cache
+      - HF_HOME=/tmp/.cache/huggingface
+      - HF_DATASETS_CACHE=/tmp/.cache/huggingface/datasets
+      - HUGGINGFACE_HUB_CACHE=/tmp/.cache/huggingface/hub
+      - TRITON_CACHE_DIR=/tmp/.cache/triton
+      - TORCH_HOME=/tmp/.cache/torch
+      - TORCHINDUCTOR_CACHE_DIR=/tmp/.cache/torchinductor
+      - CUDA_CACHE_PATH=/tmp/.cache/nv
+      - NUMBA_CACHE_DIR=/tmp/.cache/numba
+      - MPLCONFIGDIR=/tmp/.cache/matplotlib
+      - PIP_CACHE_DIR=/tmp/.cache/pip
       # NCCL: улучшенная диагностика при ошибках multi-GPU
       - NCCL_DEBUG=WARN
     # ВАЖНО: shared memory для NCCL (multi-GPU / DeepSpeed / DDP).

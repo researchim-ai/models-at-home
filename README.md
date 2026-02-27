@@ -74,6 +74,8 @@ The easiest way to run the studio without dealing with CUDA and PyTorch installa
 
 2. **Run with Docker Compose:**
    ```bash
+   export UID=$(id -u)
+   export GID=$(id -g)
    docker compose up --build
    ```
 
@@ -81,6 +83,11 @@ The easiest way to run the studio without dealing with CUDA and PyTorch installa
    Navigate to: [http://localhost:8501](http://localhost:8501)
 
 All data (datasets, model weights, logs) is saved to `datasets/`, `out/`, and `.runs/` folders on your machine.
+
+If files were created earlier by root inside Docker, fix ownership once:
+```bash
+sudo chown -R "$(id -u):$(id -g)" datasets out .runs models .cache
+```
 
 ---
 
