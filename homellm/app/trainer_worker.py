@@ -854,6 +854,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
             muon_ds_profile_optimizer_step = bool(
                 config.get("muon_ds_profile_optimizer_step", False)
             )
+            muon_ds_fast_aux_adamw = bool(config.get("muon_ds_fast_aux_adamw", True))
+            muon_ds_gather_bucket_numel = int(config.get("muon_ds_gather_bucket_numel", 50_000_000))
             if uses_deepspeed and (
                 muon_ds_offload_optimizer not in ("none", "")
                 or muon_ds_offload_param not in ("none", "")
@@ -884,6 +886,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 muon_ds_offload_param=muon_ds_offload_param,
                 muon_ds_strict_mode=muon_ds_strict_mode,
                 muon_ds_profile_optimizer_step=muon_ds_profile_optimizer_step,
+                muon_ds_fast_aux_adamw=muon_ds_fast_aux_adamw,
+                muon_ds_gather_bucket_numel=muon_ds_gather_bucket_numel,
                 muon_hidden_patterns=tuple(muon_hidden_patterns),
                 muon_exclude_patterns=tuple(muon_exclude_patterns),
                 adamw_betas=betas,
@@ -947,6 +951,8 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                 muon_ds_offload_param=muon_ds_offload_param,
                 muon_ds_strict_mode=bool(muon_ds_strict_mode),
                 muon_ds_profile_optimizer_step=bool(muon_ds_profile_optimizer_step),
+                muon_ds_fast_aux_adamw=bool(muon_ds_fast_aux_adamw),
+                muon_ds_gather_bucket_numel=int(muon_ds_gather_bucket_numel),
             )
         # LR scheduler
         # ВАЖНО: мы шагаем scheduler на UPDATE-step (когда accelerator.sync_gradients=True).

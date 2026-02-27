@@ -4092,6 +4092,8 @@ def render_training_config():
     muon_aux_adamw_eps = 1e-10
     muon_ds_strict_mode = True
     muon_ds_profile_optimizer_step = False
+    muon_ds_fast_aux_adamw = True
+    muon_ds_gather_bucket_numel = 50_000_000
     muon_exclude_patterns = [
         r"(^|\.)(embed|embeddings|embed_tokens|tok_embeddings|token_embeddings|wte|wpe|word_embeddings|position_embeddings)(\.|$)",
         r"(^|\.)(lm_head|output|classifier|head)(\.|$)",
@@ -4197,6 +4199,27 @@ def render_training_config():
             value=False,
             help="Логировать время gather/NS/scatter и оценку объема собранных параметров.",
         )
+        muon_ds_fast_aux_adamw = st.sidebar.checkbox(
+            "Muon DS fast aux AdamW",
+            value=True,
+            help=(
+                "Ускоренный путь для aux AdamW в distributed режиме: обновление локальных shard-параметров "
+                "без full gather. Обычно заметно быстрее на ZeRO-3/CPU offload."
+            ),
+        )
+        muon_ds_gather_bucket_numel = int(
+            st.sidebar.number_input(
+                "Muon DS gather bucket size (numel)",
+                min_value=1_000_000,
+                max_value=500_000_000,
+                value=50_000_000,
+                step=1_000_000,
+                help=(
+                    "Размер bucket для gather Muon-параметров. Меньше — ниже пик памяти, "
+                    "больше — меньше накладных расходов на gather/scatter."
+                ),
+            )
+        )
 
         muon_exclude_text = st.sidebar.text_input(
             "Muon exclude patterns (regex, comma-separated)",
@@ -4286,6 +4309,8 @@ def render_training_config():
         "muon_aux_adamw_eps": muon_aux_adamw_eps,
         "muon_ds_strict_mode": muon_ds_strict_mode,
         "muon_ds_profile_optimizer_step": muon_ds_profile_optimizer_step,
+        "muon_ds_fast_aux_adamw": muon_ds_fast_aux_adamw,
+        "muon_ds_gather_bucket_numel": muon_ds_gather_bucket_numel,
         "muon_hidden_patterns": muon_hidden_patterns,
         "muon_exclude_patterns": muon_exclude_patterns,
         "magma_prob": magma_prob,
