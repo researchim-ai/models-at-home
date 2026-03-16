@@ -68,6 +68,7 @@ protobuf
 streamlit>=1.32.0
 plotly>=5.18.0
 graphviz>=0.20.1
+jupyterlab>=4.2.0
 
 # Логирование
 wandb>=0.17.0

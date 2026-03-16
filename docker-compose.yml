@@ -23,6 +23,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - MKL_THREADING_LAYER=GNU
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-mah-local}
       # Единый writable cache root (избегаем permission проблем на bind-mounted /app)
       - HOME=/tmp
       - XDG_CACHE_HOME=/tmp/.cache
@@ -50,4 +51,62 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    restart: unless-stopped
+
+  notebooks:
+    image: models-at-home-studio:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: models-at-home-notebooks
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./datasets:/app/datasets
+      - ./out:/app/out
+      - ./.runs:/app/.runs
+      - ./blueprints:/app/blueprints
+      - ./models:/app/models
+      - ./configs:/app/configs
+      - ./notebooks:/app/notebooks
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MKL_THREADING_LAYER=GNU
+      - HOME=/tmp
+      - XDG_CACHE_HOME=/tmp/.cache
+      - HF_HOME=/tmp/.cache/huggingface
+      - HF_DATASETS_CACHE=/tmp/.cache/huggingface/datasets
+      - HUGGINGFACE_HUB_CACHE=/tmp/.cache/huggingface/hub
+      - TRITON_CACHE_DIR=/tmp/.cache/triton
+      - TORCH_HOME=/tmp/.cache/torch
+      - TORCHINDUCTOR_CACHE_DIR=/tmp/.cache/torchinductor
+      - CUDA_CACHE_PATH=/tmp/.cache/nv
+      - NUMBA_CACHE_DIR=/tmp/.cache/numba
+      - MPLCONFIGDIR=/tmp/.cache/matplotlib
+      - PIP_CACHE_DIR=/tmp/.cache/pip
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-mah-local}
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      bash -lc "
+      mkdir -p /tmp/.ipython/profile_default/startup /app/notebooks &&
+      cp /app/scripts/jupyter/startup/00_homellm.py /tmp/.ipython/profile_default/startup/00_homellm.py &&
+      jupyter lab
+      --ip=0.0.0.0
+      --port=8888
+      --no-browser
+      --ServerApp.allow_origin='*'
+      --ServerApp.allow_remote_access=True
+      --IdentityProvider.token='${JUPYTER_TOKEN:-mah-local}'
+      --ServerApp.password=''
+      --ServerApp.tornado_settings='{\"headers\":{\"Content-Security-Policy\":\"frame-ancestors http://localhost:8501 http://127.0.0.1:8501\"}}'
+      --ServerApp.root_dir=/app/notebooks
+      "
     restart: unless-stopped
