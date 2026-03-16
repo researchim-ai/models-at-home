@@ -20,9 +20,11 @@
 - **Continual Pretraining** — Continue training an existing model on new data
 - **SFT (Supervised Fine-Tuning)** — Train model to follow instructions and chat
 - **GRPO (Group Relative Policy Optimization)** — Reinforcement Learning for reasoning tasks
+- **VLM SFT** — Fine-tune Vision-Language Models (e.g. LLaVA) on image + text data (see **VLM Studio** page)
 
 ### 🖥️ Visual Interface
 - **Browser-based GUI** — Configure, launch, and monitor training without writing code
+- **VLM Studio** — Dedicated page for Vision-Language Models: SFT tuning, chat with images, data preview
 - **Real-time Monitoring** — Live graphs for loss, learning rate, GPU utilization
 - **Run History** — Track all experiments with logs and checkpoints
 - **Built-in Documentation** — Tutorials and references right in the app
@@ -156,9 +158,12 @@ models-at-home/
 │   ├── training/               # Training scripts
 │   │   ├── pretrain.py         # Pretraining
 │   │   ├── sft.py              # Supervised Fine-Tuning
+│   │   ├── vlm_sft.py          # VLM SFT (e.g. LLaVA)
 │   │   └── rl/                 # Reinforcement Learning (GRPO)
 │   ├── app/                    # Streamlit GUI
 │   │   ├── LLM.py              # Main application
+│   │   ├── pages/
+│   │   │   └── 05_VLM_Studio.py # VLM Studio page
 │   │   └── docs.py             # Built-in documentation
 │   ├── cli/                    # Command-line interface
 │   │   └── chat.py             # Interactive chat
@@ -214,6 +219,16 @@ Test your trained model:
 2. Select model or checkpoint
 3. Configure generation parameters
 4. Start chatting!
+
+### 5. VLM Studio (Vision-Language Models)
+
+Tune and chat with VLMs (e.g. LLaVA, Qwen2-VL):
+
+1. Open **VLM Studio** from the sidebar (or navigate to the VLM Studio page)
+2. **Launch**: Choose base VLM (HF ID or local path), dataset (JSONL with `image` + `conversations` or `caption`), tuning (LoRA/QLoRA/full), and hyperparameters → Start VLM SFT
+3. **Monitoring**: View loss, steps, and logs for VLM runs
+4. **Chat**: Upload an image and prompt; select a VLM to get a response
+5. **Data**: Preview JSONL rows (image thumbnail + text). Format: `{"image": "path_or_url", "conversations": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}` or `{"image": "...", "caption": "..."}`
 
 ---
 

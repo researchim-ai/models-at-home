@@ -18,12 +18,17 @@ from .rl.rewards import (
     FormatReward,
 )
 
+from .vlm_sft import VLMSFTDataset, run_vlm_sft
+
 __all__ = [
     # Pretrain
     "StreamingTextDataset",
     "pretrain_main",
     # SFT
     "SFTDataset",
+    # VLM SFT
+    "VLMSFTDataset",
+    "run_vlm_sft",
     # GRPO/RL
     "GRPOConfig",
     "GRPOTrainer", 
