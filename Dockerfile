@@ -71,11 +71,16 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-deps vllm \
  && uv pip install vllm --no-build-isolation 2>/dev/null || true
 
-# 5. DeepSpeed
+# 5. llama.cpp Python bindings с CUDA
+RUN --mount=type=cache,target=/root/.cache/uv \
+    CMAKE_ARGS="-DGGML_CUDA=on" FORCE_CMAKE=1 \
+    uv pip install llama-cpp-python
+
+# 6. DeepSpeed
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install deepspeed
 
-# 6. Unsloth — ставим ПОСЛЕ основных пакетов с --no-deps
+# 7. Unsloth — ставим ПОСЛЕ основных пакетов с --no-deps
 # чтобы не перезаписывать уже установленные transformers/peft/trl
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-deps unsloth unsloth-zoo \
