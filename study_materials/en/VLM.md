@@ -4,6 +4,33 @@ A detailed study guide on Vision-Language Models (VLM): what they are made of, h
 
 ---
 
+## 2026 Practice: tuning small VLMs at home
+
+If the goal is a practical home-lab workflow on 24GB or 2x3090 rather than cluster-scale research, the default strategy is usually:
+
+- use `LoRA`/`QLoRA` instead of full fine-tuning;
+- treat `Qwen 3.5 0.8B` and `Qwen 3.5 2B` as the main small-VLM defaults;
+- keep `Qwen2.5-VL` and `LLaVA-NeXT` as mature instruct-oriented fallbacks;
+- for small `pretrain`, do **continued multimodal pretraining/alignment** on caption/OCR/VQA data rather than training from scratch;
+- keep `gradient checkpointing`, `BF16`, and `FlashAttention 2` enabled by default, and often freeze the vision tower for early runs.
+
+Practical scenarios that map well to home hardware:
+
+| Scenario | Best use |
+|---------|----------|
+| `FastSFT_0.8B_24GB` | Fast instruction tuning on 0.8B with `QLoRA`, small batches, and moderate visual token budget |
+| `FastSFT_2B_2x3090` | Main general-purpose setup for 2B VLMs on two 3090 GPUs |
+| `SmallPretrain_0.8B_caption_alignment` | Small multimodal pretrain/alignment on caption and OCR-like corpora |
+| `OCRTune_2B_doc_qa` | Fine-tuning for documents, screenshots, tables, and OCR-heavy tasks |
+| `ExperimentalVLM_GRPO` | Experimental reward-guided optimization for image-conditioned answers |
+
+Important details for modern Qwen-style VLMs:
+
+- they have a real **visual token budget**, so `min_pixels`/`max_pixels` directly affect memory and quality;
+- message-based data is better than plain strings because it matches the model’s real chat template;
+- short, clean, unambiguous answers usually work better for SFT than long fuzzy responses;
+- for OCR/doc/UI tasks it is often more useful to raise visual resolution than to keep increasing `seq_len`.
+
 ## What You Need to Know in Advance (Minimum)
 
 To follow the material from scratch, this picture is enough:

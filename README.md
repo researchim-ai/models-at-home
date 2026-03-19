@@ -222,13 +222,28 @@ Test your trained model:
 
 ### 5. VLM Studio (Vision-Language Models)
 
-Tune and chat with VLMs (e.g. LLaVA, Qwen2-VL):
+Tune and chat with modern VLMs including `Qwen/Qwen3.5-0.8B`, `Qwen/Qwen3.5-2B`, `Qwen2.5-VL`, and `LLaVA-NeXT`:
 
-1. Open **VLM Studio** from the sidebar (or navigate to the VLM Studio page)
-2. **Launch**: Choose base VLM (HF ID or local path), dataset (JSONL with `image` + `conversations` or `caption`), tuning (LoRA/QLoRA/full), and hyperparameters → Start VLM SFT
-3. **Monitoring**: View loss, steps, and logs for VLM runs
-4. **Chat**: Upload an image and prompt; select a VLM to get a response
-5. **Data**: Preview JSONL rows (image thumbnail + text). Format: `{"image": "path_or_url", "conversations": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}` or `{"image": "...", "caption": "..."}`
+1. Open **VLM Studio** from the sidebar
+2. Pick a built-in scenario preset such as `FastSFT_0.8B_24GB`, `FastSFT_2B_2x3090`, `SmallPretrain_0.8B_caption_alignment`, `OCRTune_2B_doc_qa`, or `ExperimentalVLM_GRPO`
+3. **Launch**: choose `vlm_pretrain`, `vlm_sft`, or `vlm_grpo`, then select the base VLM, train/val dataset, tuning method, freeze policy, `min_pixels/max_pixels`, GPU count, and optimization hyperparameters
+4. **Monitoring**: inspect loss, reward, ETA, GPU usage, sample outputs, stdout/stderr, and checkpoints
+5. **Chat**: upload an image and prompt, select a base or fine-tuned VLM, and control `system prompt`, `temperature`, and `max_new_tokens`
+6. **History**: resume SFT/pretrain runs, jump into monitoring, send the final model to chat, or delete a run
+7. **Data**: use schema-aware preview for local JSONL datasets and convert HuggingFace datasets such as `llava-instruct-mix-vsft`, `Vision-Flan`, COCO, and LLaVA-Pretrain
+
+Recommended VLM dataset schemas:
+
+- `single_image_messages`: `{"image": "path_or_url", "messages": [{"role": "user", "content": [{"type":"image"}, {"type":"text","text":"..."}]}, {"role":"assistant","content":[{"type":"text","text":"..."}]}]}`
+- `single_image_caption`: `{"image": "path_or_url", "caption": "..."}`
+- `ocr_or_doc_qa`: `{"image": "path_or_url", "question": "...", "answer": "..."}`
+
+Home-lab best practices:
+
+- Prefer `QLoRA` over full fine-tuning on 24GB or 2x3090 setups
+- Keep `gradient checkpointing` and `FlashAttention 2` enabled for `Qwen 3.5 0.8B/2B`
+- Use caption/OCR/VQA corpora with low learning rates for small-task multimodal pretraining
+- Increase `max_pixels` for OCR/doc tasks, then compensate with a lower `batch_size`
 
 ---
 

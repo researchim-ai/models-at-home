@@ -219,13 +219,29 @@ models-at-home/
 
 ### 5. VLM Studio (Vision-Language модели)
 
-Тюнинг и чат с VLM (LLaVA, Qwen2-VL и др.):
+Тюнинг и чат с современными VLM, включая `Qwen/Qwen3.5-0.8B`, `Qwen/Qwen3.5-2B`, `Qwen2.5-VL` и `LLaVA-NeXT`:
 
 1. Откройте **VLM Studio** из сайдбара
-2. **Запуск**: выберите базовую VLM (HF ID или локальный путь), датасет (JSONL с полями `image` и `conversations`/`caption`), метод тюнинга (LoRA/QLoRA/full) и гиперпараметры → Запустить VLM SFT
-3. **Мониторинг**: просмотр loss, шагов и логов по запускам VLM
-4. **Чат**: загрузите изображение и вопрос, выберите VLM для ответа
-5. **Данные**: превью записей JSONL (миниатюра изображения + текст). Формат: `{"image": "path_or_url", "conversations": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}` или `{"image": "...", "caption": "..."}`
+2. **Сценарий**: выберите один из готовых пресетов:
+   `FastSFT_0.8B_24GB`, `FastSFT_2B_2x3090`, `SmallPretrain_0.8B_caption_alignment`, `OCRTune_2B_doc_qa`, `ExperimentalVLM_GRPO`
+3. **Запуск**: выберите стадию `vlm_pretrain`, `vlm_sft` или `vlm_grpo`, базовую VLM, train/val dataset, метод тюнинга, freeze-policy, `min_pixels/max_pixels`, GPU и гиперпараметры
+4. **Мониторинг**: просмотр loss, reward, ETA, GPU, sample outputs, stdout/stderr и чекпоинтов по VLM-запускам
+5. **Чат**: загрузите изображение и вопрос, выберите базовую или дообученную VLM, настройте `system prompt`, `temperature` и `max_new_tokens`
+6. **История**: resume SFT/pretrain, переход в мониторинг, выбор финальной модели для чата, удаление эксперимента
+7. **Данные**: schema-aware preview локальных JSONL-датасетов и конвертация из HuggingFace (`llava-instruct-mix-vsft`, `Vision-Flan`, COCO, LLaVA-Pretrain)
+
+Рекомендуемый формат данных для VLM:
+
+- `single_image_messages`: `{"image": "path_or_url", "messages": [{"role": "user", "content": [{"type":"image"}, {"type":"text","text":"..."}]}, {"role":"assistant","content":[{"type":"text","text":"..."}]}]}`
+- `single_image_caption`: `{"image": "path_or_url", "caption": "..." }`
+- `ocr_or_doc_qa`: `{"image": "path_or_url", "question": "...", "answer": "..." }`
+
+Практические дефолты для домашнего железа:
+
+- Для 24GB или 2x3090 используйте `QLoRA`, а не full finetune
+- Для `Qwen 3.5 0.8B/2B` оставляйте включёнными `gradient checkpointing` и `FlashAttention 2`
+- Для small-task pretrain используйте caption/OCR/VQA корпуса с низким LR и часто с `freeze_vision_tower=true`
+- Для OCR/doc задач повышайте `max_pixels`, но компенсируйте это меньшим `batch_size`
 
 ---
 

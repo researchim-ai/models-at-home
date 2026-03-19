@@ -18,7 +18,11 @@ from .rl.rewards import (
     FormatReward,
 )
 
+from .vlm_common import MetricsLogger
+from .vlm_data import VLMDataCollator, VLMJsonlDataset
+from .vlm_pretrain import run_vlm_pretrain
 from .vlm_sft import VLMSFTDataset, run_vlm_sft
+from .vlm_grpo import run_vlm_grpo
 
 __all__ = [
     # Pretrain
@@ -27,8 +31,13 @@ __all__ = [
     # SFT
     "SFTDataset",
     # VLM SFT
+    "MetricsLogger",
+    "VLMDataCollator",
+    "VLMJsonlDataset",
     "VLMSFTDataset",
     "run_vlm_sft",
+    "run_vlm_pretrain",
+    "run_vlm_grpo",
     # GRPO/RL
     "GRPOConfig",
     "GRPOTrainer", 
