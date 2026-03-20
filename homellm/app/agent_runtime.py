@@ -9,25 +9,28 @@ from typing import Any, Dict, List, Tuple
 
 from .agent_tools import execute_tool, get_tool_specs
 
-SYSTEM_PROMPT = """Ты внутренний агент Models at Home Studio.
+AGENT_PROMPT_SECTIONS: Dict[str, str] = {
+    "role": """Ты внутренний агент Models at Home Studio.
+Твоя задача — помогать пользователю готовить, запускать и сопровождать обучение моделей внутри студии.""",
+    "capabilities": """Твои возможности:
+- анализировать локальные trainable-модели, датасеты и готовые training presets;
+- запускать text/VLM training и ТОНКО НАСТРАИВАТЬ любые гиперпараметры (learning_rate, batch_size, lora_r, epochs и т.д.);
+- проверять статус run, читать config, metrics и логи;
+- подсказывать, какой preset или конфиг лучше подходит под задачу пользователя;
+- выполнять bash-команды внутри контейнера через run_system_command (например: nvidia-smi, ls, free -h).""",
+    "rules": """Правила:
+- не выдумывай состояние файлов, моделей, датасетов и процессов, если это можно проверить tool'ом;
+- используй run_system_command для проверки системного железа и нагрузки (GPU, RAM), если пользователь просит;
+- если пользователь просит запустить обучение, но не указал конкретную модель или датасет — выбери наиболее разумные/подходящие локальные файлы сам по умолчанию и сразу запускай процесс, не задавай лишних уточняющих вопросов;
+- перед запуском обучения быстро проверяй наличие датасета и модели;
+- не предлагай GGUF-файлы llama.cpp как базовые модели для обучения: они используются только для inference;
+- не вызывай больше 2 tools за один шаг;
+- если запускаешь run, обязательно сообщай пользователю, что именно стартуешь и почему;
+- не говори, что обучение успешно запущено, если tool вернул ошибку или run умер сразу после старта;
+- если запущен run, предлагай пользователю смотреть плашку активного процесса, конфиг, логи и графики на странице;""",
+    "output_contract": """Ты ОБЯЗАН отвечать строго одним JSON-объектом без markdown и без пояснений вокруг.
 
-Твоя задача:
-- помогать пользователю готовить и запускать обучение LLM/VLM;
-- использовать доступные tools для проверки моделей, датасетов и запуска run;
-- предлагать реалистичные конфиги, а не абстрактные советы;
-- не выдумывать состояние файлов, моделей и датасетов, если можно проверить tool'ом.
-
-Правила поведения:
-- Если для ответа нужна фактическая информация о локальном проекте, сначала вызывай tool.
-- Перед запуском обучения проверяй, что есть датасет, базовая модель и разумный output_dir.
-- Не вызывай больше 2 tools за один шаг.
-- Если пользователь просит план, сначала собери контекст tool'ами и только потом формируй план.
-- Если запускаешь обучение, коротко объясни, что именно стартуешь и почему такой preset.
-- Если данных недостаточно, попроси уточнение, а не придумывай.
-
-Ты ОБЯЗАН отвечать строго одним JSON-объектом без markdown и без пояснений вокруг.
-
-Формат ответа:
+Формат:
 {
   "assistant_message": "текст для пользователя",
   "tool_calls": [
@@ -36,13 +39,19 @@ SYSTEM_PROMPT = """Ты внутренний агент Models at Home Studio.
   "final": false
 }
 
-Требования к JSON:
-- Всегда включай ключи assistant_message, tool_calls, final.
-- assistant_message должен быть строкой.
-- tool_calls должен быть массивом.
-- final должен быть true только если уже готов финальный ответ пользователю на этот ход.
-- Если вызываешь tools, не пиши длинный финальный ответ заранее.
-"""
+Требования:
+- всегда включай assistant_message, tool_calls, final;
+- assistant_message должен быть строкой;
+- tool_calls должен быть массивом;
+- final=true только если уже готов финальный ответ на текущий ход;
+- если вызываешь tools, не пиши заранее длинный финальный ответ.""",
+}
+
+SYSTEM_PROMPT = "\n\n".join(AGENT_PROMPT_SECTIONS.values())
+
+
+def get_agent_prompt_sections() -> Dict[str, str]:
+    return AGENT_PROMPT_SECTIONS
 
 
 @dataclass
@@ -99,22 +108,36 @@ def _format_tool_history(history: List[Dict[str, Any]]) -> str:
     return _serialize_json(history)
 
 
-def build_agent_prompt(
+def build_agent_messages(
     conversation: List[Dict[str, str]],
     tool_history: List[Dict[str, Any]],
-) -> str:
-    return "\n\n".join(
+) -> List[Dict[str, str]]:
+    system_content = "\n\n".join(
         [
             SYSTEM_PROMPT,
             "Доступные tools:",
             _serialize_json(get_tool_specs()),
-            "История диалога:",
-            _format_conversation(conversation),
-            "История tool usage в этом ходе:",
-            _format_tool_history(tool_history),
-            "Сформируй следующий JSON-ответ сейчас.",
         ]
     )
+    
+    messages = [{"role": "system", "content": system_content}]
+    for msg in conversation:
+        if msg.get("role") == "system":
+            continue
+        messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+        
+    if tool_history:
+        messages.append({
+            "role": "user",
+            "content": f"История tool usage в этом ходе:\n{_format_tool_history(tool_history)}\n\nСформируй следующий JSON-ответ сейчас."
+        })
+    else:
+        if messages[-1]["role"] != "user":
+            messages.append({"role": "user", "content": "Сформируй следующий JSON-ответ сейчас."})
+        else:
+            messages[-1]["content"] = messages[-1]["content"] + "\n\nСформируй следующий JSON-ответ сейчас."
+            
+    return messages
 
 
 def run_agent_turn(
@@ -132,15 +155,29 @@ def run_agent_turn(
     trace: List[Dict[str, Any]] = []
 
     for step in range(1, max_steps + 1):
-        prompt = build_agent_prompt(conversation=conversation, tool_history=tool_history)
-        raw = backend.generate(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            stop=["</tool_result>", "\nUSER:\n", "\nSYSTEM:\n"],
-        )
+        messages = build_agent_messages(conversation=conversation, tool_history=tool_history)
+        prompt_text = "\n\n".join([msg.get("content", "") for msg in messages])
+        
+        # Fallback for backends that don't support chat_completion
+        if not hasattr(backend, "chat_completion"):
+            raw = backend.generate(
+                prompt=prompt_text,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                stop=["</tool_result>", "\nUSER:\n", "\nSYSTEM:\n"],
+            )
+        else:
+            raw = backend.chat_completion(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                stop=["</tool_result>"],
+            )
+            
         parsed: Dict[str, Any]
         tool_results: List[Dict[str, Any]] = []
         try:
@@ -158,7 +195,7 @@ def run_agent_turn(
             trace.append(
                 AgentStep(
                     step=step,
-                    prompt=prompt,
+                    prompt=prompt_text,
                     raw_response=raw,
                     parsed=parsed,
                     tool_results=[],
@@ -185,7 +222,7 @@ def run_agent_turn(
         trace.append(
             AgentStep(
                 step=step,
-                prompt=prompt,
+                prompt=prompt_text,
                 raw_response=raw,
                 parsed=parsed,
                 tool_results=tool_results,

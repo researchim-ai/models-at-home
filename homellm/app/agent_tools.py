@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -110,21 +111,25 @@ VLM_TRAINING_PRESETS: Dict[str, Dict[str, Any]] = {
 TOOL_SPECS: List[Dict[str, Any]] = [
     {
         "name": "list_training_capabilities",
+        "category": "discovery",
         "description": "Показывает доступные типы обучения и краткие рекомендации по выбору пайплайна.",
         "arguments": {},
     },
     {
         "name": "list_local_models",
-        "description": "Показывает локальные базовые модели, GGUF-файлы, адаптеры и результаты тренировок.",
+        "category": "discovery",
+        "description": "Показывает локальные trainable-модели, адаптеры и результаты тренировок. GGUF для inference сюда не входят.",
         "arguments": {},
     },
     {
         "name": "list_datasets",
+        "category": "discovery",
         "description": "Показывает доступные локальные датасеты из папки datasets/.",
         "arguments": {},
     },
     {
         "name": "preview_dataset",
+        "category": "discovery",
         "description": "Читает несколько примеров из локального JSON/JSONL/TXT датасета.",
         "arguments": {
             "path": "str, относительный путь внутри datasets/ или абсолютный путь",
@@ -133,6 +138,7 @@ TOOL_SPECS: List[Dict[str, Any]] = [
     },
     {
         "name": "get_training_presets",
+        "category": "planning",
         "description": "Возвращает готовые пресеты для text/VLM обучения.",
         "arguments": {
             "domain": "str: text | vlm | all",
@@ -140,27 +146,55 @@ TOOL_SPECS: List[Dict[str, Any]] = [
     },
     {
         "name": "start_text_training",
-        "description": "Запускает text training через существующий trainer_worker.py.",
+        "category": "execution",
+        "description": "Запускает text training. У тебя есть ПОЛНЫЙ доступ к тонкой настройке: ты можешь передавать любые гиперпараметры (learning_rate, batch_size, lora_r, lora_alpha, gradient_accumulation, seq_len и т.д.).",
         "arguments": {
-            "config": "dict с training config. Можно взять пресет и доопределить data_path/base_model_path/output_dir.",
+            "config": "dict с training config. Можно взять базовый пресет и переопределить в нем любые параметры под задачу пользователя.",
         },
     },
     {
         "name": "start_vlm_training",
-        "description": "Запускает VLM pretrain/SFT/GRPO через существующие воркеры.",
+        "category": "execution",
+        "description": "Запускает VLM training. У тебя есть ПОЛНЫЙ доступ к тонкой настройке: передавай в config любые нужные гиперпараметры, как это делал бы пользователь в UI.",
         "arguments": {
-            "config": "dict с stage=vlm_pretrain|vlm_sft|vlm_grpo и остальными параметрами.",
+            "config": "dict с stage=vlm_pretrain|vlm_sft|vlm_grpo и любыми другими параметрами обучения (LR, epochs, batch_size, LoRA params и т.д.).",
+        },
+    },
+    {
+        "name": "list_runs",
+        "category": "monitoring",
+        "description": "Показывает agent-run'ы и их текущее состояние.",
+        "arguments": {
+            "status": "str: running | finished | all",
         },
     },
     {
         "name": "get_run_status",
+        "category": "monitoring",
         "description": "Показывает состояние run по metrics.json и process PID.",
         "arguments": {
             "run_id": "str",
         },
     },
     {
+        "name": "get_run_config",
+        "category": "monitoring",
+        "description": "Возвращает полный config.json указанного run.",
+        "arguments": {
+            "run_id": "str",
+        },
+    },
+    {
+        "name": "get_run_metrics",
+        "category": "monitoring",
+        "description": "Возвращает metrics.json указанного run для графиков и диагностики.",
+        "arguments": {
+            "run_id": "str",
+        },
+    },
+    {
         "name": "read_run_logs",
+        "category": "monitoring",
         "description": "Читает хвост stdout/stderr логов run.",
         "arguments": {
             "run_id": "str",
@@ -169,9 +203,18 @@ TOOL_SPECS: List[Dict[str, Any]] = [
     },
     {
         "name": "stop_run",
+        "category": "control",
         "description": "Останавливает запущенный train/job по PID.",
         "arguments": {
             "run_id": "str",
+        },
+    },
+    {
+        "name": "run_system_command",
+        "category": "execution",
+        "description": "Выполняет системную bash-команду внутри контейнера для проверки хардвера (nvidia-smi, lscpu, free -h) или навигации.",
+        "arguments": {
+            "command": "str, bash команда"
         },
     },
 ]
@@ -179,6 +222,36 @@ TOOL_SPECS: List[Dict[str, Any]] = [
 
 def get_tool_specs() -> List[Dict[str, Any]]:
     return TOOL_SPECS
+
+
+def get_tool_groups() -> List[Dict[str, Any]]:
+    return [
+        {
+            "category": "discovery",
+            "title": "Разведка и входные данные",
+            "tools": [tool for tool in TOOL_SPECS if tool.get("category") == "discovery"],
+        },
+        {
+            "category": "planning",
+            "title": "Планирование и пресеты",
+            "tools": [tool for tool in TOOL_SPECS if tool.get("category") == "planning"],
+        },
+        {
+            "category": "execution",
+            "title": "Запуск обучения",
+            "tools": [tool for tool in TOOL_SPECS if tool.get("category") == "execution"],
+        },
+        {
+            "category": "monitoring",
+            "title": "Мониторинг run",
+            "tools": [tool for tool in TOOL_SPECS if tool.get("category") == "monitoring"],
+        },
+        {
+            "category": "control",
+            "title": "Управление процессами",
+            "tools": [tool for tool in TOOL_SPECS if tool.get("category") == "control"],
+        },
+    ]
 
 
 def list_training_capabilities() -> Dict[str, Any]:
@@ -201,6 +274,7 @@ def list_training_capabilities() -> Dict[str, Any]:
             "Для text SFT safest путь: trainer_worker с config.json.",
             "Для agentic workflows лучше запускать обучение отдельным процессом и мониторить через .runs/.",
             "Для локального агента inference идет через llama.cpp, а train через существующие Python workers.",
+            "GGUF-файлы используются только для локального inference агента и не должны предлагаться как базовые модели для обучения.",
         ],
     }
 
@@ -240,17 +314,6 @@ def _tail_lines(path: Path, max_lines: int = 80) -> List[str]:
 def list_local_models() -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
 
-    for gguf in MODELS_DIR.rglob("*.gguf"):
-        items.append(
-            {
-                "kind": "gguf",
-                "name": gguf.name,
-                "path": _safe_relpath(gguf),
-                "size_gb": round(gguf.stat().st_size / (1024**3), 2),
-                "modified_at": datetime.fromtimestamp(gguf.stat().st_mtime).isoformat(),
-            }
-        )
-
     for model_dir in MODELS_DIR.iterdir():
         if not model_dir.is_dir():
             continue
@@ -283,7 +346,14 @@ def list_local_models() -> Dict[str, Any]:
         )
 
     items.sort(key=lambda item: item.get("modified_at", ""), reverse=True)
-    return {"models": items[:200], "count": len(items)}
+    return {
+        "models": items[:200],
+        "count": len(items),
+        "notes": [
+            "В выдачу включаются только trainable-модели и артефакты обучения.",
+            "GGUF-файлы для llama.cpp намеренно скрыты, потому что они используются только для inference и не подходят как база для training.",
+        ],
+    }
 
 
 def list_datasets() -> Dict[str, Any]:
@@ -351,12 +421,13 @@ def get_training_presets(domain: str = "all") -> Dict[str, Any]:
     return result
 
 
-def _write_initial_metrics(metrics_path: Path, stage: str) -> None:
+def _write_initial_metrics(metrics_path: Path, stage: str, model_name_input: str = "agent_run") -> None:
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "status": "starting",
                 "stage": stage,
+                "model_name_input": model_name_input,
                 "current_step": 0,
                 "started_at": datetime.now().isoformat(),
             },
@@ -379,7 +450,7 @@ def _spawn_run(run_id: str, cmd: List[str], env: Dict[str, str], stage: str, con
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False, default=str)
-    _write_initial_metrics(metrics_path, stage=stage)
+    _write_initial_metrics(metrics_path, stage=stage, model_name_input=config.get("model_name_input", "agent_run"))
     with open(command_path, "w", encoding="utf-8") as f:
         f.write(" ".join(cmd))
 
@@ -401,6 +472,31 @@ def _spawn_run(run_id: str, cmd: List[str], env: Dict[str, str], stage: str, con
     with open(pid_path, "w", encoding="utf-8") as f:
         f.write(str(process.pid))
 
+    # Guard against immediate startup failures so the agent does not report
+    # "training launched" for runs that crash before the first metrics update.
+    time.sleep(1.5)
+    exit_code = process.poll()
+    if exit_code is not None:
+        stderr_tail = _tail_lines(stderr_path, max_lines=40)
+        stdout_tail = _tail_lines(stdout_path, max_lines=40)
+        error_message = "\n".join(stderr_tail[-12:] or stdout_tail[-12:] or [f"Process exited with code {exit_code}"])
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "status": "error",
+                    "stage": stage,
+                    "current_step": 0,
+                    "total_steps": 0,
+                    "finished_at": datetime.now().isoformat(),
+                    "error": error_message,
+                    "exit_code": exit_code,
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+        raise RuntimeError(f"Run failed during startup: {error_message}")
+
     return {
         "run_id": run_id,
         "pid": process.pid,
@@ -421,6 +517,8 @@ def start_text_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     if not cfg.get("output_dir"):
         cfg["output_dir"] = f"out/agent/text/{stage}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if not cfg.get("model_name_input"):
+        cfg["model_name_input"] = Path(cfg["output_dir"]).name
 
     run_id = f"agent_text_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_output_dir = (PROJECT_ROOT / cfg["output_dir"]).resolve() / run_id
@@ -434,7 +532,7 @@ def start_text_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False, default=str)
-    _write_initial_metrics(metrics_path, stage=stage)
+    _write_initial_metrics(metrics_path, stage=stage, model_name_input=cfg.get("model_name_input", "agent_run"))
 
     distributed_mode = cfg.get("distributed_mode", "default")
     config_file = cfg.get("config_file")
@@ -488,6 +586,8 @@ def start_vlm_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     if not cfg.get("output_dir"):
         cfg["output_dir"] = f"out/agent/vlm/{stage}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if not cfg.get("model_name_input"):
+        cfg["model_name_input"] = Path(cfg["output_dir"]).name
 
     run_id = f"agent_vlm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_output_dir = (PROJECT_ROOT / cfg["output_dir"]).resolve() / run_id
@@ -501,7 +601,7 @@ def start_vlm_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False, default=str)
-    _write_initial_metrics(metrics_path, stage=stage)
+    _write_initial_metrics(metrics_path, stage=stage, model_name_input=cfg.get("model_name_input", "agent_vlm_run"))
 
     distributed_mode = cfg.get("distributed_mode", "default")
     config_file = cfg.get("config_file")
@@ -578,6 +678,42 @@ def get_run_status(run_id: str) -> Dict[str, Any]:
     }
 
 
+def get_run_config(run_id: str) -> Dict[str, Any]:
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise FileNotFoundError(f"Run not found: {run_id}")
+    return {
+        "run_id": run_id,
+        "config": _load_json_if_exists(run_dir / "config.json"),
+    }
+
+
+def get_run_metrics(run_id: str) -> Dict[str, Any]:
+    run_dir = RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise FileNotFoundError(f"Run not found: {run_id}")
+    return {
+        "run_id": run_id,
+        "metrics": _load_json_if_exists(run_dir / "metrics.json"),
+    }
+
+
+def list_runs(status: str = "all") -> Dict[str, Any]:
+    wanted = str(status or "all").lower()
+    runs: List[Dict[str, Any]] = []
+    for run_dir in sorted(RUNS_DIR.iterdir(), reverse=True):
+        if not run_dir.is_dir() or not run_dir.name.startswith("agent_"):
+            continue
+        run_status = get_run_status(run_dir.name)
+        is_running = bool(run_status.get("is_running"))
+        if wanted == "running" and not is_running:
+            continue
+        if wanted == "finished" and is_running:
+            continue
+        runs.append(run_status)
+    return {"status_filter": wanted, "runs": runs[:50], "count": len(runs)}
+
+
 def read_run_logs(run_id: str, max_lines: int = 80) -> Dict[str, Any]:
     run_dir = RUNS_DIR / run_id
     if not run_dir.exists():
@@ -605,6 +741,26 @@ def stop_run(run_id: str) -> Dict[str, Any]:
         return {"run_id": run_id, "stopped": False, "reason": str(exc)}
 
 
+def run_system_command(command: str) -> Dict[str, Any]:
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return {
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+            "returncode": result.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": "Timeout", "stdout": "", "stderr": "", "returncode": -1}
+    except Exception as exc:
+        return {"error": str(exc), "stdout": "", "stderr": "", "returncode": -1}
+
+
 def execute_tool(tool_name: str, arguments: Dict[str, Any] | None = None) -> Dict[str, Any]:
     args = arguments or {}
     registry = {
@@ -615,9 +771,13 @@ def execute_tool(tool_name: str, arguments: Dict[str, Any] | None = None) -> Dic
         "get_training_presets": lambda: get_training_presets(domain=str(args.get("domain", "all"))),
         "start_text_training": lambda: start_text_training(config=dict(args.get("config") or {})),
         "start_vlm_training": lambda: start_vlm_training(config=dict(args.get("config") or {})),
+        "list_runs": lambda: list_runs(status=str(args.get("status", "all"))),
         "get_run_status": lambda: get_run_status(run_id=str(args.get("run_id", ""))),
+        "get_run_config": lambda: get_run_config(run_id=str(args.get("run_id", ""))),
+        "get_run_metrics": lambda: get_run_metrics(run_id=str(args.get("run_id", ""))),
         "read_run_logs": lambda: read_run_logs(run_id=str(args.get("run_id", "")), max_lines=int(args.get("max_lines", 80))),
         "stop_run": lambda: stop_run(run_id=str(args.get("run_id", ""))),
+        "run_system_command": lambda: run_system_command(command=str(args.get("command", ""))),
     }
     if tool_name not in registry:
         raise ValueError(f"Unknown tool: {tool_name}")

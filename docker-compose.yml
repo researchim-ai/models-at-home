@@ -8,6 +8,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        LLAMA_CPP_BACKEND: ${LLAMA_CPP_BACKEND:-vulkan}
     container_name: models-at-home
     user: "${UID:-1000}:${GID:-1000}"
     ports:
@@ -25,12 +27,14 @@ services:
       - MKL_THREADING_LAYER=GNU
       - JUPYTER_TOKEN=${JUPYTER_TOKEN:-mah-local}
       - MAH_AGENT_AUTOLOAD=${MAH_AGENT_AUTOLOAD:-1}
-      - MAH_AGENT_CTX_SIZE=${MAH_AGENT_CTX_SIZE:-4096}
+      - MAH_AGENT_CPU_ONLY=${MAH_AGENT_CPU_ONLY:-0}
+      - MAH_AGENT_CTX_SIZE=${MAH_AGENT_CTX_SIZE:-262144}
       - MAH_AGENT_GPU_LAYERS=${MAH_AGENT_GPU_LAYERS:--1}
       - MAH_AGENT_MODEL=${MAH_AGENT_MODEL:-}
       - MAH_AGENT_MODEL_REPO=${MAH_AGENT_MODEL_REPO:-unsloth/Qwen3.5-9B-GGUF}
       - MAH_AGENT_MODEL_QUANT=${MAH_AGENT_MODEL_QUANT:-9B-UD-Q4_K_XL}
       - MAH_AGENT_MODEL_FILENAME=${MAH_AGENT_MODEL_FILENAME:-}
+      - NVIDIA_DRIVER_CAPABILITIES=all
       # Единый writable cache root (избегаем permission проблем на bind-mounted /app)
       - HOME=/tmp
       - XDG_CACHE_HOME=/tmp/.cache
@@ -65,6 +69,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        LLAMA_CPP_BACKEND: ${LLAMA_CPP_BACKEND:-vulkan}
     container_name: models-at-home-notebooks
     user: "${UID:-1000}:${GID:-1000}"
     ports:
@@ -93,6 +99,7 @@ services:
       - MPLCONFIGDIR=/tmp/.cache/matplotlib
       - PIP_CACHE_DIR=/tmp/.cache/pip
       - JUPYTER_TOKEN=${JUPYTER_TOKEN:-mah-local}
+      - NVIDIA_DRIVER_CAPABILITIES=all
     shm_size: "8gb"
     deploy:
       resources:

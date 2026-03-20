@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
 
+ARG LLAMA_CPP_BACKEND=vulkan
+
 ############################
 # 1) Builder stage
 ############################
@@ -10,6 +12,7 @@
 # - Flash Attention 2.8.3 (pre-built wheel для torch 2.9 + cu12 + Python 3.12)
 # - Liger Kernel 0.6.4 (чистый Python/Triton)
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS builder
+ARG LLAMA_CPP_BACKEND
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -22,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     libgl1 \
     libgomp1 \
+    libvulkan-dev \
  && add-apt-repository ppa:deadsnakes/ppa -y \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -71,10 +75,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-deps vllm \
  && uv pip install vllm --no-build-isolation 2>/dev/null || true
 
-# 5. llama.cpp Python bindings с CUDA
-RUN --mount=type=cache,target=/root/.cache/uv \
-    CMAKE_ARGS="-DGGML_CUDA=on" FORCE_CMAKE=1 \
-    uv pip install llama-cpp-python
+# 5. llama.cpp Python bindings intentionally omitted.
+# Agent Studio uses prebuilt external `llama-server`, which is downloaded at runtime.
+# This avoids very long source builds of `llama-cpp-python`, especially for Vulkan.
 
 # 6. DeepSpeed
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -101,6 +104,7 @@ RUN uv pip install -e .
 # 2) Runtime stage
 ############################
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS runtime
+ARG LLAMA_CPP_BACKEND
 
 LABEL com.modelsathome.image="models-at-home-studio"
 
@@ -113,7 +117,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-dev \
     libgl1 \
+    libegl1 \
+    libxext6 \
+    libx11-6 \
+    libxcb1 \
     libgomp1 \
+    libvulkan1 \
+    vulkan-tools \
     # Для JIT компиляции DeepSpeed ops (cpu_adam и др.)
     build-essential \
     ninja-build \
@@ -139,8 +149,9 @@ RUN mkdir -p /root/.triton/autotune
 
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
+ENV LLAMA_CPP_BACKEND=${LLAMA_CPP_BACKEND}
 ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV NVIDIA_DRIVER_CAPABILITIES=all
 ENV MKL_THREADING_LAYER=GNU
 ENV PYTHONUNBUFFERED=1
 
