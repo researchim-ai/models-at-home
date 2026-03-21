@@ -23,9 +23,11 @@ AGENT_PROMPT_SECTIONS: Dict[str, str] = {
 - используй run_system_command для проверки системного железа и нагрузки (GPU, RAM), если пользователь просит;
 - если пользователь просит запустить обучение, но не указал конкретную модель или датасет — выбери наиболее разумные/подходящие локальные файлы сам по умолчанию и сразу запускай процесс, не задавай лишних уточняющих вопросов;
 - перед запуском обучения быстро проверяй наличие датасета и модели;
+- строго используй только те названия параметров (ключи словаря), которые описаны в arguments tool'а (например: используй 'data_path', а не 'dataset_path'; 'epochs', а не 'num_epochs');
 - не предлагай GGUF-файлы llama.cpp как базовые модели для обучения: они используются только для inference;
 - не вызывай больше 2 tools за один шаг;
 - если запускаешь run, обязательно сообщай пользователю, что именно стартуешь и почему;
+- при успешном запуске обучения ОБЯЗАТЕЛЬНО дай пользователю ссылку `[Перейти к мониторингу (LLM Студия)](/)` или `[Перейти к мониторингу (VLM Студия)](/VLM_Studio)` и укажи Run ID, чтобы он мог перейти по ссылке;
 - не говори, что обучение успешно запущено, если tool вернул ошибку или run умер сразу после старта;
 - если запущен run, предлагай пользователю смотреть плашку активного процесса, конфиг, логи и графики на странице;""",
     "output_contract": """Ты ОБЯЗАН отвечать строго одним JSON-объектом без markdown и без пояснений вокруг.
@@ -69,6 +71,16 @@ def _serialize_json(data: Any) -> str:
 
 def _extract_json_object(text: str) -> str:
     text = text.strip()
+    
+    # Check for markdown codeblocks first
+    if "```json" in text:
+        parts = text.split("```json")
+        for part in parts[1:]:
+            if "```" in part:
+                candidate = part.split("```")[0].strip()
+                if candidate.startswith("{") and candidate.endswith("}"):
+                    return candidate
+                    
     if text.startswith("{") and text.endswith("}"):
         return text
 
@@ -149,6 +161,7 @@ def run_agent_turn(
     temperature: float = 0.2,
     top_p: float = 0.95,
     top_k: int = 40,
+    stream_callback: Any = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Run a multi-step agent loop and return final text plus execution trace."""
     tool_history: List[Dict[str, Any]] = []
@@ -169,14 +182,30 @@ def run_agent_turn(
                 stop=["</tool_result>", "\nUSER:\n", "\nSYSTEM:\n"],
             )
         else:
-            raw = backend.chat_completion(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                stop=["</tool_result>"],
-            )
+            if hasattr(backend, "chat_completion_stream") and stream_callback:
+                raw_chunks = []
+                stream_callback("\n\n") # add spacing between steps in stream
+                for chunk in backend.chat_completion_stream(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    stop=["</tool_result>"],
+                ):
+                    if chunk is not None:
+                        raw_chunks.append(chunk)
+                        stream_callback(chunk)
+                raw = "".join(raw_chunks)
+            else:
+                raw = backend.chat_completion(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    stop=["</tool_result>"],
+                )
             
         parsed: Dict[str, Any]
         tool_results: List[Dict[str, Any]] = []
@@ -207,10 +236,19 @@ def run_agent_turn(
         for tool_call in tool_calls:
             tool_name = str(tool_call.get("tool", "")).strip()
             arguments = tool_call.get("arguments") or {}
+            
+            if stream_callback:
+                stream_callback(f"\n\n*(Вызываю инструмент: `{tool_name}`...)*\n\n")
+                
             try:
                 result = execute_tool(tool_name, arguments)
+                if stream_callback:
+                    stream_callback(f"*(Инструмент `{tool_name}` успешно выполнен)*\n\n")
             except Exception as exc:
                 result = {"error": str(exc), "tool": tool_name, "arguments": arguments}
+                if stream_callback:
+                    stream_callback(f"*(Ошибка при вызове `{tool_name}`)*\n\n")
+                    
             tool_record = {
                 "tool": tool_name,
                 "arguments": arguments,

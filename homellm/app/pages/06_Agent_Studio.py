@@ -213,13 +213,103 @@ div[data-testid="stExpander"] {
     overflow: hidden;
 }
 
+/* Chat History Tabs using horizontal radio to look exactly like Cursor tabs */
+div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] > div[role="radiogroup"] {
+    display: flex;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    flex-direction: row;
+    gap: 0;
+    padding-bottom: 0;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+    margin-bottom: 1rem;
+}
+
+div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] > div[role="radiogroup"] label {
+    border-radius: 8px 8px 0 0;
+    border: none;
+    border-right: 1px solid rgba(148, 163, 184, 0.1);
+    background: transparent;
+    padding: 0.5rem 1.2rem;
+    margin: 0;
+    margin-bottom: -1px; /* Overlap the bottom border */
+    cursor: pointer;
+    transition: background 0.2s ease;
+}
+
+div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] > div[role="radiogroup"] label[data-checked="true"] {
+    background: rgba(15, 23, 42, 0.32);
+    border-top: 2px solid #3b82f6;
+    border-bottom: 1px solid rgba(15, 23, 42, 0.32); /* Blend with container */
+    box-shadow: none;
+}
+
+div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] > div[role="radiogroup"] label:hover:not([data-checked="true"]) {
+    background: rgba(148, 163, 184, 0.05);
+}
+
+/* Hide radio circles */
+div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] > div[role="radiogroup"] label div[data-testid="stMarkdownContainer"] p {
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: #94a3b8;
+    margin: 0;
+}
+div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] > div[role="radiogroup"] label[data-checked="true"] div[data-testid="stMarkdownContainer"] p {
+    color: #e2e8f0;
+    font-weight: 600;
+}
+div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] div[role="radiogroup"] label input,
+div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] div[role="radiogroup"] label div[class*="stRadio"] > div:first-child,
+div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] div[role="radiogroup"] label div[data-testid="stMarkdownContainer"] + div {
+    display: none !important;
+}
+
+/* Hide the little radio dot specifically */
+div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] div[role="radiogroup"] label > div:first-child {
+    display: none !important;
+}
+
 div[data-testid="stChatMessage"] {
-    border-radius: 20px;
-    border: 1px solid rgba(148, 163, 184, 0.12);
-    background: rgba(15, 23, 42, 0.34);
+    border-radius: 22px;
+    border: 1px solid rgba(148, 163, 184, 0.1);
     box-shadow: 0 10px 30px rgba(2, 6, 23, 0.10);
-    padding-top: 0.35rem;
-    padding-bottom: 0.35rem;
+    padding: 1.2rem 1.2rem;
+    margin-bottom: 1.2rem;
+    font-size: 0.95rem;
+}
+
+div[data-testid="stChatMessage"][data-baseweb="card"] {
+    /* Base styles applied to all */
+}
+
+/* Assistant message specific styles */
+div[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) {
+    background: linear-gradient(145deg, rgba(30, 41, 59, 0.6), rgba(15, 23, 42, 0.7));
+    border-top-left-radius: 6px;
+    border: 1px solid rgba(148, 163, 184, 0.15);
+}
+
+/* User message specific styles */
+div[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
+    background: linear-gradient(145deg, rgba(59, 130, 246, 0.12), rgba(37, 99, 235, 0.05));
+    border-top-right-radius: 6px;
+    border: 1px solid rgba(59, 130, 246, 0.2);
+}
+
+/* Premium gradient for Agent Hero */
+.agent-hero {
+    position: relative;
+    overflow: hidden;
+    border: 1px solid rgba(120, 119, 198, 0.24);
+    background:
+        radial-gradient(circle at top left, rgba(124, 58, 237, 0.25), transparent 40%),
+        radial-gradient(circle at top right, rgba(59, 130, 246, 0.25), transparent 40%),
+        linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.98));
+    border-radius: 24px;
+    padding: 1.8rem 1.8rem 1.4rem 1.8rem;
+    box-shadow: 0 25px 60px rgba(2, 6, 23, 0.4);
+    margin-bottom: 1.2rem;
 }
 
 div[data-testid="stChatInput"] {
@@ -1233,10 +1323,6 @@ def main() -> None:
                 st.session_state.agent_load_error = None
                 st.rerun()
 
-        if st.button("Новая сессия"):
-            _new_session()
-            st.rerun()
-
         loaded_model = st.session_state.get("agent_model_path_loaded")
         if loaded_model:
             st.success(f"Активна модель: `{_safe_relpath(Path(loaded_model))}`")
@@ -1315,6 +1401,71 @@ def main() -> None:
         chat_col = st.container()
 
         with chat_col:
+            sessions = []
+            if AGENT_SESSIONS_DIR.exists():
+                for p in AGENT_SESSIONS_DIR.glob("*.json"):
+                    try:
+                        stats = p.stat()
+                        sessions.append({
+                            "id": p.stem,
+                            "path": p,
+                            "mtime": stats.st_mtime,
+                            "updated_at": datetime.fromtimestamp(stats.st_mtime).strftime("%d.%m %H:%M")
+                        })
+                    except Exception:
+                        pass
+            sessions.sort(key=lambda x: x["mtime"], reverse=True)
+
+            current_session_id = st.session_state.get("agent_session_id")
+            session_options = [s["id"] for s in sessions[:8]]
+            if current_session_id and current_session_id not in session_options:
+                session_options.insert(0, current_session_id)
+                
+            st.markdown('<div class="agent-section-title" style="margin-bottom: 0.5rem;">История чатов</div>', unsafe_allow_html=True)
+            
+            top_cols = st.columns([0.85, 0.15])
+            with top_cols[0]:
+                if session_options:
+                    selected_session = st.radio(
+                        "История чатов",
+                        options=session_options,
+                        index=session_options.index(current_session_id) if current_session_id in session_options else 0,
+                        format_func=lambda sid: f"Чат {sid[-4:]}" if len(sid) > 4 else sid,
+                        horizontal=True,
+                        label_visibility="collapsed"
+                    )
+                    if selected_session and selected_session != current_session_id:
+                        try:
+                            with open(AGENT_SESSIONS_DIR / f"{selected_session}.json", "r", encoding="utf-8") as f:
+                                data = json.load(f)
+                            st.session_state.agent_session_id = selected_session
+                            st.session_state.agent_messages = data.get("messages", [])
+                            st.session_state.agent_trace = data.get("trace", [])
+                            st.session_state.agent_prompt = data.get("agent_prompt", DEFAULT_AGENT_PROMPT)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Не удалось загрузить сессию: {e}")
+                else:
+                    st.caption("Нет сохраненных чатов")
+            
+            with top_cols[1]:
+                btn_cols = st.columns(2)
+                with btn_cols[0]:
+                    if st.button("🗑️", help="Удалить текущий чат", use_container_width=True):
+                        try:
+                            target = AGENT_SESSIONS_DIR / f"{current_session_id}.json"
+                            if target.exists():
+                                target.unlink()
+                            _new_session()
+                            st.rerun()
+                        except Exception:
+                            pass
+                with btn_cols[1]:
+                    if st.button("📝", help="Создать новый чат", use_container_width=True):
+                        _new_session()
+                        st.rerun()
+
+            st.markdown('<div style="height: 1rem;"></div>', unsafe_allow_html=True)
             st.markdown('<div class="agent-section-title">Диалог с агентом</div>', unsafe_allow_html=True)
             st.markdown(
                 '<div class="agent-form-note">Служебный prompt и debug скрыты в боковых настройках, чтобы чат оставался чистым и удобным.</div>',
@@ -1337,6 +1488,20 @@ def main() -> None:
 
             for idx, message in enumerate(st.session_state.agent_messages):
                 with st.chat_message(message["role"]):
+                    if message["role"] == "assistant" and "trace" in message:
+                        trace = message["trace"] or []
+                        for step_data in trace:
+                            tool_results = step_data.get("tool_results", [])
+                            for t_res in tool_results:
+                                tool_name = t_res.get("tool", "unknown")
+                                args = t_res.get("arguments", {})
+                                with st.expander(f"🛠️ Tool: `{tool_name}`", expanded=False):
+                                    st.markdown("**Аргументы:**")
+                                    st.json(args)
+                                    if "result" in t_res:
+                                        st.markdown("**Результат:**")
+                                        st.json(t_res["result"])
+                    
                     st.write(message["content"])
                     if st.session_state.get("agent_show_debug") and message["role"] == "assistant":
                         trace = message.get("trace") or []
@@ -1367,6 +1532,9 @@ def main() -> None:
 
             if submitted and prompt.strip():
                 st.session_state.agent_messages.append({"role": "user", "content": prompt.strip()})
+                
+                with st.chat_message("user"):
+                    st.write(prompt.strip())
 
                 system_prompt = st.session_state.get("agent_prompt", "").strip()
                 conversation: List[Dict[str, str]] = []
@@ -1378,16 +1546,27 @@ def main() -> None:
                     if msg["role"] in {"user", "assistant"}
                 )
 
-                with st.spinner("Агент думает..."):
-                    answer, trace = run_agent_turn(
-                        backend=st.session_state.agent_backend,
-                        conversation=conversation,
-                        max_steps=max_steps,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        top_p=0.95,
-                        top_k=40,
-                    )
+                with st.chat_message("assistant"):
+                    stream_placeholder = st.empty()
+                    current_stream = {"text": ""}
+                    
+                    def _on_chunk(chunk: str):
+                        if chunk is not None:
+                            current_stream["text"] += str(chunk)
+                            stream_placeholder.markdown(current_stream['text'] + " ▌")
+
+                    with st.spinner("Агент думает..."):
+                        answer, trace = run_agent_turn(
+                            backend=st.session_state.agent_backend,
+                            conversation=conversation,
+                            max_steps=max_steps,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            top_p=0.95,
+                            top_k=40,
+                            stream_callback=_on_chunk,
+                        )
+                    stream_placeholder.empty()
 
                 st.session_state.agent_messages.append({"role": "assistant", "content": answer, "trace": trace})
                 st.session_state.agent_trace = trace

@@ -194,7 +194,11 @@ def _kill_existing_server() -> None:
             pass
 
 
-def _ctx_batch_args(ctx_size: int) -> List[str]:
+def _ctx_batch_args(ctx_size: int, backend_name: str) -> List[str]:
+    if backend_name == "vulkan":
+        # Limit ubatch on Vulkan to avoid NVIDIA driver hangs (TDR 0x0000c67d)
+        return ["--batch-size", "2048", "--ubatch-size", "1024"]
+
     if ctx_size >= 131072:
         return ["--batch-size", "4096", "--ubatch-size", "1024"]
     if ctx_size >= 65536:
@@ -301,16 +305,15 @@ class LlamaServerBackend:
             str(self.n_ctx),
             "--threads",
             str(self.n_threads),
-            "--cache-type-k",
-            "q8_0",
-            "--cache-type-v",
-            "q8_0",
             "--parallel",
             "1",
             "--kv-unified",
             "--cont-batching",
+            "--cache-type-k", "q8_0",
+            "--cache-type-v", "q8_0",
         ]
-        cmd.extend(_ctx_batch_args(self.n_ctx))
+        
+        cmd.extend(_ctx_batch_args(self.n_ctx, self.backend_name))
         if self.n_gpu_layers != 0:
             cmd.append("--kv-offload")
             cmd.extend(_device_args(self.backend_name, self.visible_devices))
@@ -460,6 +463,56 @@ class LlamaServerBackend:
                 if isinstance(message, dict) and "content" in message:
                     return str(message["content"])
         return ""
+
+    def chat_completion_stream(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 512,
+        temperature: float = 0.2,
+        top_p: Optional[float] = 0.95,
+        top_k: Optional[int] = 40,
+        stop: Optional[List[str]] = None,
+    ):
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "stream": True,
+        }
+        if top_p is not None:
+            payload["top_p"] = float(top_p)
+        if top_k is not None:
+            payload["top_k"] = int(top_k)
+        if stop:
+            payload["stop"] = stop
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://{LLAMA_HOST}:{LLAMA_PORT}/v1/chat/completions",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as response:
+                for line in response:
+                    line = line.decode("utf-8").strip()
+                    if line.startswith("data: "):
+                        content = line[6:]
+                        if content == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(content)
+                            choices = chunk.get("choices")
+                            if isinstance(choices, list) and choices:
+                                delta = choices[0].get("delta", {})
+                                if "content" in delta and delta["content"] is not None:
+                                    yield delta["content"]
+                        except json.JSONDecodeError:
+                            pass
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"llama-server chat stream error: HTTP {exc.code} {body}") from exc
 
     def apply_chat_template(
         self,

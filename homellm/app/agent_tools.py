@@ -31,7 +31,7 @@ TEXT_TRAINING_PRESETS: Dict[str, Dict[str, Any]] = {
         "batch_size": 1,
         "gradient_accumulation": 16,
         "learning_rate": 2e-4,
-        "num_epochs": 2,
+        "epochs": 2,
         "seq_len": 4096,
         "warmup_steps": 50,
         "save_every": 200,
@@ -50,7 +50,7 @@ TEXT_TRAINING_PRESETS: Dict[str, Dict[str, Any]] = {
         "batch_size": 1,
         "gradient_accumulation": 16,
         "learning_rate": 1e-5,
-        "num_epochs": 1,
+        "epochs": 1,
         "seq_len": 4096,
         "warmup_steps": 100,
         "save_every": 100,
@@ -65,7 +65,7 @@ TEXT_TRAINING_PRESETS: Dict[str, Dict[str, Any]] = {
         "batch_size": 8,
         "gradient_accumulation": 8,
         "learning_rate": 3e-4,
-        "num_epochs": 1,
+        "epochs": 1,
         "seq_len": 2048,
         "warmup_steps": 100,
         "save_every": 250,
@@ -83,7 +83,7 @@ VLM_TRAINING_PRESETS: Dict[str, Dict[str, Any]] = {
         "batch_size": 2,
         "gradient_accumulation": 8,
         "learning_rate": 2e-5,
-        "num_epochs": 2,
+        "epochs": 2,
         "seq_len": 3072,
         "warmup_steps": 100,
         "assistant_only_loss": True,
@@ -99,7 +99,7 @@ VLM_TRAINING_PRESETS: Dict[str, Dict[str, Any]] = {
         "batch_size": 2,
         "gradient_accumulation": 8,
         "learning_rate": 1e-5,
-        "num_epochs": 1,
+        "epochs": 1,
         "seq_len": 1536,
         "warmup_steps": 50,
         "assistant_only_loss": False,
@@ -147,17 +147,17 @@ TOOL_SPECS: List[Dict[str, Any]] = [
     {
         "name": "start_text_training",
         "category": "execution",
-        "description": "Запускает text training. У тебя есть ПОЛНЫЙ доступ к тонкой настройке: ты можешь передавать любые гиперпараметры (learning_rate, batch_size, lora_r, lora_alpha, gradient_accumulation, seq_len и т.д.).",
+        "description": "Запускает text training. У тебя есть ПОЛНЫЙ доступ к тонкой настройке: ты можешь передавать любые гиперпараметры.",
         "arguments": {
-            "config": "dict с training config. Можно взять базовый пресет и переопределить в нем любые параметры под задачу пользователя.",
+            "config": "dict с training config. Обязательные ключи: 'data_path' (путь к датасету), 'base_model_path' (базовая модель), 'epochs' (количество эпох, строго ключ 'epochs'!), 'learning_rate', 'batch_size', 'gradient_accumulation', 'seq_len' и т.д.",
         },
     },
     {
         "name": "start_vlm_training",
         "category": "execution",
-        "description": "Запускает VLM training. У тебя есть ПОЛНЫЙ доступ к тонкой настройке: передавай в config любые нужные гиперпараметры, как это делал бы пользователь в UI.",
+        "description": "Запускает VLM training. У тебя есть ПОЛНЫЙ доступ к тонкой настройке: передавай в config любые нужные гиперпараметры.",
         "arguments": {
-            "config": "dict с stage=vlm_pretrain|vlm_sft|vlm_grpo и любыми другими параметрами обучения (LR, epochs, batch_size, LoRA params и т.д.).",
+            "config": "dict с training config. Обязательные ключи: 'stage' (vlm_pretrain|vlm_sft|vlm_grpo), 'data_path' (путь к датасету), 'base_model_path', 'epochs' (строго ключ 'epochs'!), 'learning_rate', 'batch_size' и т.д.",
         },
     },
     {
@@ -283,6 +283,12 @@ def _resolve_local_path(path_value: str, default_root: Path) -> Path:
     candidate = Path(path_value)
     if candidate.is_absolute():
         return candidate
+    
+    # Check if path already starts with the root folder name to prevent doubling
+    # e.g. path_value="datasets/foo.json", default_root=".../datasets" -> avoid ".../datasets/datasets/foo.json"
+    if candidate.parts and candidate.parts[0] == default_root.name:
+        candidate = Path(*candidate.parts[1:])
+        
     return (default_root / candidate).resolve()
 
 
@@ -512,6 +518,7 @@ def _spawn_run(run_id: str, cmd: List[str], env: Dict[str, str], stage: str, con
 def start_text_training(config: Dict[str, Any]) -> Dict[str, Any]:
     cfg = dict(config or {})
     stage = str(cfg.get("stage", "sft"))
+    
     if stage not in {"pretrain", "continual_pretrain", "sft"}:
         raise ValueError(f"Unsupported text stage: {stage}")
 
