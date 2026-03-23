@@ -814,7 +814,7 @@ class HomeAdapter(ModelAdapter):
             vocab_size=len(tokenizer),
             hidden_size=config["hidden_size"],
             num_hidden_layers=config["num_layers"],
-            num_attention_heads=config["n_heads"],
+            num_attention_heads=config.get("num_heads", config.get("n_heads", 8)),
             max_position_embeddings=config["seq_len"],
             dropout=config.get("dropout", 0.0),
             use_sdpa=use_flash_attention,

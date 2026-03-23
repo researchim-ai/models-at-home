@@ -97,6 +97,8 @@ def _detect_variant_candidates(backend_name: Optional[str] = None) -> List[str]:
     if system == "windows":
         return ["win-cpu-arm64" if "arm" in machine else "win-cpu-x64"]
 
+    if backend_name == "cuda":
+        return ["ubuntu-cuda-cu12.4-x64", "ubuntu-cuda-cu12.2-x64", "ubuntu-x64"]
     if backend_name == "vulkan":
         return ["ubuntu-vulkan-x64", "ubuntu-x64"]
     if backend_name in {"hip", "rocm"}:
@@ -197,7 +199,18 @@ def _kill_existing_server() -> None:
 def _ctx_batch_args(ctx_size: int, backend_name: str) -> List[str]:
     if backend_name == "vulkan":
         # Limit ubatch on Vulkan to avoid NVIDIA driver hangs (TDR 0x0000c67d)
-        return ["--batch-size", "2048", "--ubatch-size", "1024"]
+        # Even 1024 can be too much for some heavy prompts on Vulkan, causing TDR.
+        # 512 is the sweet spot for stability vs speed on Vulkan.
+        return ["--batch-size", "512", "--ubatch-size", "512"]
+
+    if backend_name == "cuda":
+        if ctx_size >= 131072:
+            return ["--batch-size", "4096", "--ubatch-size", "1024"]
+        if ctx_size >= 65536:
+            return ["--batch-size", "4096"]
+        if ctx_size >= 32768:
+            return ["--batch-size", "2048"]
+        return []
 
     if ctx_size >= 131072:
         return ["--batch-size", "4096", "--ubatch-size", "1024"]
@@ -209,6 +222,8 @@ def _ctx_batch_args(ctx_size: int, backend_name: str) -> List[str]:
 
 
 def _installed_backend_name() -> str:
+    if platform.system().lower() == "linux":
+        return "vulkan"
     return (os.environ.get("LLAMA_CPP_BACKEND", "vulkan") or "vulkan").strip().lower()
 
 
@@ -246,9 +261,9 @@ def _device_args(backend_name: str, visible_devices: List[int]) -> List[str]:
 
     backend_name = str(backend_name or "cpu").lower()
     if backend_name == "vulkan":
-        names = [f"Vulkan{device_id}" for device_id in visible_devices]
+        names = [f"Vulkan{i}" for i in range(len(visible_devices))]
     elif backend_name == "cuda":
-        names = [f"CUDA{device_id}" for device_id in visible_devices]
+        names = [f"CUDA{i}" for i in range(len(visible_devices))]
     else:
         return []
 
@@ -448,11 +463,15 @@ class LlamaServerBackend:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=180) as response:
+            with urllib.request.urlopen(req, timeout=1800) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"llama-server chat error: HTTP {exc.code} {body}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f"Таймаут подключения к llama-server: модель слишком долго думала. Возможно, промпт слишком велик для обработки с текущим batch_size.") from exc
+        except Exception as exc:
+            raise RuntimeError(f"Ошибка при получении ответа: {exc}") from exc
 
         result = json.loads(raw)
         if isinstance(result, dict):
@@ -494,7 +513,10 @@ class LlamaServerBackend:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=180) as response:
+            # When ctx sizes are huge (e.g. 256k) and batch sizes are small (e.g. 512), 
+            # prompt processing can take many minutes.
+            # We increase timeout to 1800 seconds (30 mins) to avoid dropping the connection.
+            with urllib.request.urlopen(req, timeout=1800) as response:
                 for line in response:
                     line = line.decode("utf-8").strip()
                     if line.startswith("data: "):
@@ -513,6 +535,10 @@ class LlamaServerBackend:
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"llama-server chat stream error: HTTP {exc.code} {body}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f"Таймаут подключения к llama-server: модель слишком долго думала. Возможно, промпт слишком велик для обработки с маленьким batch_size.") from exc
+        except Exception as exc:
+            raise RuntimeError(f"Ошибка при потоковом получении ответа: {exc}") from exc
 
     def apply_chat_template(
         self,

@@ -72,6 +72,22 @@ TEXT_TRAINING_PRESETS: Dict[str, Dict[str, Any]] = {
         "log_every": 10,
         "description": "Легкий стартовый претрейн/continued-pretrain по текстовому корпусу.",
     },
+    "pretrain_scratch_60m": {
+        "stage": "pretrain",
+        "training_backend": "models-at-home",
+        "output_dir": "out/agent/text/pretrain_scratch_60m",
+        "hidden_size": 512,
+        "num_layers": 8,
+        "num_heads": 8,
+        "batch_size": 8,
+        "gradient_accumulation": 8,
+        "learning_rate": 5e-4,
+        "epochs": 1,
+        "seq_len": 1024,
+        "warmup_steps": 500,
+        "save_every": 500,
+        "description": "Претрейн с нуля (from scratch) собственной маленькой модели ~60M параметров (homellm architecture).",
+    },
 }
 
 VLM_TRAINING_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -149,7 +165,7 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "category": "execution",
         "description": "Запускает text training. У тебя есть ПОЛНЫЙ доступ к тонкой настройке: ты можешь передавать любые гиперпараметры.",
         "arguments": {
-            "config": "dict с training config. Обязательные ключи: 'data_path' (путь к датасету), 'base_model_path' (базовая модель), 'epochs' (количество эпох, строго ключ 'epochs'!), 'learning_rate', 'batch_size', 'gradient_accumulation', 'seq_len' и т.д.",
+            "config": "dict с training config. Обязательные ключи: 'data_path', 'epochs'. Для SFT/continued_pretrain передай 'base_model_path'. Для pretrain своей модели с нуля НЕ ПЕРЕДАВАЙ 'base_model_path', а укажи параметры ('hidden_size', 'num_layers', 'num_heads' и т.д.). Другие ключи: 'learning_rate', 'batch_size', 'gradient_accumulation', 'seq_len' и т.д.",
         },
     },
     {
@@ -577,6 +593,7 @@ def start_text_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     result = _spawn_run(run_id=run_id, cmd=cmd, env=env, stage=stage, config=cfg)
     result["output_dir"] = _safe_relpath(run_output_dir)
+    result["monitoring_url"] = f"/?run_id={run_id}"
     return result
 
 
@@ -646,6 +663,7 @@ def start_vlm_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     result = _spawn_run(run_id=run_id, cmd=cmd, env=env, stage=stage, config=cfg)
     result["output_dir"] = _safe_relpath(run_output_dir)
+    result["monitoring_url"] = f"/VLM_Studio?run_id={run_id}"
     return result
 
 

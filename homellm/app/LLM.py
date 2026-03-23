@@ -4874,7 +4874,14 @@ def live_metrics_fragment():
     
     # Статус
     if process_alive:
-        st.success(f"🟢 {t('status.running')} (Run: {run_id})")
+        col1, col2 = st.columns([0.85, 0.15])
+        with col1:
+            st.success(f"🟢 {t('status.running')} (Run: {run_id})")
+        with col2:
+            if st.button("⏹️ Стоп", key=f"stop_{run_id}", use_container_width=True):
+                with st.spinner("Останавливаем..."):
+                    stop_training()
+                st.rerun()
     else:
         if metrics and metrics.get("status") == "completed":
             duration = metrics.get("training_duration", "unknown")
@@ -6877,6 +6884,32 @@ def export_model_to_hf(model, tokenizer, source_path: str):
 # ============================================================================
 
 def main():
+    q = st.query_params
+    if "run_id" in q:
+        target_run = q["run_id"]
+        
+        # Check if this is a VLM run and redirect if necessary
+        is_vlm = False
+        config_path = RUNS_DIR / target_run / "config.json"
+        if config_path.exists():
+            import json
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    if str(cfg.get("stage", "")).startswith("vlm_"):
+                        is_vlm = True
+            except:
+                pass
+                
+        if is_vlm:
+            st.markdown(f'<meta http-equiv="refresh" content="0;url=/VLM_Studio?run_id={target_run}">', unsafe_allow_html=True)
+            return
+
+        if st.session_state.get("last_processed_run_id") != target_run:
+            st.session_state.current_run_id = target_run
+            st.session_state.last_processed_run_id = target_run
+            st.toast(f"📊 Выбран run: {target_run}. Перейдите на вкладку 'Мониторинг'!", icon="✅")
+
     if not st.session_state.get("onboarding_done", False):
         render_first_run_setup(USER_PREFS_FILE)
         return
@@ -7303,6 +7336,7 @@ def main():
                             if st.button(f"📊 {t('metrics.title')}", key=f"metrics_{run_id}"):
                                 st.session_state.current_run_id = run_id
                                 st.toast(f"✅ Выбран run: {run_id}. Перейдите на вкладку 📊 Мониторинг", icon="📊")
+                            st.markdown(f"[🔗 Ссылка на процесс](/?run_id={run_id})")
                         with btn_col2:
                             # Проверяем есть ли модель для чата
                             config_path = run_dir / "config.json"

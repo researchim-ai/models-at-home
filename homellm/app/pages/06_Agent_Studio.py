@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import subprocess
 from datetime import datetime
@@ -13,7 +14,7 @@ from typing import Any, Dict, List
 import streamlit as st
 
 try:
-    from homellm.app.agent_runtime import run_agent_turn
+    from homellm.app.agent_runtime import run_agent_turn, SYSTEM_PROMPT
     from homellm.app.agent_tools import (
         RUNS_DIR,
         get_tool_groups,
@@ -32,7 +33,7 @@ try:
     from homellm.app.llama_server_backend import LLAMA_SERVER_LOG, LlamaServerBackend, is_llama_server_supported
     from homellm.app.ui_preferences import DEFAULT_THEME, apply_theme_css, init_user_preferences
 except ImportError:
-    from ..agent_runtime import run_agent_turn
+    from ..agent_runtime import run_agent_turn, SYSTEM_PROMPT
     from ..agent_tools import RUNS_DIR, get_tool_groups, get_training_presets, list_training_capabilities, stop_run
     from ..hf_gguf import (
         DEFAULT_AGENT_GGUF_QUANT,
@@ -50,12 +51,6 @@ MODELS_DIR = PROJECT_ROOT / "models"
 AGENT_SESSIONS_DIR = RUNS_DIR / "agent_sessions"
 USER_PREFS_FILE = RUNS_DIR / "ui_preferences.json"
 AGENT_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-
-DEFAULT_AGENT_PROMPT = """Ты агент Models at Home Studio.
-Помогай проектировать, конфигурировать и запускать обучение моделей.
-Думай прагматично: сначала проверяй локальные модели, датасеты и статусы run через tools.
-Если можешь запустить training безопасно и обоснованно, делай это.
-Если информации мало, уточняй ровно недостающие поля."""
 
 RUNTIME_MODE_PRESETS = {
     "auto": {"label": "Авто", "gpu_layers": -1, "description": "Пытается использовать GPU/offload максимально эффективно."},
@@ -268,6 +263,32 @@ div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] div[role="
 /* Hide the little radio dot specifically */
 div[data-testid="stAppViewBlockContainer"] div[data-testid="stRadio"] div[role="radiogroup"] label > div:first-child {
     display: none !important;
+}
+
+/* Make st.pills look like tabs */
+div[data-testid="stPills"] {
+    border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+    padding-bottom: 0;
+    margin-bottom: 1rem;
+    gap: 0;
+}
+div[data-testid="stPills"] button {
+    border-radius: 8px 8px 0 0 !important;
+    border: none !important;
+    border-right: 1px solid rgba(148, 163, 184, 0.1) !important;
+    background: transparent !important;
+    padding: 0.5rem 1.2rem !important;
+    margin: 0 !important;
+    margin-bottom: -1px !important;
+    color: #94a3b8 !important;
+}
+div[data-testid="stPills"] button[data-selected="true"],
+div[data-testid="stPills"] button[aria-pressed="true"] {
+    background: rgba(15, 23, 42, 0.32) !important;
+    border-top: 2px solid #3b82f6 !important;
+    border-bottom: 1px solid rgba(15, 23, 42, 0.32) !important;
+    color: #e2e8f0 !important;
+    font-weight: 600 !important;
 }
 
 div[data-testid="stChatMessage"] {
@@ -913,7 +934,7 @@ def _persist_session() -> None:
         "model_path": st.session_state.get("agent_model_path_loaded"),
         "messages": st.session_state.get("agent_messages", []),
         "trace": _serialize_trace(st.session_state.get("agent_trace", [])),
-        "agent_prompt": st.session_state.get("agent_prompt", DEFAULT_AGENT_PROMPT),
+        "agent_prompt": st.session_state.get("agent_prompt", SYSTEM_PROMPT),
     }
     with open(session_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
@@ -923,6 +944,8 @@ def _new_session() -> None:
     st.session_state.agent_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     st.session_state.agent_messages = []
     st.session_state.agent_trace = []
+    if "chat_history_pills_widget" in st.session_state:
+        del st.session_state["chat_history_pills_widget"]
     _persist_session()
 
 
@@ -1075,7 +1098,7 @@ def _init_state() -> None:
     if "agent_model_path_loaded" not in st.session_state:
         st.session_state.agent_model_path_loaded = None
     if "agent_prompt" not in st.session_state:
-        st.session_state.agent_prompt = DEFAULT_AGENT_PROMPT
+        st.session_state.agent_prompt = SYSTEM_PROMPT
     if "agent_autoload_attempted" not in st.session_state:
         st.session_state.agent_autoload_attempted = False
     if "agent_download_attempted" not in st.session_state:
@@ -1100,6 +1123,26 @@ def _init_state() -> None:
         st.session_state.agent_runtime_notice = None
     if "agent_loaded_backend_config" not in st.session_state:
         st.session_state.agent_loaded_backend_config = None
+
+
+def _get_session_title(session_id: str) -> str:
+    path = AGENT_SESSIONS_DIR / f"{session_id}.json"
+    if not path.exists():
+        return f"Чат {session_id[-4:]}" if len(session_id) > 4 else session_id
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            msgs = data.get("messages", [])
+            for m in msgs:
+                if m.get("role") == "user":
+                    text = m.get("content", "").strip().split("\n")[0]
+                    if len(text) > 22:
+                        return text[:19] + "..."
+                    if text:
+                        return text
+    except:
+        pass
+    return f"Чат {session_id[-4:]}" if len(session_id) > 4 else session_id
 
 
 def main() -> None:
@@ -1279,9 +1322,14 @@ def main() -> None:
             max_steps = st.slider("Max agent steps", min_value=1, max_value=10, value=6, step=1)
 
         with st.expander("Настройки агента", expanded=False):
+            def _update_agent_prompt():
+                st.session_state.agent_prompt = st.session_state.agent_prompt_widget
+
             st.text_area(
                 "Системный prompt",
-                key="agent_prompt",
+                value=st.session_state.get("agent_prompt", SYSTEM_PROMPT),
+                key="agent_prompt_widget",
+                on_change=_update_agent_prompt,
                 height=180,
                 help="Скрытая системная роль агента. Здесь ее можно настроить, не засоряя основной экран чата.",
             )
@@ -1426,25 +1474,32 @@ def main() -> None:
             top_cols = st.columns([0.85, 0.15])
             with top_cols[0]:
                 if session_options:
-                    selected_session = st.radio(
+                    # Initialize default in session state if not set to prevent re-render jumps
+                    if "chat_history_pills_widget" not in st.session_state:
+                        st.session_state["chat_history_pills_widget"] = current_session_id if current_session_id in session_options else None
+                        
+                    def _on_chat_change():
+                        sel = st.session_state.get("chat_history_pills_widget")
+                        if sel and sel != st.session_state.get("agent_session_id"):
+                            try:
+                                with open(AGENT_SESSIONS_DIR / f"{sel}.json", "r", encoding="utf-8") as f:
+                                    data = json.load(f)
+                                st.session_state.agent_session_id = sel
+                                st.session_state.agent_messages = data.get("messages", [])
+                                st.session_state.agent_trace = data.get("trace", [])
+                                st.session_state.agent_prompt = data.get("agent_prompt", SYSTEM_PROMPT)
+                            except Exception:
+                                pass
+
+                    selected_session = st.pills(
                         "История чатов",
                         options=session_options,
-                        index=session_options.index(current_session_id) if current_session_id in session_options else 0,
-                        format_func=lambda sid: f"Чат {sid[-4:]}" if len(sid) > 4 else sid,
-                        horizontal=True,
-                        label_visibility="collapsed"
+                        format_func=_get_session_title,
+                        selection_mode="single",
+                        label_visibility="collapsed",
+                        key="chat_history_pills_widget",
+                        on_change=_on_chat_change
                     )
-                    if selected_session and selected_session != current_session_id:
-                        try:
-                            with open(AGENT_SESSIONS_DIR / f"{selected_session}.json", "r", encoding="utf-8") as f:
-                                data = json.load(f)
-                            st.session_state.agent_session_id = selected_session
-                            st.session_state.agent_messages = data.get("messages", [])
-                            st.session_state.agent_trace = data.get("trace", [])
-                            st.session_state.agent_prompt = data.get("agent_prompt", DEFAULT_AGENT_PROMPT)
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Не удалось загрузить сессию: {e}")
                 else:
                     st.caption("Нет сохраненных чатов")
             
@@ -1491,11 +1546,17 @@ def main() -> None:
                     if message["role"] == "assistant" and "trace" in message:
                         trace = message["trace"] or []
                         for step_data in trace:
+                            parsed = step_data.get("parsed", {})
+                            thought = parsed.get("thought", "")
+                            if thought:
+                                with st.expander("💭 Размышления", expanded=False):
+                                    st.write(thought)
+
                             tool_results = step_data.get("tool_results", [])
                             for t_res in tool_results:
                                 tool_name = t_res.get("tool", "unknown")
                                 args = t_res.get("arguments", {})
-                                with st.expander(f"🛠️ Tool: `{tool_name}`", expanded=False):
+                                with st.expander(f"🛠️ Инструмент: `{tool_name}`", expanded=False):
                                     st.markdown("**Аргументы:**")
                                     st.json(args)
                                     if "result" in t_res:
@@ -1548,12 +1609,41 @@ def main() -> None:
 
                 with st.chat_message("assistant"):
                     stream_placeholder = st.empty()
-                    current_stream = {"text": ""}
                     
-                    def _on_chunk(chunk: str):
-                        if chunk is not None:
+                    current_stream = {"text": ""}
+                    blocks = []
+                    
+                    def _on_chunk(chunk_type: str, chunk: str):
+                        if chunk is None:
+                            return
+                        if chunk_type == "system_msg":
+                            clean_msg = chunk.strip()
+                            if clean_msg:
+                                blocks.append(clean_msg)
+                            if blocks:
+                                stream_placeholder.markdown("\n\n".join(blocks) + " ▌")
+                            current_stream["text"] = "" # Reset model JSON accumulator when system interrupts
+                        else:
                             current_stream["text"] += str(chunk)
-                            stream_placeholder.markdown(current_stream['text'] + " ▌")
+                            text = current_stream["text"]
+                            
+                            display_parts = blocks.copy()
+                            import re
+                            
+                            thought_match = re.search(r'"thought"\s*:\s*"((?:[^"\\]|\\.)*)', text)
+                            if thought_match:
+                                val = thought_match.group(1).replace('\\n', '\n').replace('\\"', '"').replace('\\t', '\t')
+                                if val.strip():
+                                    display_parts.append(f"💭 *{val}*")
+                                    
+                            msg_match = re.search(r'"assistant_message"\s*:\s*"((?:[^"\\]|\\.)*)', text)
+                            if msg_match:
+                                val = msg_match.group(1).replace('\\n', '\n').replace('\\"', '"').replace('\\t', '\t')
+                                if val.strip():
+                                    display_parts.append(val)
+                            
+                            if display_parts:
+                                stream_placeholder.markdown("\n\n".join(display_parts) + " ▌")
 
                     with st.spinner("Агент думает..."):
                         answer, trace = run_agent_turn(

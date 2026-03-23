@@ -1020,6 +1020,32 @@ def _render_vlm_distributed_config(training_config: Dict[str, Any] | None = None
 
 
 def main() -> None:
+    q = st.query_params
+    if "run_id" in q:
+        target_run = q["run_id"]
+        
+        # Check if this is a TEXT run and redirect if necessary
+        is_text = False
+        config_path = RUNS_DIR / target_run / "config.json"
+        if config_path.exists():
+            import json
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    if not str(cfg.get("stage", "")).startswith("vlm_"):
+                        is_text = True
+            except:
+                pass
+                
+        if is_text:
+            st.markdown(f'<meta http-equiv="refresh" content="0;url=/?run_id={target_run}">', unsafe_allow_html=True)
+            return
+
+        if st.session_state.get("vlm_last_processed_run_id") != target_run:
+            st.session_state.vlm_current_run_id = target_run
+            st.session_state.vlm_last_processed_run_id = target_run
+            st.toast(f"📊 Выбран run: {target_run}. Перейдите на вкладку 'Мониторинг'!", icon="✅")
+
     st.set_page_config(page_title=t("vlm.title"), page_icon="🖼️", layout="wide", initial_sidebar_state="expanded")
     init_user_preferences(RUNS_DIR / "ui_preferences.json")
     apply_theme_css(st.session_state.get("ui_theme", DEFAULT_THEME))
@@ -1266,6 +1292,7 @@ def main() -> None:
                         if st.button("📊 Мониторинг", key=f"history_monitor_{run_id}"):
                             st.session_state.vlm_current_run_id = run_id
                             st.rerun()
+                        st.markdown(f"[🔗 Ссылка на процесс](/VLM_Studio?run_id={run_id})")
                     with b2:
                         final_model = Path(cfg.get("output_dir", "")) / "final_model"
                         if not final_model.is_absolute():

@@ -15,6 +15,7 @@ AGENT_PROMPT_SECTIONS: Dict[str, str] = {
     "capabilities": """Твои возможности:
 - анализировать локальные trainable-модели, датасеты и готовые training presets;
 - запускать text/VLM training и ТОНКО НАСТРАИВАТЬ любые гиперпараметры (learning_rate, batch_size, lora_r, epochs и т.д.);
+- ЗАПУСКАТЬ PRETRAIN С НУЛЯ (from scratch) собственных моделей: для этого не указывай `base_model_path`, а передай архитектурные параметры (`hidden_size`, `num_layers`, `num_heads`, `vocab_size` и т.д.);
 - проверять статус run, читать config, metrics и логи;
 - подсказывать, какой preset или конфиг лучше подходит под задачу пользователя;
 - выполнять bash-команды внутри контейнера через run_system_command (например: nvidia-smi, ls, free -h).""",
@@ -27,14 +28,15 @@ AGENT_PROMPT_SECTIONS: Dict[str, str] = {
 - не предлагай GGUF-файлы llama.cpp как базовые модели для обучения: они используются только для inference;
 - не вызывай больше 2 tools за один шаг;
 - если запускаешь run, обязательно сообщай пользователю, что именно стартуешь и почему;
-- при успешном запуске обучения ОБЯЗАТЕЛЬНО дай пользователю ссылку `[Перейти к мониторингу (LLM Студия)](/)` или `[Перейти к мониторингу (VLM Студия)](/VLM_Studio)` и укажи Run ID, чтобы он мог перейти по ссылке;
+- при успешном запуске обучения инструменты возвращают поле `monitoring_url`. ОБЯЗАТЕЛЬНО дай пользователю кликабельную markdown-ссылку на этот URL `[Перейти к мониторингу](URL_ИЗ_TOOL_RESULT)`, чтобы он мог сразу открыть этот запуск;
 - не говори, что обучение успешно запущено, если tool вернул ошибку или run умер сразу после старта;
 - если запущен run, предлагай пользователю смотреть плашку активного процесса, конфиг, логи и графики на странице;""",
-    "output_contract": """Ты ОБЯЗАН отвечать строго одним JSON-объектом без markdown и без пояснений вокруг.
+    "output_contract": """Ты ОБЯЗАН отвечать строго одним JSON-объектом без markdown и без пояснений вокруг. Твой ответ не должен содержать ничего, кроме фигурных скобок `{` и `}` и корректного JSON внутри. НИКАКОГО ТЕКСТА ДО ИЛИ ПОСЛЕ JSON!
 
 Формат:
 {
-  "assistant_message": "текст для пользователя",
+  "thought": "твои внутренние размышления и планирование (необязательно, но полезно)",
+  "assistant_message": "сообщение для пользователя (рассказы, эссе, ответы на вопросы пиши сюда, можно использовать переносы строк `\\n`)",
   "tool_calls": [
     {"tool": "tool_name", "arguments": {"key": "value"}}
   ],
@@ -42,11 +44,12 @@ AGENT_PROMPT_SECTIONS: Dict[str, str] = {
 }
 
 Требования:
-- всегда включай assistant_message, tool_calls, final;
-- assistant_message должен быть строкой;
+- ВСЕГДА отвечай только валидным JSON;
+- ВСЕГДА экранируй кавычки и спецсимволы внутри строковых полей (используй `\\n` для переноса строк);
+- если пользователь просит написать длинный текст (рассказ, статью, код) — помести весь этот текст внутрь строкового поля `"assistant_message"`;
 - tool_calls должен быть массивом;
 - final=true только если уже готов финальный ответ на текущий ход;
-- если вызываешь tools, не пиши заранее длинный финальный ответ.""",
+- если вызываешь tools, не пиши заранее длинный финальный ответ в assistant_message.""",
 }
 
 SYSTEM_PROMPT = "\n\n".join(AGENT_PROMPT_SECTIONS.values())
@@ -84,9 +87,13 @@ def _extract_json_object(text: str) -> str:
     if text.startswith("{") and text.endswith("}"):
         return text
 
-    fenced = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if fenced:
-        return fenced.group(0)
+    # Handle texts where the LLM might have written intro/outro text around the JSON
+    # by trying to find the first { and the last }
+    start_idx = text.find('{')
+    end_idx = text.rfind('}')
+    if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
+        return text[start_idx:end_idx+1]
+
     raise ValueError("Model did not return a JSON object")
 
 
@@ -94,9 +101,12 @@ def _parse_agent_response(raw: str) -> Dict[str, Any]:
     parsed = json.loads(_extract_json_object(raw))
     if not isinstance(parsed, dict):
         raise ValueError("Agent response is not a JSON object")
+    parsed.setdefault("thought", "")
     parsed.setdefault("assistant_message", "")
     parsed.setdefault("tool_calls", [])
     parsed.setdefault("final", False)
+    if not isinstance(parsed["thought"], str):
+        parsed["thought"] = str(parsed["thought"])
     if not isinstance(parsed["assistant_message"], str):
         parsed["assistant_message"] = str(parsed["assistant_message"])
     if not isinstance(parsed["tool_calls"], list):
@@ -184,7 +194,8 @@ def run_agent_turn(
         else:
             if hasattr(backend, "chat_completion_stream") and stream_callback:
                 raw_chunks = []
-                stream_callback("\n\n") # add spacing between steps in stream
+                if step > 1:
+                    stream_callback("system_msg", "\n\n---\n\n")
                 for chunk in backend.chat_completion_stream(
                     messages=messages,
                     max_tokens=max_tokens,
@@ -195,7 +206,7 @@ def run_agent_turn(
                 ):
                     if chunk is not None:
                         raw_chunks.append(chunk)
-                        stream_callback(chunk)
+                        stream_callback("model_json_chunk", chunk)
                 raw = "".join(raw_chunks)
             else:
                 raw = backend.chat_completion(
@@ -238,16 +249,16 @@ def run_agent_turn(
             arguments = tool_call.get("arguments") or {}
             
             if stream_callback:
-                stream_callback(f"\n\n*(Вызываю инструмент: `{tool_name}`...)*\n\n")
+                stream_callback("system_msg", f"\n\n*(Вызываю инструмент: `{tool_name}`...)*\n\n")
                 
             try:
                 result = execute_tool(tool_name, arguments)
                 if stream_callback:
-                    stream_callback(f"*(Инструмент `{tool_name}` успешно выполнен)*\n\n")
+                    stream_callback("system_msg", f"*(Инструмент `{tool_name}` успешно выполнен)*\n\n")
             except Exception as exc:
                 result = {"error": str(exc), "tool": tool_name, "arguments": arguments}
                 if stream_callback:
-                    stream_callback(f"*(Ошибка при вызове `{tool_name}`)*\n\n")
+                    stream_callback("system_msg", f"*(Ошибка при вызове `{tool_name}`)*\n\n")
                     
             tool_record = {
                 "tool": tool_name,
