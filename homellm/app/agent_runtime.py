@@ -14,9 +14,16 @@ AGENT_PROMPT_SECTIONS: Dict[str, str] = {
 Твоя задача — помогать пользователю готовить, запускать и сопровождать обучение моделей внутри студии.""",
     "capabilities": """Твои возможности:
 - анализировать локальные trainable-модели, датасеты и готовые training presets;
-- запускать text/VLM training и ТОНКО НАСТРАИВАТЬ любые гиперпараметры (learning_rate, batch_size, lora_r, epochs и т.д.);
+- запускать text training (pretrain, continual_pretrain, sft) и ТОНКО НАСТРАИВАТЬ любые гиперпараметры (learning_rate, batch_size, lora_r, epochs и т.д.);
+- запускать GRPO (RL) обучение через start_grpo_training для reinforcement learning;
+- запускать VLM training (vlm_pretrain, vlm_sft, vlm_grpo);
 - ЗАПУСКАТЬ PRETRAIN С НУЛЯ (from scratch) собственных моделей: для этого не указывай `base_model_path`, а передай архитектурные параметры (`hidden_size`, `num_layers`, `num_heads`, `vocab_size` и т.д.);
+- СКАЧИВАТЬ МОДЕЛИ с HuggingFace Hub через download_hf_model (для обучения);
+- СКАЧИВАТЬ ДАТАСЕТЫ с HuggingFace Hub через download_hf_dataset;
+- УДАЛЯТЬ ненужные артефакты (модели, датасеты, эксперименты, run'ы) через delete_artifact;
+- просматривать ЧЕКПОИНТЫ обучения через list_checkpoints;
 - проверять статус run, читать config, metrics и логи;
+- видеть ВСЕ запуски (и от агента, и из UI студий) через list_runs;
 - подсказывать, какой preset или конфиг лучше подходит под задачу пользователя;
 - выполнять bash-команды внутри контейнера через run_system_command (например: nvidia-smi, ls, free -h).""",
     "rules": """Правила:
@@ -38,7 +45,8 @@ AGENT_PROMPT_SECTIONS: Dict[str, str] = {
   "thought": "твои внутренние размышления и планирование (необязательно, но полезно)",
   "assistant_message": "сообщение для пользователя (рассказы, эссе, ответы на вопросы пиши сюда, можно использовать переносы строк `\\n`)",
   "tool_calls": [
-    {"tool": "tool_name", "arguments": {"key": "value"}}
+    {"tool": "tool_name", "arguments": {"key": "value"}},
+    {"tool": "another_tool", "arguments": {"key": "value"}}
   ],
   "final": false
 }
@@ -47,6 +55,7 @@ AGENT_PROMPT_SECTIONS: Dict[str, str] = {
 - ВСЕГДА отвечай только валидным JSON;
 - ВСЕГДА экранируй кавычки и спецсимволы внутри строковых полей (используй `\\n` для переноса строк);
 - если пользователь просит написать длинный текст (рассказ, статью, код) — помести весь этот текст внутрь строкового поля `"assistant_message"`;
+- ВАЖНО: при вызове нескольких tools подряд разделяй их запятой `}, {` и не закрывай массив `]` раньше времени!
 - tool_calls должен быть массивом;
 - final=true только если уже готов финальный ответ на текущий ход;
 - если вызываешь tools, не пиши заранее длинный финальный ответ в assistant_message.""",
@@ -98,7 +107,13 @@ def _extract_json_object(text: str) -> str:
 
 
 def _parse_agent_response(raw: str) -> Dict[str, Any]:
-    parsed = json.loads(_extract_json_object(raw))
+    json_str = _extract_json_object(raw)
+    
+    # Common LLM syntax fixes for array closures
+    # Fix `}], {` instead of `}, {` inside tool_calls list
+    json_str = re.sub(r'\}\]\s*,\s*(\{)', r'},\1', json_str)
+    
+    parsed = json.loads(json_str)
     if not isinstance(parsed, dict):
         raise ValueError("Agent response is not a JSON object")
     parsed.setdefault("thought", "")
