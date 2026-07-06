@@ -106,14 +106,58 @@ def _extract_json_object(text: str) -> str:
     raise ValueError("Model did not return a JSON object")
 
 
+def _recover_truncated_json(text: str) -> Dict[str, Any] | None:
+    """Best-effort recovery when the model's JSON got cut off (e.g. by max_tokens).
+
+    Extracts whatever 'thought' / 'assistant_message' content was produced so far and
+    returns a final answer instead of failing hard with a parse error.
+    """
+    start_idx = text.find("{")
+    if start_idx == -1:
+        return None
+    body = text[start_idx:]
+
+    def _extract_field(field: str) -> str:
+        # Match "field": "....  (value may be unterminated due to truncation)
+        match = re.search(rf'"{field}"\s*:\s*"((?:[^"\\]|\\.)*)', body)
+        if not match:
+            return ""
+        value = match.group(1)
+        # Unescape common JSON escapes for human-readable output
+        for src, dst in (("\\n", "\n"), ("\\t", "\t"), ('\\"', '"'), ("\\\\", "\\")):
+            value = value.replace(src, dst)
+        return value.strip()
+
+    assistant_message = _extract_field("assistant_message")
+    thought = _extract_field("thought")
+
+    if not assistant_message:
+        return None
+
+    return {
+        "thought": thought,
+        "assistant_message": assistant_message,
+        "tool_calls": [],
+        "final": True,
+        "recovered_from_truncation": True,
+    }
+
+
 def _parse_agent_response(raw: str) -> Dict[str, Any]:
-    json_str = _extract_json_object(raw)
-    
-    # Common LLM syntax fixes for array closures
-    # Fix `}], {` instead of `}, {` inside tool_calls list
-    json_str = re.sub(r'\}\]\s*,\s*(\{)', r'},\1', json_str)
-    
-    parsed = json.loads(json_str)
+    try:
+        json_str = _extract_json_object(raw)
+        # Common LLM syntax fixes for array closures
+        # Fix `}], {` instead of `}, {` inside tool_calls list
+        json_str = re.sub(r'\}\]\s*,\s*(\{)', r'},\1', json_str)
+        parsed = json.loads(json_str)
+    except (ValueError, json.JSONDecodeError):
+        # The JSON was likely truncated (cut off by max_tokens) or malformed.
+        # Try to salvage the partial assistant_message so the user still gets a reply.
+        recovered = _recover_truncated_json(raw)
+        if recovered is not None:
+            return recovered
+        raise
+
     if not isinstance(parsed, dict):
         raise ValueError("Agent response is not a JSON object")
     parsed.setdefault("thought", "")

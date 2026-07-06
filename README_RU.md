@@ -78,7 +78,7 @@
    ```bash
    export UID=$(id -u)
    export GID=$(id -g)
-   docker-compose up --build
+   docker compose up --build
    ```
 
 3. **Откройте в браузере:**
