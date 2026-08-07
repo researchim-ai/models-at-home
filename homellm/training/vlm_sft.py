@@ -18,6 +18,8 @@ from .vlm_common import (
     MetricsLogger,
     apply_vlm_freeze_policy,
     apply_vlm_lora,
+    configure_sdpa_kernels,
+    ensure_cuda_available,
     load_vlm_model,
     load_vlm_processor,
     mark_training_completed,
@@ -31,6 +33,22 @@ VLMSFTDataset = VLMJsonlDataset
 
 
 def run_vlm_sft(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
+    """Public entrypoint: runs SFT and records any failure into metrics.json.
+
+    Wrapping the whole pipeline (not just trainer.train) means model/dataset
+    loading errors surface in the UI instead of leaving it stuck on
+    ``loading_model`` forever.
+    """
+    try:
+        _run_vlm_sft_impl(config, metrics_logger)
+    except Exception as exc:
+        import traceback
+
+        metrics_logger.update(status="error", error=str(exc) + "\n" + traceback.format_exc())
+        raise
+
+
+def _run_vlm_sft_impl(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
     if config.get("stage") not in (None, "vlm_sft"):
         raise ValueError(f"vlm_sft worker supports only stage=vlm_sft, got {config.get('stage')}")
 
@@ -58,28 +76,53 @@ def run_vlm_sft(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
     save_total_limit = int(config.get("save_total_limit", 2))
     eval_steps = int(config.get("eval_steps", 0))
     lr_schedule = str(config.get("lr_schedule", "cosine"))
+    # Map UI/legacy optimizer names to valid HF TrainingArguments.optim values.
+    optim_aliases = {
+        "adamw": "adamw_torch",
+        "adam": "adamw_torch",
+        "adamw_8bit": "adamw_bnb_8bit",
+        "muon": "adamw_torch",
+        "magma_adamw": "adamw_torch",
+    }
+    valid_optims = {
+        "adamw_torch", "adamw_torch_fused", "adamw_hf", "adamw_apex_fused",
+        "adamw_anyprecision", "adamw_bnb_8bit", "adafactor", "sgd", "adagrad", "rmsprop",
+    }
     optimizer = str(config.get("optimizer", "adamw"))
-    if optimizer not in {"adamw_torch", "adamw_hf", "adamw_torch_fused", "adamw_apex_fused", "adamw_anyprecision", "adamw_bnb_8bit", "adamw_8bit", "adamw"}:
-        optimizer = "adamw"
-    elif optimizer == "adamw_8bit":
-        optimizer = "adamw_bnb_8bit"
+    optimizer = optim_aliases.get(optimizer, optimizer)
+    if optimizer not in valid_optims:
+        optimizer = "adamw_torch"
     mixed_precision = str(config.get("mixed_precision", "") or "").lower()
     use_bf16 = device == "cuda" and mixed_precision == "bf16" and torch.cuda.is_bf16_supported()
     use_fp16 = device == "cuda" and ((mixed_precision == "fp16") or (mixed_precision not in {"bf16", "fp16", "no"} and not torch.cuda.is_bf16_supported()))
 
+    ensure_cuda_available()
     metrics_logger.update(status="loading_model", stage="vlm_sft", model_name_or_path=model_name_or_path)
+    configure_sdpa_kernels(config)
     processor = load_vlm_processor(model_name_or_path, config)
     model = load_vlm_model(model_name_or_path, config, device)
+    metrics_logger.update(attn_implementation=getattr(getattr(model, "config", None), "_attn_implementation", None))
     apply_vlm_freeze_policy(model, config)
     model = apply_vlm_lora(model, config)
+    try:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        metrics_logger.update(trainable_params=int(trainable), num_parameters=int(total))
+    except Exception:
+        pass
 
     metrics_logger.update(status="loading_dataset")
+    field_map = config.get("vlm_columns") or None
     train_dataset = VLMJsonlDataset(
         data_path,
         prompt_for_caption=str(config.get("caption_prompt", "Describe this image.")),
+        field_map=field_map,
     )
     if len(train_dataset) == 0:
-        raise ValueError("No valid examples in dataset")
+        raise ValueError(
+            "No valid examples in dataset. Проверьте, что датасет содержит изображения "
+            "и что поля (image/question/answer/caption/messages) указаны верно."
+        )
 
     eval_dataset = None
     val_path = config.get("val_data_path")
@@ -87,6 +130,7 @@ def run_vlm_sft(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
         eval_dataset = VLMJsonlDataset(
             val_path,
             prompt_for_caption=str(config.get("caption_prompt", "Describe this image.")),
+            field_map=field_map,
         )
 
     collator = VLMDataCollator(
@@ -119,6 +163,7 @@ def run_vlm_sft(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
         bf16=use_bf16,
         fp16=use_fp16,
         gradient_checkpointing=bool(config.get("gradient_checkpointing", True)),
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to=[],
         remove_unused_columns=False,
         dataloader_num_workers=int(config.get("num_workers", 0)),
@@ -142,6 +187,17 @@ def run_vlm_sft(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
             self.ml = ml
             self.every = max(1, every)
             self.step_t0 = time.time()
+
+        def on_step_end(self, args, state, control, **kwargs):
+            # Обновляем шаг/время КАЖДЫЙ шаг, чтобы прогресс-бар в UI не «замирал»
+            # между логами loss (loss пишется раз в log_every шагов).
+            step = int(state.global_step)
+            if step <= 0:
+                return
+            self.ml.update(
+                current_step=step,
+                elapsed_seconds=time.time() - self.ml.start_timestamp,
+            )
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             logs = logs or {}
@@ -170,18 +226,12 @@ def run_vlm_sft(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
 
     trainer.add_callback(MetricsCallback(metrics_logger, log_every))
 
-    try:
-        trainer.train(resume_from_checkpoint=resolve_resume_checkpoint(config))
-        final_dir = output_dir / "final_model"
-        trainer.save_model(str(final_dir))
-        processor.save_pretrained(str(final_dir))
-        mark_training_completed(metrics_logger, str(final_dir))
-        metrics_logger.log_checkpoint(str(final_dir), loss=metrics_logger.metrics.get("current_loss"))
-    except Exception as exc:
-        import traceback
-
-        metrics_logger.update(status="error", error=str(exc) + "\n" + traceback.format_exc())
-        raise
+    trainer.train(resume_from_checkpoint=resolve_resume_checkpoint(config))
+    final_dir = output_dir / "final_model"
+    trainer.save_model(str(final_dir))
+    processor.save_pretrained(str(final_dir))
+    mark_training_completed(metrics_logger, str(final_dir))
+    metrics_logger.log_checkpoint(str(final_dir), loss=metrics_logger.metrics.get("current_loss"))
 
 
 def main() -> None:

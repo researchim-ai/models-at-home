@@ -14,6 +14,8 @@ from .vlm_common import (
     MetricsLogger,
     apply_vlm_freeze_policy,
     apply_vlm_lora,
+    configure_sdpa_kernels,
+    ensure_cuda_available,
     load_vlm_model,
     load_vlm_processor,
     mark_training_completed,
@@ -69,6 +71,17 @@ def _prepare_generation_batch(processor: Any, examples: Sequence[Dict[str, Any]]
 
 
 def run_vlm_grpo(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
+    """Public entrypoint: runs GRPO and records any failure into metrics.json."""
+    try:
+        _run_vlm_grpo_impl(config, metrics_logger)
+    except Exception as exc:
+        import traceback
+
+        metrics_logger.update(status="error", error=str(exc) + "\n" + traceback.format_exc())
+        raise
+
+
+def _run_vlm_grpo_impl(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
     if config.get("stage") not in (None, "vlm_grpo"):
         raise ValueError(f"vlm_grpo worker supports only stage=vlm_grpo, got {config.get('stage')}")
 
@@ -84,14 +97,27 @@ def run_vlm_grpo(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
     base_dir = Path(config.get("data_base_dir") or Path(data_path).parent)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    train_dataset = VLMJsonlDataset(data_path, prompt_for_caption=str(config.get("caption_prompt", "Describe this image.")))
+    train_dataset = VLMJsonlDataset(
+        data_path,
+        prompt_for_caption=str(config.get("caption_prompt", "Describe this image.")),
+        field_map=config.get("vlm_columns") or None,
+    )
     if len(train_dataset) == 0:
         raise ValueError("No valid examples in dataset")
 
+    ensure_cuda_available()
+    configure_sdpa_kernels(config)
     processor = load_vlm_processor(model_name_or_path, config)
     model = load_vlm_model(model_name_or_path, config, device)
+    metrics_logger.update(attn_implementation=getattr(getattr(model, "config", None), "_attn_implementation", None))
     apply_vlm_freeze_policy(model, config)
     model = apply_vlm_lora(model, config)
+    try:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        metrics_logger.update(trainable_params=int(trainable), num_parameters=int(total))
+    except Exception:
+        pass
     model.train()
 
     batch_size = int(config.get("batch_size", 1))

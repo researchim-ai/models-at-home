@@ -54,12 +54,17 @@ COPY requirements.txt /app/requirements.txt
 # --mount=type=cache сохраняет скачанные пакеты на хосте
 # ============================================================
 
-# 1. PyTorch 2.9.0 — ФИКСИРОВАННАЯ ВЕРСИЯ (совместима с flash-attn wheel)
+# 1. PyTorch 2.9.0 + cu128 — ФИКСИРОВАННАЯ ВЕРСИЯ.
+# ВАЖНО: индекс cu128 обязателен. По умолчанию PyPI уже отдаёт cu130-сборки,
+# которые требуют драйвер CUDA 13 (580+). На хостах с драйвером 12.8 (570.x)
+# cu130 приводит к "CUDA driver too old" и torch.cuda.is_available()==False.
+# flash-attn 2.8.3 wheel собран под torch 2.9 — поэтому версию не меняем.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install \
+    --index-url https://download.pytorch.org/whl/cu128 \
     torch==2.9.0 \
-    torchvision \
-    torchaudio
+    torchvision==0.24.0 \
+    torchaudio==2.9.0
 
 # 2. Flash Attention 2.8.3 — PRE-BUILT WHEEL для torch 2.9 + cu12 + Python 3.12
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -70,10 +75,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install -r /app/requirements.txt
 
-# 4. vLLM — ставим с --no-deps чтобы не переустанавливать torch
+# 4. vLLM — ТОЛЬКО с --no-deps, иначе он тянет torch 2.11+cu130 и transformers 5.x,
+# ломая совместимость с драйвером и flash-attn. vLLM здесь опционален (инференс).
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-deps vllm \
- && uv pip install vllm --no-build-isolation 2>/dev/null || true
+ || echo "Warning: vLLM installation failed, continuing without it"
 
 # 5. llama.cpp Python bindings intentionally omitted.
 # Agent Studio uses prebuilt external `llama-server`, which is downloaded at runtime.
@@ -88,6 +94,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-deps unsloth unsloth-zoo \
  || echo "Warning: Unsloth installation failed, continuing without it"
+
+# 8. СТРАХОВКА: жёстко возвращаем нужную сборку torch (cu128) и transformers.
+# Любой из шагов выше (vLLM/DeepSpeed/Unsloth) мог случайно подтянуть torch 2.11+cu130
+# или transformers 5.x. Переустанавливаем в самом конце, чтобы зафиксировать стек,
+# совместимый с драйвером 12.8 и flash-attn 2.8.3.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --reinstall \
+    --index-url https://download.pytorch.org/whl/cu128 \
+    torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --reinstall transformers==4.57.1
 
 # Теперь код (ВАЖНО: .dockerignore должен исключать datasets/out/.runs и т.п.)
 COPY . /app

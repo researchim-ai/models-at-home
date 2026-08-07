@@ -197,6 +197,98 @@ def load_vlm_processor(model_name_or_path: str, config: Dict[str, Any]) -> Any:
     return AutoProcessor.from_pretrained(model_name_or_path, **processor_kwargs)
 
 
+def ensure_cuda_available() -> None:
+    """Fail fast with a clear message if CUDA is not usable.
+
+    Without this, training loads the model on CPU and only crashes deep inside
+    ``pin_memory`` with a cryptic driver error. A common cause is a torch build
+    whose CUDA runtime is newer than the installed NVIDIA driver (e.g. a
+    ``+cu130`` wheel on a CUDA 12.8 / 570.x driver), which makes
+    ``torch.cuda.is_available()`` return ``False``.
+    """
+    if torch.cuda.is_available():
+        return
+    torch_ver = getattr(torch, "__version__", "unknown")
+    cuda_ver = getattr(torch.version, "cuda", "unknown")
+    raise RuntimeError(
+        "CUDA недоступна (torch.cuda.is_available() == False). "
+        f"Установлен torch {torch_ver} (CUDA runtime {cuda_ver}). "
+        "Скорее всего сборка torch новее драйвера NVIDIA (например, +cu130 при драйвере 12.8/570.x). "
+        "Нужен torch с cu128 под этот драйвер — пересоберите образ (Dockerfile уже пиннит torch 2.9.0+cu128)."
+    )
+
+
+def configure_sdpa_kernels(config: Dict[str, Any]) -> None:
+    """Enable/disable PyTorch SDPA flash kernels, mirroring the LLM worker.
+
+    PyTorch's scaled_dot_product_attention has FlashAttention-2 built in. Turning
+    on the flash SDP backend is what actually makes "FlashAttention" fast — this
+    is the same mechanism the LLM Studio uses.
+    """
+    if not torch.cuda.is_available():
+        return
+    use_flash_attention = bool(config.get("use_flash_attention"))
+    try:
+        if use_flash_attention:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
+        else:
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.backends.cuda.enable_math_sdp(True)
+        logger.info(
+            "SDPA kernels: flash=%s mem_efficient=%s math=%s (use_flash_attention=%s)",
+            getattr(torch.backends.cuda, "flash_sdp_enabled", lambda: "N/A")(),
+            getattr(torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: "N/A")(),
+            getattr(torch.backends.cuda, "math_sdp_enabled", lambda: "N/A")(),
+            use_flash_attention,
+        )
+    except Exception as exc:
+        logger.warning("Could not configure CUDA SDPA kernels: %s", exc)
+
+
+def resolve_attn_implementation(config: Dict[str, Any], device: str) -> str:
+    """Pick the attention backend, matching the LLM Studio's exact rules.
+
+    - FlashAttention-2 (the standalone ``flash_attn`` package) is used only when it
+      is requested AND weights are fp16/bf16 AND the method is not QLoRA AND the
+      package actually imports. This is identical to ``homellm/models/adapters.py``.
+    - When FlashAttention is off we force eager.
+    - Otherwise we use SDPA, whose flash backend (enabled via
+      :func:`configure_sdpa_kernels`) IS FlashAttention-2 built into PyTorch.
+
+    NOTE: The standalone ``flash_attn`` package may be broken in the image (ABI
+    mismatch with the installed torch build). In that case both LLM and VLM fall
+    back to SDPA flash kernels — real flash attention, just via PyTorch.
+    """
+    if device != "cuda":
+        return "eager"
+
+    use_flash_attention = bool(config.get("use_flash_attention"))
+    tuning_method = (config.get("tuning_method") or "lora").lower()
+    dtype = get_requested_torch_dtype(device, config)
+
+    if not use_flash_attention:
+        return "eager"
+
+    want_flash_pkg = dtype in (torch.float16, torch.bfloat16) and tuning_method != "qlora"
+    if want_flash_pkg:
+        try:
+            import flash_attn  # noqa: F401
+
+            return "flash_attention_2"
+        except Exception as exc:
+            logger.warning(
+                "flash_attn package requested but not importable (%s); "
+                "using PyTorch SDPA flash kernels instead",
+                exc,
+            )
+            return "sdpa"
+    # QLoRA / non-half precision: SDPA flash backend (same as LLM leaving it unset).
+    return "sdpa"
+
+
 def load_vlm_model(model_name_or_path: str, config: Dict[str, Any], device: str) -> Any:
     try:
         from transformers import AutoModelForImageTextToText
@@ -208,13 +300,10 @@ def load_vlm_model(model_name_or_path: str, config: Dict[str, Any], device: str)
         model_cls = AutoModelForVision2Seq
 
     model_kwargs: Dict[str, Any] = {"trust_remote_code": True}
-    if device == "cuda":
-        model_kwargs["device_map"] = "auto"
-    attn_impl = config.get("attn_implementation")
-    if not attn_impl and config.get("use_flash_attention"):
-        attn_impl = "flash_attention_2"
-    if attn_impl:
-        model_kwargs["attn_implementation"] = attn_impl
+    model_kwargs["attn_implementation"] = resolve_attn_implementation(config, device)
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
     tuning_method = (config.get("tuning_method") or "lora").lower()
     if tuning_method == "qlora":
@@ -227,16 +316,23 @@ def load_vlm_model(model_name_or_path: str, config: Dict[str, Any], device: str)
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
+        # Quantized weights must be placed on a concrete device at load time.
+        if device == "cuda":
+            model_kwargs["device_map"] = {"": local_rank}
     else:
         model_kwargs["torch_dtype"] = get_requested_torch_dtype(device, config)
+        # Single-process, single-GPU: pin to the visible device. Under DDP/accelerate
+        # (world_size > 1) let the launcher place the model to avoid clashes.
+        if device == "cuda" and world_size == 1:
+            model_kwargs["device_map"] = {"": local_rank}
 
     model = model_cls.from_pretrained(model_name_or_path, **model_kwargs)
-    if device == "cuda" and not hasattr(model, "hf_device_map"):
+    if device == "cuda" and not getattr(model, "hf_device_map", None):
         model = model.to(device)
-    if config.get("gradient_checkpointing", True) and hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-        if hasattr(model, "config"):
-            model.config.use_cache = False
+    # Gradient checkpointing is enabled centrally (prepare_model_for_kbit_training
+    # for QLoRA, or the HF Trainer via TrainingArguments) to avoid double-enabling.
+    if config.get("gradient_checkpointing", True) and hasattr(model, "config"):
+        model.config.use_cache = False
     return model
 
 
@@ -274,6 +370,17 @@ def apply_vlm_lora(model: Any, config: Dict[str, Any]) -> Any:
         return model
 
     from peft import LoraConfig, TaskType, get_peft_model
+
+    use_gc = bool(config.get("gradient_checkpointing", True))
+    if tuning_method == "qlora":
+        # Casts norms to fp32 and enables input grads so 4-bit QLoRA actually
+        # backprops. The HF Trainer enables the gradient-checkpointing hooks.
+        from peft import prepare_model_for_kbit_training
+
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=use_gc)
+    elif use_gc and hasattr(model, "enable_input_require_grads"):
+        # LoRA on a frozen base + gradient checkpointing needs input grads enabled.
+        model.enable_input_require_grads()
 
     target_modules: Any = config.get("lora_target_modules") or "all-linear"
     modules_to_save = config.get("lora_modules_to_save") or None

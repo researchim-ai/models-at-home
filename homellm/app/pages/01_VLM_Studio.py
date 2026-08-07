@@ -79,36 +79,119 @@ PARALLEL_TYPES = {
     "fsdp": {"icon": "📦", "name": "FSDP", "type": "fsdp"},
 }
 
-VLM_HF_PRESETS: List[Dict[str, str]] = [
+VLM_HF_PRESETS: List[Dict[str, Any]] = [
+    # --- Ультра-лёгкие (для слабых GPU / быстрых экспериментов) ---
     {
-        "name": "Qwen 3.5 0.8B",
-        "repo_id": "Qwen/Qwen3.5-0.8B",
-        "save_name": "Qwen3.5-0.8B",
-        "description": "Основной малый VLM для быстрых домашних экспериментов и small-task pretrain/SFT.",
+        "name": "SmolVLM-256M Instruct",
+        "repo_id": "HuggingFaceTB/SmolVLM-256M-Instruct",
+        "save_name": "SmolVLM-256M-Instruct",
+        "params": "256M",
+        "vram": "~2 ГБ",
+        "task": "Мультизадачный",
+        "trust_remote_code": False,
+        "description": "Самый маленький современный VLM. Идеален для первого запуска и слабых видеокарт (GTX 1060+).",
     },
     {
-        "name": "Qwen 3.5 2B",
-        "repo_id": "Qwen/Qwen3.5-2B",
-        "save_name": "Qwen3.5-2B",
-        "description": "Основной VLM для 24GB и 2x3090, лучше для OCR/doc/ui задач.",
+        "name": "SmolVLM-500M Instruct",
+        "repo_id": "HuggingFaceTB/SmolVLM-500M-Instruct",
+        "save_name": "SmolVLM-500M-Instruct",
+        "params": "500M",
+        "vram": "~3 ГБ",
+        "task": "Мультизадачный",
+        "trust_remote_code": False,
+        "description": "Компактный VLM с хорошим балансом скорость/качество для домашних задач.",
+    },
+    {
+        "name": "moondream2",
+        "repo_id": "vikhyatk/moondream2",
+        "save_name": "moondream2",
+        "params": "1.9B",
+        "vram": "~4 ГБ",
+        "task": "Caption / VQA",
+        "trust_remote_code": True,
+        "description": "Популярная лёгкая модель для описания изображений и ответов на вопросы. Требует trust_remote_code.",
+    },
+    # --- Основные рабочие лошадки (24GB) ---
+    {
+        "name": "SmolVLM Instruct (2.2B)",
+        "repo_id": "HuggingFaceTB/SmolVLM-Instruct",
+        "save_name": "SmolVLM-Instruct",
+        "params": "2.2B",
+        "vram": "~6 ГБ (QLoRA)",
+        "task": "Instruction",
+        "trust_remote_code": False,
+        "description": "Отличный современный VLM для домашнего instruction tuning. Рекомендуется по умолчанию.",
+    },
+    {
+        "name": "Qwen2-VL 2B Instruct",
+        "repo_id": "Qwen/Qwen2-VL-2B-Instruct",
+        "save_name": "Qwen2-VL-2B-Instruct",
+        "params": "2B",
+        "vram": "~8 ГБ (QLoRA)",
+        "task": "Instruction / OCR",
+        "trust_remote_code": False,
+        "description": "Сильный компактный VLM с динамическим разрешением. Хорош для OCR и документов.",
+    },
+    {
+        "name": "InternVL2 2B",
+        "repo_id": "OpenGVLab/InternVL2-2B",
+        "save_name": "InternVL2-2B",
+        "params": "2B",
+        "vram": "~8 ГБ (QLoRA)",
+        "task": "Мультизадачный",
+        "trust_remote_code": True,
+        "description": "Мощный компактный VLM из линейки InternVL. Требует trust_remote_code.",
+    },
+    {
+        "name": "PaliGemma2 3B (224)",
+        "repo_id": "google/paligemma2-3b-pt-224",
+        "save_name": "paligemma2-3b-pt-224",
+        "params": "3B",
+        "vram": "~10 ГБ (QLoRA)",
+        "task": "Caption / VQA",
+        "trust_remote_code": False,
+        "description": "Модель Google для тонкой настройки под конкретные задачи (caption, VQA, detection).",
     },
     {
         "name": "Qwen2.5-VL 3B Instruct",
         "repo_id": "Qwen/Qwen2.5-VL-3B-Instruct",
         "save_name": "Qwen2.5-VL-3B-Instruct",
-        "description": "Хороший запасной instruct-бейзлайн, если нужен зрелый мультимодальный стек.",
+        "params": "3B",
+        "vram": "~10 ГБ (QLoRA)",
+        "task": "Instruction / OCR",
+        "trust_remote_code": False,
+        "description": "Зрелый instruct-бейзлайн нового поколения. Лучший выбор для OCR/doc/UI задач на 24GB.",
     },
+    # --- Для сильных сетапов (2x3090 / 48GB) ---
     {
         "name": "Qwen2.5-VL 7B Instruct",
         "repo_id": "Qwen/Qwen2.5-VL-7B-Instruct",
         "save_name": "Qwen2.5-VL-7B-Instruct",
-        "description": "Сильный instruct-бейзлайн для 2x3090.",
+        "params": "7B",
+        "vram": "~18 ГБ (QLoRA)",
+        "task": "Instruction / OCR",
+        "trust_remote_code": False,
+        "description": "Сильный instruct-бейзлайн для 2x3090 и серьёзных задач.",
+    },
+    {
+        "name": "LLaVA 1.5 7B",
+        "repo_id": "llava-hf/llava-1.5-7b-hf",
+        "save_name": "llava-1.5-7b",
+        "params": "7B",
+        "vram": "~18 ГБ (QLoRA)",
+        "task": "Instruction",
+        "trust_remote_code": False,
+        "description": "Классический LLaVA — стабильный вариант для image+instruction тюнинга.",
     },
     {
         "name": "LLaVA-NeXT Mistral 7B",
         "repo_id": "llava-hf/llava-v1.6-mistral-7b-hf",
         "save_name": "llava-v1.6-mistral-7b",
-        "description": "Альтернатива Qwen-линейке для классического image+instruction тюнинга.",
+        "params": "7B",
+        "vram": "~20 ГБ (QLoRA)",
+        "task": "Instruction",
+        "trust_remote_code": False,
+        "description": "Улучшенный LLaVA-NeXT с более высоким разрешением.",
     },
 ]
 
@@ -198,41 +281,111 @@ SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-VLM_HF_DATASETS: List[Dict[str, str]] = [
+VLM_DATASET_CATEGORIES = ["Все", "Instruction", "Caption", "VQA", "OCR / Документы"]
+
+VLM_HF_DATASETS: List[Dict[str, Any]] = [
+    # --- OCR / Документы (маленькие, идеальны для локального старта) ---
     {
-        "id": "HuggingFaceH4/llava-instruct-mix-vsft",
-        "name": "LLaVA Instruct Mix",
-        "description": "Основной single-image instruction tuning корпус.",
-        "split": "train",
-        "format": "image_messages",
+        "id": "nielsr/docvqa_1200_examples",
+        "name": "DocVQA (1200 примеров)",
+        "category": "OCR / Документы",
+        "description": "Крошечный doc-QA набор (1200 примеров). Идеален для первого локального прогона OCR/документов.",
+        "split": "test",
+        "subset": None,
+        "format": "ocr_qa",
+        "size": "~200 МБ",
+        "recommended_rows": 1200,
     },
     {
-        "id": "Vision-Flan/vision-flan",
-        "name": "Vision-Flan",
-        "description": "Крупный human-labeled instruction tuning датасет.",
+        "id": "naver-clova-ix/cord-v2",
+        "name": "CORD v2 (чеки)",
+        "category": "OCR / Документы",
+        "description": "Небольшой набор чеков для OCR/структурированного извлечения. ~1000 примеров.",
         "split": "train",
-        "format": "image_messages",
+        "subset": None,
+        "format": "image_caption",
+        "size": "~200 МБ",
+        "recommended_rows": 800,
+    },
+    # --- VQA (вопрос-ответ по картинке) ---
+    {
+        "id": "flaviagiammarino/vqa-rad",
+        "name": "VQA-RAD (медицина)",
+        "category": "VQA",
+        "description": "Небольшой медицинский VQA (рентген/снимки). ~2000 примеров, хорош для узкой доменной настройки.",
+        "split": "train",
+        "subset": None,
+        "format": "ocr_qa",
+        "size": "~300 МБ",
+        "recommended_rows": 2000,
+    },
+    {
+        "id": "derek-thomas/ScienceQA",
+        "name": "ScienceQA",
+        "category": "VQA",
+        "description": "Научный VQA с картинками и вариантами ответов. Хорош для reasoning по изображению.",
+        "split": "train",
+        "subset": None,
+        "format": "ocr_qa",
+        "size": "стриминг",
+        "recommended_rows": 5000,
+    },
+    {
+        "id": "HuggingFaceM4/VQAv2",
+        "name": "VQAv2",
+        "category": "VQA",
+        "description": "Стандартный крупный VQA-бенчмарк. Качайте с лимитом строк для локального трена.",
+        "split": "train",
+        "subset": None,
+        "format": "ocr_qa",
+        "size": "большой (стриминг)",
+        "recommended_rows": 10000,
+    },
+    # --- Caption (описание изображений, для alignment/pretrain) ---
+    {
+        "id": "nlphuji/flickr30k",
+        "name": "Flickr30k",
+        "category": "Caption",
+        "description": "Классический caption-набор (~31k изображений, по 5 подписей). Отлично для alignment/pretrain.",
+        "split": "test",
+        "subset": None,
+        "format": "image_caption",
+        "size": "~4 ГБ",
+        "recommended_rows": 5000,
     },
     {
         "id": "HuggingFaceM4/COCO",
         "name": "COCO Captions",
-        "description": "Простой caption корпус для small-task pretrain/alignment.",
+        "category": "Caption",
+        "description": "Крупный caption корпус для small-task pretrain/alignment. Качайте с лимитом.",
         "split": "train",
+        "subset": None,
         "format": "image_caption",
+        "size": "большой (стриминг)",
+        "recommended_rows": 10000,
+    },
+    # --- Instruction (мультимодальные диалоги) ---
+    {
+        "id": "HuggingFaceH4/llava-instruct-mix-vsft",
+        "name": "LLaVA Instruct Mix",
+        "category": "Instruction",
+        "description": "Основной single-image instruction tuning корпус. Стандарт для VLM SFT.",
+        "split": "train",
+        "subset": None,
+        "format": "image_messages",
+        "size": "большой (стриминг)",
+        "recommended_rows": 10000,
     },
     {
-        "id": "liuhaotian/LLaVA-Pretrain",
-        "name": "LLaVA Pretrain",
-        "description": "Caption-alignment корпус для continued multimodal pretrain.",
+        "id": "TIGER-Lab/VisualWebInstruct",
+        "name": "VisualWebInstruct",
+        "category": "Instruction",
+        "description": "Разнообразные мультимодальные инструкции из web-контента.",
         "split": "train",
-        "format": "image_caption",
-    },
-    {
-        "id": "nielsr/caption-the-image",
-        "name": "Caption the Image",
-        "description": "Небольшой caption dataset для быстрых домашних прогонов.",
-        "split": "train",
-        "format": "image_caption",
+        "subset": None,
+        "format": "image_messages",
+        "size": "большой (стриминг)",
+        "recommended_rows": 8000,
     },
 ]
 
@@ -378,90 +531,357 @@ def _download_hf_vlm_model(repo_id: str, save_name: str) -> bool:
         return False
 
 
-def _dataset_output_record(row: Dict[str, Any], dataset_id: str, idx: int, format_type: str) -> Optional[Dict[str, Any]]:
-    image = row.get("image")
-    if image is None and row.get("images"):
-        image = row["images"][0]
+def _coerce_text(value: Any) -> Optional[str]:
+    """Reduce a field to a single readable string.
+
+    Handles the common messy shapes found in HF datasets: lists (take first
+    non-empty), multilingual dicts like ``{'en': ..., 'de': ...}`` (prefer
+    English), and plain scalars.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        for key in ("en", "english", "text", "value"):
+            if value.get(key):
+                return str(value[key]).strip() or None
+        for v in value.values():
+            if v:
+                return str(v).strip() or None
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            coerced = _coerce_text(item)
+            if coerced:
+                return coerced
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_caption(value: Any) -> Optional[str]:
+    """Captions come as str or list[str] (e.g. Flickr30k has 5 captions)."""
+    return _coerce_text(value)
+
+
+def _extract_row_image(row: Dict[str, Any]) -> Any:
+    for key in ("image", "images", "img", "picture"):
+        val = row.get(key)
+        if val is None:
+            continue
+        if isinstance(val, (list, tuple)):
+            return val[0] if val else None
+        return val
+    return None
+
+
+def _dataset_output_record(
+    row: Dict[str, Any],
+    dataset_id: str,
+    idx: int,
+    format_type: str,
+    images_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    image = _extract_row_image(row)
     if image is None:
         return None
-    image_ref = None
+
     if hasattr(image, "save"):
-        file_name = f"vlm_{dataset_id.replace('/', '_')}_{idx}.png"
-        image_path = DATASET_DIR / file_name
-        image.save(image_path)
-        image_ref = file_name
+        file_name = f"{dataset_id.replace('/', '_')}_{idx}.png"
+        try:
+            image.convert("RGB").save(images_dir / file_name)
+        except Exception:
+            try:
+                image.save(images_dir / file_name)
+            except Exception:
+                return None
+        image_ref = f"{images_dir.name}/{file_name}"
     else:
         image_ref = str(image)
 
     if format_type == "image_messages":
         messages = row.get("messages") or row.get("conversations")
-        if not messages and row.get("question") and (row.get("answer") or row.get("output")):
-            answer = row.get("answer") or row.get("output")
-            messages = [
-                {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": str(row["question"])}]},
-                {"role": "assistant", "content": [{"type": "text", "text": str(answer)}]},
-            ]
+        if not messages:
+            question = _coerce_text(row.get("question") or row.get("query") or row.get("prompt"))
+            answer = _coerce_text(row.get("answer") or row.get("answers") or row.get("output") or row.get("response"))
+            if question and answer:
+                messages = [
+                    {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": question}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+                ]
         if not messages:
             return None
         return {"image": image_ref, "messages": messages, "schema": "single_image_messages"}
 
-    caption = row.get("caption") or row.get("caption_text") or row.get("caption_gt") or row.get("text")
-    if format_type == "image_caption" and caption:
-        return {"image": image_ref, "caption": str(caption), "schema": "single_image_caption"}
+    if format_type == "image_caption":
+        caption = _normalize_caption(
+            row.get("caption")
+            or row.get("caption_text")
+            or row.get("caption_gt")
+            or row.get("captions")
+            or row.get("text")
+            or row.get("label")
+        )
+        if caption:
+            return {"image": image_ref, "caption": caption, "schema": "single_image_caption"}
+        return None
 
     if format_type == "ocr_qa":
-        question = row.get("question") or row.get("prompt")
-        answer = row.get("answer") or row.get("response") or row.get("output")
+        question = _coerce_text(row.get("question") or row.get("query") or row.get("prompt"))
+        answer = _coerce_text(row.get("answer") or row.get("answers") or row.get("response") or row.get("output"))
         if question and answer:
             return {
                 "image": image_ref,
-                "question": str(question),
-                "answer": str(answer),
+                "question": question,
+                "answer": answer,
                 "schema": "ocr_or_doc_qa",
             }
     return None
 
 
-def _download_hf_vlm_dataset(hf_id: str, split: str, out_name: str, format_type: str) -> str | None:
+def _inspect_hf_dataset(repo_id: str) -> tuple[Optional[Dict[str, Any]], str]:
+    """Fetch available configs/subsets and splits for a HF dataset repo.
+
+    Returns (info_dict_or_None, message). Mirrors the "check repo" behaviour of
+    the LLM studio so the user can pick a real subset/split before downloading.
+    """
+    try:
+        from datasets import get_dataset_config_names, get_dataset_split_names
+    except ImportError:
+        return None, "Библиотека 'datasets' не установлена"
+
+    try:
+        configs = get_dataset_config_names(repo_id)
+    except Exception as exc:
+        return None, f"Не удалось получить конфиги: {exc}"
+
+    selected_config = configs[0] if configs else None
+    splits: List[str] = []
+    if selected_config is not None:
+        try:
+            splits = get_dataset_split_names(repo_id, selected_config)
+        except Exception:
+            splits = []
+    else:
+        try:
+            splits = get_dataset_split_names(repo_id)
+        except Exception:
+            splits = []
+
+    return (
+        {"configs": configs, "splits": splits, "selected_config": selected_config},
+        f"Найдено конфигов: {len(configs)}, splits: {splits or '—'}",
+    )
+
+
+def _download_hf_vlm_dataset(
+    hf_id: str,
+    split: str,
+    out_name: str,
+    format_type: str,
+    subset: Optional[str] = None,
+    limit_type: str = "rows",
+    max_rows: int = 0,
+    max_bytes: int = 0,
+    progress_cb=None,
+) -> tuple[Optional[str], str]:
+    """Download and convert an HF VLM dataset to local JSONL + images.
+
+    Streaming keeps memory/disk bounded. ``limit_type`` selects whether the
+    download is capped by row count (``"rows"`` + ``max_rows``) or by on-disk
+    size in bytes (``"gb"`` + ``max_bytes``, counting JSONL text plus images).
+    Returns (path_or_None, message).
+    """
     try:
         from datasets import load_dataset
     except ImportError:
-        return "datasets library not installed"
-    out_path = DATASET_DIR / (out_name or "vlm_data.jsonl")
+        return None, "Библиотека 'datasets' не установлена"
+
+    base_name = (out_name or hf_id.split("/")[-1]).replace(".jsonl", "")
+    out_path = DATASET_DIR / f"{base_name}.jsonl"
+    images_dir = DATASET_DIR / f"{base_name}_images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    load_kwargs: Dict[str, Any] = {"split": split, "streaming": True}
+    subset_arg = None if (not subset or subset.strip() == "" or subset.strip().lower() == "default") else subset.strip()
+    if subset_arg:
+        load_kwargs["name"] = subset_arg
+
     try:
-        dataset = load_dataset(hf_id, split=split, trust_remote_code=True)
+        dataset = load_dataset(hf_id, **load_kwargs)
     except Exception as exc:
-        return str(exc)
+        return None, f"Не удалось открыть датасет: {exc}"
 
     written = 0
-    with open(out_path, "w", encoding="utf-8") as f:
-        for idx, row in enumerate(dataset):
-            try:
-                record = _dataset_output_record(row, hf_id, idx, format_type)
-                if not record:
-                    continue
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                written += 1
-            except Exception:
-                continue
-    return str(out_path) if written > 0 else None
+    scanned = 0
+    total_bytes = 0
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            for idx, row in enumerate(dataset):
+                scanned += 1
+                try:
+                    record = _dataset_output_record(row, hf_id, idx, format_type, images_dir)
+                except Exception:
+                    record = None
+                if record:
+                    line = json.dumps(record, ensure_ascii=False) + "\n"
+                    line_bytes = len(line.encode("utf-8"))
+                    img_bytes = 0
+                    img_ref = record.get("image")
+                    if img_ref and not str(img_ref).startswith(("http://", "https://")):
+                        img_path = DATASET_DIR / str(img_ref)
+                        if img_path.exists():
+                            img_bytes = img_path.stat().st_size
+
+                    if limit_type == "gb" and max_bytes > 0 and (total_bytes + line_bytes + img_bytes) > max_bytes:
+                        # Would exceed the size cap — drop the just-saved image and stop.
+                        if img_bytes:
+                            (DATASET_DIR / str(img_ref)).unlink(missing_ok=True)
+                        break
+
+                    f.write(line)
+                    written += 1
+                    total_bytes += line_bytes + img_bytes
+                    if progress_cb and written % 25 == 0:
+                        progress_cb(written, total_bytes)
+                    if limit_type == "rows" and max_rows > 0 and written >= max_rows:
+                        break
+                if scanned > 200 and written == 0:
+                    # Format almost certainly mismatched — bail out early.
+                    break
+    except Exception as exc:
+        return None, f"Ошибка при конвертации: {exc}"
+
+    if written == 0:
+        shutil.rmtree(images_dir, ignore_errors=True)
+        out_path.unlink(missing_ok=True)
+        return None, "Не удалось извлечь ни одного примера (проверьте формат/split)."
+
+    size_mb = total_bytes / (1024 * 1024)
+    return str(out_path), f"Сохранено {written} примеров ({size_mb:.1f} МБ вкл. картинки) → {out_path.name}"
+
+
+def _estimate_jsonl_rows(path: Path, file_size: int | None = None) -> tuple[int, bool]:
+    """Estimate the number of rows in a JSONL file without reading it whole.
+
+    Returns ``(count, exact)``. For small files we count precisely; for large
+    ones we sample the first lines and extrapolate from the average line size.
+    This keeps the datasets listing fast even with multi-GB files in datasets/.
+    """
+    try:
+        if file_size is None:
+            file_size = path.stat().st_size
+        if file_size == 0:
+            return 0, True
+        # Small files: exact count is cheap.
+        if file_size <= 2 * 1024 * 1024:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return sum(1 for line in f if line.strip()), True
+        # Large files: sample the first lines and extrapolate.
+        sampled_bytes = 0
+        sampled_lines = 0
+        with open(path, "rb") as f:
+            for _ in range(200):
+                line = f.readline()
+                if not line:
+                    break
+                if line.strip():
+                    sampled_bytes += len(line)
+                    sampled_lines += 1
+        if sampled_lines == 0 or sampled_bytes == 0:
+            return 0, False
+        avg = sampled_bytes / sampled_lines
+        return max(1, int(file_size / avg)), False
+    except Exception:
+        return 0, False
+
+
+def _record_has_image(record: Any) -> bool:
+    """True if a JSONL record references at least one image (any common schema)."""
+    if not isinstance(record, dict):
+        return False
+    for key in ("image", "images", "image_path", "input_image_path", "image_url"):
+        value = record.get(key)
+        if value:
+            return True
+    for conv_key in ("messages", "conversations"):
+        messages = record.get(conv_key)
+        if isinstance(messages, list):
+            for message in messages:
+                content = message.get("content") if isinstance(message, dict) else None
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and (
+                            item.get("type") in {"image", "image_url"} or item.get("image") or item.get("image_url")
+                        ):
+                            return True
+    return False
+
+
+def _dataset_has_images(path: Path, sample_size: int = 8) -> bool:
+    """Detect whether a dataset is multimodal.
+
+    A dataset counts as VLM if an accompanying ``{stem}_images`` directory exists
+    or any of the first records reference an image. This is what actually decides
+    whether ``VLMJsonlDataset`` will yield any training examples.
+    """
+    if (DATASET_DIR / f"{path.stem}_images").is_dir():
+        return True
+    preview = _read_dataset_preview(path, limit=sample_size)
+    return any(_record_has_image(rec) for rec in preview.get("samples", []))
 
 
 def _get_vlm_datasets() -> List[Dict[str, Any]]:
     datasets = []
     for path in sorted(DATASET_DIR.glob("*.jsonl")):
-        size_mb = path.stat().st_size / (1024 * 1024)
-        preview = _read_dataset_preview(path, limit=1)
+        size_bytes = path.stat().st_size
+        size_mb = size_bytes / (1024 * 1024)
+        preview = _read_dataset_preview(path, limit=8)
+        count, exact = _estimate_jsonl_rows(path, size_bytes)
+        has_images = _dataset_has_images(path)
         datasets.append(
             {
                 "name": path.name,
                 "path": str(path),
                 "size": f"{size_mb:.1f} MB",
-                "schema": preview.get("schema", "unknown"),
-                "count": preview.get("count", 0),
+                "schema": preview.get("schema", "unknown") if has_images else "⚠️ без изображений",
+                "count": count,
+                "count_exact": exact,
+                "has_images": has_images,
             }
         )
+    # VLM datasets (with images) first, so the default selection is a valid one.
+    datasets.sort(key=lambda d: (not d["has_images"], d["name"]))
     return datasets
+
+
+def _delete_vlm_dataset(path: str) -> tuple[bool, str]:
+    """Delete a dataset JSONL and its associated images directory (if any)."""
+    try:
+        p = Path(path)
+        if p.resolve().parent != DATASET_DIR.resolve():
+            return False, "Можно удалять только файлы внутри datasets/"
+        if p.exists():
+            p.unlink()
+        images_dir = DATASET_DIR / f"{p.stem}_images"
+        if images_dir.exists() and images_dir.is_dir():
+            shutil.rmtree(images_dir, ignore_errors=True)
+        return True, "Датасет удалён"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _delete_vlm_model(path: str) -> tuple[bool, str]:
+    """Delete a locally downloaded model directory inside models/."""
+    try:
+        p = Path(path)
+        if not str(p.resolve()).startswith(str(MODELS_DIR.resolve())):
+            return False, "Можно удалять только модели внутри models/"
+        if p.exists() and p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            return True, "Модель удалена"
+        return False, "Папка не найдена"
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _model_looks_like_vlm(cfg: Dict[str, Any]) -> bool:
@@ -498,6 +918,23 @@ def _default_gpu_ids(num_gpus: int) -> List[int]:
     return list(range(max(1, int(num_gpus))))
 
 
+def _model_available_locally(model_ref: str) -> bool:
+    """True if the model is a local dir or already in the HF hub cache.
+
+    Used to decide whether we can safely run training with HF offline flags.
+    """
+    if not model_ref:
+        return False
+    p = Path(model_ref)
+    if p.exists() and (p / "config.json").exists():
+        return True
+    hf_home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    cache_dir = Path(hf_home) / "hub" / ("models--" + model_ref.replace("/", "--"))
+    if cache_dir.exists() and any(cache_dir.glob("snapshots/*/config.json")):
+        return True
+    return False
+
+
 def _start_vlm_training(config: Dict[str, Any]) -> tuple[str, subprocess.Popen]:
     stage = config.get("stage", "vlm_sft")
     worker_module = STAGE_TO_WORKER[stage]
@@ -527,6 +964,12 @@ def _start_vlm_training(config: Dict[str, Any]) -> tuple[str, subprocess.Popen]:
     if config.get("gpu_ids"):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in config["gpu_ids"])
     env["PYTHONUNBUFFERED"] = "1"
+    # If the base model is already local/cached, force HF offline so from_pretrained
+    # never hangs contacting huggingface.co (model download is a separate step).
+    base_model = config.get("base_model_path") or config.get("model_name_or_path") or ""
+    if _model_available_locally(base_model):
+        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("TRANSFORMERS_OFFLINE", "1")
 
     num_gpus = int(config.get("num_gpus", 1))
     if num_gpus > 1 and ACCELERATE_MULTI_GPU_CONFIG.exists():
@@ -627,9 +1070,16 @@ def _read_dataset_preview(path: Path, limit: int = 5) -> Dict[str, Any]:
 def _render_quick_summary_vlm(config: Dict[str, Any]) -> bool:
     model_display = _resolve_model_choice_label(config.get("base_model_path", ""))
     data_path = config.get("data_path") or ""
-    data_display = Path(data_path).name if data_path and Path(data_path).exists() else "❌ Не выбрано"
+    data_exists = bool(data_path and Path(data_path).exists())
+    has_images = data_exists and _dataset_has_images(Path(data_path))
+    if not data_exists:
+        data_display = "❌ Не выбрано"
+    elif not has_images:
+        data_display = f"⚠️ {Path(data_path).name} (нет изображений)"
+    else:
+        data_display = f"🖼️ {Path(data_path).name}"
     stage_display = t(dict(VLM_STAGES).get(config.get("stage", "vlm_sft"), config.get("stage", "vlm_sft")))
-    all_ready = bool(config.get("base_model_path")) and bool(data_path and Path(data_path).exists())
+    all_ready = bool(config.get("base_model_path")) and data_exists and has_images
     st.markdown(
         f"""
         <div style="background: linear-gradient(135deg, #1e1e1e 0%, #2a2a2a 100%); border: 2px solid #444; border-radius: 12px; padding: 1rem; margin-bottom: 1rem;">
@@ -670,6 +1120,114 @@ def _render_model_preview_vlm(config: Dict[str, Any]) -> None:
         f"Этап: `{stage}` | Freeze vision tower: `{freeze_vision}` | "
         f"Min pixels: `{config.get('min_pixels', 'auto')}` | Max pixels: `{config.get('max_pixels', 'auto')}`"
     )
+
+
+def render_vlm_sft_main_config(data_path: str) -> Dict[str, Any]:
+    """Field-mapping configurator for VLM datasets (mirrors LLM SFT config).
+
+    Lets the user pick which columns hold the image / question / answer / caption /
+    messages and previews the resulting prompt + image. Returns ``{"vlm_columns": ...}``
+    to be merged into the training config.
+    """
+    st.markdown("### 🛠️ Конфигурация полей датасета")
+    if not data_path or not Path(data_path).exists():
+        st.info("Выберите мультимодальный датасет в сайдбаре, чтобы настроить поля.")
+        return {}
+
+    preview = _read_dataset_preview(Path(data_path), limit=1)
+    samples = preview.get("samples", [])
+    if not samples:
+        st.error("Не удалось прочитать пример из датасета.")
+        return {}
+    sample = samples[0]
+    all_keys = list(sample.keys())
+    list_fields = [k for k, v in sample.items() if isinstance(v, list)]
+    image_candidates = [k for k in all_keys if k.lower() in ("image", "images", "image_path", "input_image_path", "image_url")]
+
+    if sample.get("messages") or sample.get("conversations"):
+        auto_format = "messages"
+    elif sample.get("caption"):
+        auto_format = "caption"
+    else:
+        auto_format = "vqa"
+
+    col_json, col_cfg = st.columns([1, 1])
+    with col_json:
+        st.markdown("#### 📄 Пример записи:")
+        with st.container(height=380):
+            st.json(sample, expanded=True)
+
+    with col_cfg:
+        fmt_labels = {
+            "vqa": "❓ VQA (вопрос/ответ)",
+            "caption": "🖼️ Caption (описание)",
+            "messages": "💬 Chat (сообщения)",
+        }
+        fmt_keys = list(fmt_labels.keys())
+        labels = [fmt_labels[k] for k in fmt_keys]
+        fmt_choice = st.radio(
+            "Формат данных:", labels, index=fmt_keys.index(auto_format), horizontal=True, key="vlm_sft_format"
+        )
+        fmt = fmt_keys[labels.index(fmt_choice)]
+
+        img_options = image_candidates or all_keys
+        image_field = st.selectbox("🖼️ Поле с изображением:", img_options, index=0, key="vlm_sft_image_field")
+
+        vlm_columns: Dict[str, Any] = {"format": fmt, "image_field": image_field}
+
+        if fmt == "vqa":
+            q_guess = next((k for k in all_keys if k.lower() in ("question", "prompt", "instruction", "query")), all_keys[0])
+            a_guess = next((k for k in all_keys if k.lower() in ("answer", "response", "output", "completion", "label")), all_keys[-1])
+            c1, c2 = st.columns(2)
+            question_field = c1.selectbox("👤 Вопрос (user):", all_keys, index=all_keys.index(q_guess), key="vlm_sft_q")
+            answer_field = c2.selectbox("🤖 Ответ (assistant):", all_keys, index=all_keys.index(a_guess), key="vlm_sft_a")
+            vlm_columns.update(question_field=question_field, answer_field=answer_field)
+        elif fmt == "caption":
+            cap_guess = next((k for k in all_keys if k.lower() in ("caption", "text", "description", "answer")), all_keys[-1])
+            caption_field = st.selectbox("🖼️ Поле описания:", all_keys, index=all_keys.index(cap_guess), key="vlm_sft_cap")
+            caption_prompt = st.text_input(
+                "Промпт для caption:", st.session_state.get("vlm_cfg_caption_prompt", "Describe this image."), key="vlm_sft_capprompt"
+            )
+            vlm_columns.update(caption_field=caption_field, caption_prompt=caption_prompt)
+        else:
+            if not list_fields:
+                st.error("В записи нет поля-списка сообщений — выберите другой формат.")
+                return {}
+            msg_guess = next((k for k in list_fields if k.lower() in ("messages", "conversations")), list_fields[0])
+            messages_field = st.selectbox("💬 Поле сообщений:", list_fields, index=list_fields.index(msg_guess), key="vlm_sft_msgs")
+            vlm_columns.update(messages_field=messages_field)
+
+        st.markdown("---")
+        st.markdown("#### 👁️ Превью:")
+        pc1, pc2 = st.columns([1, 2])
+        with pc1:
+            try:
+                img_ref = sample.get(image_field)
+                if isinstance(img_ref, list):
+                    img_ref = img_ref[0] if img_ref else None
+                if isinstance(img_ref, str) and img_ref:
+                    img_path = img_ref
+                    if not Path(img_path).is_absolute() and not img_path.startswith(("http://", "https://")):
+                        img_path = str(Path(data_path).parent / img_ref)
+                    st.image(img_path, use_container_width=True)
+                else:
+                    st.caption("Изображение недоступно для превью")
+            except Exception as exc:
+                st.caption(f"Изображение недоступно: {exc}")
+        with pc2:
+            try:
+                if fmt == "vqa":
+                    st.markdown(f"**👤 User:** {_coerce_text(sample.get(vlm_columns['question_field']))}")
+                    st.markdown(f"**🤖 Assistant:** {_coerce_text(sample.get(vlm_columns['answer_field']))}")
+                elif fmt == "caption":
+                    st.markdown(f"**👤 User:** {vlm_columns['caption_prompt']}")
+                    st.markdown(f"**🤖 Assistant:** {_coerce_text(sample.get(vlm_columns['caption_field']))}")
+                else:
+                    st.json(sample.get(vlm_columns["messages_field"]))
+            except Exception as exc:
+                st.caption(f"Превью текста недоступно: {exc}")
+
+    return {"vlm_columns": vlm_columns}
 
 
 def _load_chat_model(model_path: str):
@@ -908,11 +1466,20 @@ def _render_vlm_training_config(selected_stage: str) -> Dict[str, Any]:
 def _render_vlm_dataset_config(selected_stage: str) -> Dict[str, Any]:
     st.sidebar.header(f"📁 {t('sidebar.data')}")
     datasets = _get_vlm_datasets()
-    dataset_options = [f"{item['name']} ({item['schema']}, {item['size']})" for item in datasets]
+    vlm_datasets = [d for d in datasets if d["has_images"]]
+    dataset_options = [
+        f"{'🖼️' if item['has_images'] else '⚠️'} {item['name']} ({item['schema']}, {item['size']})"
+        for item in datasets
+    ]
     if dataset_options:
-        selected_dataset_label = st.sidebar.selectbox(t("data.select_dataset"), dataset_options, index=0 if dataset_options else None)
-        selected_dataset = next((item for item in datasets if selected_dataset_label.startswith(item["name"])), None)
+        selected_dataset_label = st.sidebar.selectbox(t("data.select_dataset"), dataset_options, index=0)
+        selected_dataset = next((item for item in datasets if selected_dataset_label.endswith(f"({item['schema']}, {item['size']})") and item["name"] in selected_dataset_label), None)
         data_path = selected_dataset["path"] if selected_dataset else ""
+        if not vlm_datasets:
+            st.sidebar.warning(
+                "Нет мультимодальных датасетов (с изображениями). Скачайте VLM-датасет на вкладке «Данные» "
+                "(например, DocVQA/VQA/caption) — VLM-обучению нужны пары изображение+текст."
+            )
     else:
         st.sidebar.warning(t("data.no_datasets"))
         data_path = ""
@@ -921,6 +1488,12 @@ def _render_vlm_dataset_config(selected_stage: str) -> Dict[str, Any]:
         data_path = manual_data_path
         if not Path(data_path).is_absolute() and (DATASET_DIR / data_path).exists():
             data_path = str(DATASET_DIR / data_path)
+    # Guardrail: VLM training silently yields 0 examples on text-only data.
+    if data_path and Path(data_path).exists() and not _dataset_has_images(Path(data_path)):
+        st.sidebar.error(
+            f"❌ В датасете `{Path(data_path).name}` нет изображений. "
+            "VLM-обучение работает только с данными изображение+текст — выберите мультимодальный датасет."
+        )
     st.sidebar.divider()
     st.sidebar.subheader("Validation / Eval")
     val_data_path = st.sidebar.text_input("Val dataset (опционально)", value=st.session_state.get("vlm_cfg_val_data_path", ""))
@@ -994,7 +1567,15 @@ def _render_vlm_distributed_config(training_config: Dict[str, Any] | None = None
         index=_safe_option_index(mp_options, saved_mp, default=2),
     )
     gradient_checkpointing = st.sidebar.checkbox("Gradient Checkpointing", value=bool(st.session_state.get("vlm_cfg_gradient_checkpointing", True)))
-    flash_attention = st.sidebar.checkbox("FlashAttention", value=bool(st.session_state.get("vlm_cfg_use_flash_attention", True)))
+    flash_attention = st.sidebar.checkbox(
+        "FlashAttention",
+        value=bool(st.session_state.get("vlm_cfg_use_flash_attention", True)),
+        help=(
+            "Как в LLM Studio: включает flash-ядра. Для fp16/bf16 + LoRA/full пробует пакет "
+            "flash_attention_2, для QLoRA и в остальных случаях использует SDPA flash-ядра PyTorch "
+            "(это тоже FlashAttention-2). Выкл. — обычный (eager) attention."
+        ),
+    )
     min_pixels = st.sidebar.number_input("min_pixels (0=auto)", value=int(st.session_state.get("vlm_cfg_min_pixels", 0)), step=784)
     max_pixels = st.sidebar.number_input("max_pixels (0=auto)", value=int(st.session_state.get("vlm_cfg_max_pixels", 0)), step=784)
     freeze_vision_tower = st.sidebar.checkbox("Freeze vision tower", value=bool(st.session_state.get("vlm_cfg_freeze_vision_tower", True)))
@@ -1017,6 +1598,214 @@ def _render_vlm_distributed_config(training_config: Dict[str, Any] | None = None
         "max_new_tokens": int(max_new_tokens),
         "temperature": float(temperature),
     }
+
+
+try:
+    _st_fragment = st.fragment
+except AttributeError:  # older Streamlit
+    try:
+        _st_fragment = st.experimental_fragment
+    except AttributeError:
+        _st_fragment = lambda *a, **k: (lambda fn: fn)  # no-op fallback
+
+
+def _vlm_fmt_params(n: Any) -> str:
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "—"
+    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if n >= div:
+            return f"{n / div:.2f}{unit}"
+    return str(int(n))
+
+
+def _vlm_fmt_time(seconds: Any) -> str:
+    try:
+        seconds = int(float(seconds))
+    except (TypeError, ValueError):
+        return "—"
+    if seconds <= 0:
+        return "0с"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}ч {m}м"
+    if m:
+        return f"{m}м {s}с"
+    return f"{s}с"
+
+
+@_st_fragment(run_every=2)
+def _vlm_live_monitor() -> None:
+    """Auto-refreshing (every 2s) live dashboard for the selected VLM run.
+
+    Mirrors the LLM Studio monitoring: status header, 6 metric cards, progress
+    bar, Loss/LR charts (Reward/KL for GRPO), GPU load, checkpoints, samples, logs.
+    """
+    import plotly.graph_objects as go
+
+    selected_run = st.session_state.get("vlm_current_run_id")
+    if not selected_run:
+        st.info("Выберите run выше.")
+        return
+    metrics = _load_metrics(selected_run) or {}
+    alive = _is_process_running(selected_run)
+    status = metrics.get("status") or ("training" if alive else "unknown")
+    status = str(status)
+    stage = str(metrics.get("stage", "vlm_sft"))
+    is_grpo = "grpo" in stage
+
+    status_emoji = {
+        "training": "🟢",
+        "completed": "✅",
+        "error": "❌",
+        "stopped": "⏹️",
+        "starting": "⏳",
+        "initializing": "⏳",
+        "loading_model": "⏳",
+        "loading_dataset": "⏳",
+        "saving_model": "💾",
+    }.get(status, "⏳")
+
+    head_l, head_r = st.columns([0.8, 0.2])
+    with head_l:
+        st.subheader(f"{status_emoji} Статус: {status.upper()}")
+    with head_r:
+        if alive and st.button("⏹ Остановить", key=f"vlm_stop_{selected_run}", use_container_width=True):
+            _stop_vlm_training(selected_run)
+            st.rerun()
+
+    if alive and status in ("starting", "initializing", "loading_model", "loading_dataset"):
+        st.info(
+            "⏳ Подготовка… Первый QLoRA-запуск после старта контейнера компилирует CUDA-ядра "
+            "(bitsandbytes/Triton) — это может занять несколько минут. Дальше запуски идут быстро."
+        )
+    elif status == "completed":
+        st.success(f"✅ Завершено — {metrics.get('training_duration', '')}")
+    elif status == "error" and metrics.get("error"):
+        with st.expander("❌ Текст ошибки", expanded=True):
+            st.code(str(metrics["error"])[:4000])
+    elif status == "stopped":
+        st.warning("⏹️ Остановлено пользователем")
+
+    current_step = int(metrics.get("current_step", 0) or 0)
+    total_steps = int(metrics.get("total_steps", 0) or 0)
+    progress = (current_step / total_steps * 100) if total_steps > 0 else 0.0
+    progress = max(0.0, min(progress, 100.0))
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1:
+        suffix = f"Step {current_step}/{total_steps}" if total_steps else f"Step {current_step}"
+        st.metric("Прогресс", f"{progress:.1f}%", suffix)
+    with c2:
+        if is_grpo:
+            st.metric("Reward", f"{metrics.get('current_reward', 0.0):.4f}")
+        else:
+            st.metric("Train Loss", f"{metrics.get('current_loss', 0.0):.4f}")
+    with c3:
+        if is_grpo:
+            st.metric("KL", f"{metrics.get('current_kl', 0.0):.4f}" if "current_kl" in metrics else "—")
+        else:
+            vloss = metrics.get("current_val_loss")
+            st.metric("Val Loss", "—" if vloss is None else f"{vloss:.4f}")
+    with c4:
+        st.metric("Learning Rate", f"{metrics.get('current_lr', 0.0):.2e}")
+    with c5:
+        tp = metrics.get("trainable_params") or metrics.get("num_parameters")
+        st.metric("Параметры", _vlm_fmt_params(tp) if tp else "—")
+    with c6:
+        st.metric(
+            "Время",
+            _vlm_fmt_time(metrics.get("elapsed_seconds", 0)),
+            delta=f"ETA {_vlm_fmt_time(metrics.get('eta_seconds', 0))}" if metrics.get("eta_seconds") else None,
+        )
+
+    st.progress(
+        min(progress / 100, 1.0),
+        text=f"Шаг {current_step} / {total_steps}" if total_steps else "Ожидание первого шага…",
+    )
+    st.caption(f"Attention: `{metrics.get('attn_implementation', '—')}` · Этап: `{stage}`")
+
+    if metrics.get("loss_history"):
+        steps_history = metrics.get("steps_history", list(range(1, len(metrics["loss_history"]) + 1)))
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            fig_loss = go.Figure()
+            fig_loss.add_trace(go.Scatter(x=steps_history, y=metrics["loss_history"], mode="lines", name="Train Loss", line=dict(color="#e94560", width=2)))
+            if metrics.get("val_loss_history"):
+                fig_loss.add_trace(go.Scatter(x=metrics.get("val_steps_history", []), y=metrics["val_loss_history"], mode="lines", name="Val Loss", line=dict(dash="dash", color="#60a5fa", width=2)))
+            fig_loss.update_layout(title="Training Loss", xaxis_title="Step", yaxis_title="Loss", template="plotly_dark", height=300, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig_loss, use_container_width=True, key=f"vlm_loss_{selected_run}")
+        with cc2:
+            lr_history = metrics.get("lr_history", [])
+            if lr_history:
+                fig_lr = go.Figure()
+                fig_lr.add_trace(go.Scatter(x=steps_history[: len(lr_history)], y=lr_history, mode="lines", name="LR", line=dict(color="#60a5fa", width=2)))
+                fig_lr.update_layout(title="Learning Rate Schedule", xaxis_title="Step", yaxis_title="LR", template="plotly_dark", height=300, margin=dict(l=0, r=0, t=40, b=0))
+                st.plotly_chart(fig_lr, use_container_width=True, key=f"vlm_lr_{selected_run}")
+        if is_grpo and (metrics.get("reward_history") or metrics.get("kl_history")):
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                rh = metrics.get("reward_history", [])
+                if rh:
+                    fig_r = go.Figure()
+                    fig_r.add_trace(go.Scatter(x=steps_history[: len(rh)], y=rh, mode="lines", name="Reward", line=dict(color="#10b981", width=2)))
+                    fig_r.update_layout(title="🎯 Reward (GRPO)", xaxis_title="Step", yaxis_title="Reward", template="plotly_dark", height=300, margin=dict(l=0, r=0, t=40, b=0))
+                    st.plotly_chart(fig_r, use_container_width=True, key=f"vlm_reward_{selected_run}")
+            with rc2:
+                kh = metrics.get("kl_history", [])
+                if kh:
+                    fig_k = go.Figure()
+                    fig_k.add_trace(go.Scatter(x=steps_history[: len(kh)], y=kh, mode="lines", name="KL", line=dict(color="#f59e0b", width=2)))
+                    fig_k.update_layout(title="📊 KL Divergence (GRPO)", xaxis_title="Step", yaxis_title="KL", template="plotly_dark", height=300, margin=dict(l=0, r=0, t=40, b=0))
+                    st.plotly_chart(fig_k, use_container_width=True, key=f"vlm_kl_{selected_run}")
+    else:
+        st.info("📊 Графики появятся после первого залогированного шага.")
+
+    gpu_stats = metrics.get("gpu_stats", [])
+    if gpu_stats:
+        st.subheader("🖥️ Загрузка GPU")
+        gcols = st.columns(len(gpu_stats))
+        for col, gpu in zip(gcols, gpu_stats):
+            used = float(gpu.get("memory_used_gb", 0.0))
+            total = float(gpu.get("memory_total_gb", 0.0))
+            with col:
+                st.metric(f"GPU {gpu.get('id', 0)}", f"{used:.1f} / {total:.1f} GB")
+                if total > 0:
+                    st.progress(min(used / total, 1.0))
+
+    if metrics.get("sample_outputs"):
+        with st.expander("🖼️ Сэмплы ответов"):
+            for idx, sample in enumerate(metrics["sample_outputs"][-5:], start=1):
+                st.markdown(f"**Сэмпл {idx}** · Reward: {sample.get('reward', '—')}")
+                st.code(sample.get("prompt", ""), language="text")
+                st.write(sample.get("response", ""))
+
+    checkpoints = metrics.get("checkpoints", [])
+    if checkpoints:
+        with st.expander("📦 Чекпоинты"):
+            for idx, ckpt in enumerate(checkpoints):
+                col_ckpt1, col_ckpt2 = st.columns([5, 1])
+                loss_val = ckpt.get("loss")
+                label = f"Step {ckpt.get('step')}: "
+                if loss_val is not None:
+                    label += f"Loss {loss_val:.4f} | "
+                label += str(ckpt.get("path"))
+                col_ckpt1.caption(label)
+                if col_ckpt2.button("🗑️", key=f"del_ckpt_{selected_run}_{idx}"):
+                    ok, message = _delete_checkpoint(selected_run, ckpt.get("path", ""))
+                    st.toast(message, icon="✅" if ok else "❌")
+                    if ok:
+                        st.rerun()
+
+    for title, file_name in [("📄 stderr (лог)", "stderr.log"), ("📄 stdout", "stdout.log")]:
+        with st.expander(title):
+            log_path = RUNS_DIR / selected_run / file_name
+            if log_path.exists():
+                st.text(log_path.read_text(encoding="utf-8", errors="replace")[-50000:])
+            else:
+                st.caption("Лог пуст")
 
 
 def main() -> None:
@@ -1103,43 +1892,83 @@ def main() -> None:
     )
 
     with tab_launch:
-        with st.expander(t("vlm.best_practices.title"), expanded=False):
-            st.markdown(
-                "\n".join(
-                    [
-                        "- Для домашних GPU используйте QLoRA, а не full finetune.",
-                        "- Для Qwen 3.5 / Qwen2.5-VL держите включёнными gradient checkpointing и FlashAttention 2.",
-                        "- Для small pretrain используйте caption/OCR/VQA корпуса и низкий LR.",
-                        "- Для OCR/doc задач поднимайте `max_pixels`, но уменьшайте batch size.",
-                    ]
+        col1, col2 = st.columns([2, 1])
+
+        with col1:
+            with st.expander(t("vlm.best_practices.title"), expanded=False):
+                st.markdown(
+                    "\n".join(
+                        [
+                            "- Для домашних GPU используйте QLoRA, а не full finetune.",
+                            "- Для Qwen 3.5 / Qwen2.5-VL держите включёнными gradient checkpointing и FlashAttention 2.",
+                            "- Для small pretrain используйте caption/OCR/VQA корпуса и низкий LR.",
+                            "- Для OCR/doc задач поднимайте `max_pixels`, но уменьшайте batch size.",
+                        ]
+                    )
                 )
-            )
-        ready = _render_quick_summary_vlm(full_config)
-        _render_model_preview_vlm(full_config)
-        st.markdown("---")
-        st.subheader("Сценарии и пояснения")
-        if selected_scenario != "Без пресета":
-            st.info(SCENARIO_PRESETS[selected_scenario]["description"])
-        if selected_stage == "vlm_pretrain":
-            st.caption("`vlm_pretrain` здесь — это continued multimodal pretraining/alignment, а не обучение с нуля.")
-        elif selected_stage == "vlm_grpo":
-            st.caption("`vlm_grpo` здесь — экспериментальный reward-guided режим для image-conditioned задач.")
-        st.subheader("Полный конфиг")
-        st.json(full_config)
-        if not ready:
-            st.warning("Выберите базовую модель и train dataset.")
-        launch_label = {
-            "vlm_pretrain": "Запустить VLM Pretrain",
-            "vlm_sft": t("vlm.launch.button"),
-            "vlm_grpo": "Запустить VLM GRPO",
-        }[selected_stage]
-        if st.button(launch_label, type="primary", disabled=not ready):
-            run_id, process = _start_vlm_training(dict(full_config))
-            st.session_state.vlm_current_run_id = run_id
-            st.session_state.vlm_training_process = process
-            st.session_state.vlm_training_active = True
-            st.success(f"Запуск создан: {run_id}")
-            st.rerun()
+            ready = _render_quick_summary_vlm(full_config)
+            _render_model_preview_vlm(full_config)
+
+            _dp = full_config.get("data_path") or ""
+            if _dp and Path(_dp).exists() and _dataset_has_images(Path(_dp)):
+                st.markdown("---")
+                field_cfg = render_vlm_sft_main_config(_dp)
+                if field_cfg:
+                    full_config.update(field_cfg)
+
+            if selected_scenario != "Без пресета":
+                st.markdown("---")
+                st.info(SCENARIO_PRESETS[selected_scenario]["description"])
+            if selected_stage == "vlm_pretrain":
+                st.caption("`vlm_pretrain` здесь — это continued multimodal pretraining/alignment, а не обучение с нуля.")
+            elif selected_stage == "vlm_grpo":
+                st.caption("`vlm_grpo` здесь — экспериментальный reward-guided режим для image-conditioned задач.")
+
+            st.subheader(f"📋 {t('common.configuration')}")
+            st.json(full_config)
+
+        with col2:
+            st.subheader(f"🎮 {t('common.control')}")
+
+            if st.session_state.get("vlm_training_active"):
+                st.info("🚀 Обучение запущено. Открой вкладку «📊 Мониторинг» — метрики обновляются live.")
+                if st.button(f"⏹️ {t('button.stop_training')}", type="primary"):
+                    run_id = st.session_state.get("vlm_current_run_id")
+                    with st.spinner("Останавливаем тренировку..."):
+                        stopped = _stop_vlm_training(run_id) if run_id else False
+                    st.session_state.vlm_training_active = False
+                    clear_active_run()
+                    if stopped:
+                        st.success(f"✅ {t('status.stopped')}")
+                    else:
+                        st.warning(f"⚠️ {t('warning.stop_failed')}")
+                    time.sleep(1)
+                    st.rerun()
+            else:
+                launch_label = {
+                    "vlm_pretrain": "▶️ Запустить VLM Pretrain",
+                    "vlm_sft": f"▶️ {t('vlm.launch.button')}",
+                    "vlm_grpo": "🧠 Запустить VLM GRPO",
+                }[selected_stage]
+                button_disabled = not ready
+                if st.button(launch_label, type="primary", disabled=button_disabled):
+                    with st.spinner("Запуск..."):
+                        run_id, process = _start_vlm_training(dict(full_config))
+                        st.session_state.vlm_current_run_id = run_id
+                        st.session_state.vlm_training_process = process
+                        st.session_state.vlm_training_active = True
+                        st.success(f"Обучение запущено! Run ID: {run_id}")
+                        time.sleep(1)
+                        st.rerun()
+                if button_disabled:
+                    _dp = full_config.get("data_path") or ""
+                    if _dp and Path(_dp).exists() and not _dataset_has_images(Path(_dp)):
+                        st.error(
+                            f"❌ Датасет `{Path(_dp).name}` без изображений — VLM-обучение невозможно. "
+                            "Выберите мультимодальный датасет (изображение+текст) на вкладке «Данные»."
+                        )
+                    else:
+                        st.caption("⚠️ Выберите базовую модель и мультимодальный train dataset (с изображениями) для запуска")
 
     with tab_monitor:
         runs = _list_vlm_runs()
@@ -1151,78 +1980,8 @@ def main() -> None:
             default_idx = run_options.index(current_run) if current_run in run_options else 0
             selected_run = st.selectbox("Run", run_options, index=default_idx)
             st.session_state.vlm_current_run_id = selected_run
-            metrics = _load_metrics(selected_run) or {}
-            status = metrics.get("status", "unknown")
-            alive = _is_process_running(selected_run)
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                if alive and st.button("⏹ Остановить"):
-                    _stop_vlm_training(selected_run)
-                    st.rerun()
-            with c2:
-                if st.button("🔄 Обновить"):
-                    st.rerun()
-            with c3:
-                st.caption(f"Статус: `{status}`")
-            step = int(metrics.get("current_step", 0))
-            total_steps = int(metrics.get("total_steps", 0) or 0)
-            progress = step / total_steps if total_steps > 0 else 0.0
-            st.progress(min(progress, 1.0))
-            m1, m2, m3, m4, m5, m6 = st.columns(6)
-            with m1:
-                st.metric("Step", step)
-            with m2:
-                st.metric("Loss", f"{metrics.get('current_loss', 0.0):.4f}")
-            with m3:
-                st.metric("LR", f"{metrics.get('current_lr', 0.0):.2e}")
-            with m4:
-                st.metric("Reward", f"{metrics.get('current_reward', 0.0):.4f}" if "current_reward" in metrics else "—")
-            with m5:
-                st.metric("GPU MB", metrics.get("gpu_memory_used_mb", "—"))
-            with m6:
-                elapsed = int(metrics.get("elapsed_seconds", 0))
-                eta = int(metrics.get("eta_seconds", 0))
-                st.metric("Время", f"{elapsed // 60} мин", delta=f"ETA {eta // 60} мин" if eta else None)
-            if metrics.get("loss_history"):
-                try:
-                    import plotly.graph_objects as go
-
-                    fig = go.Figure()
-                    steps = metrics.get("steps_history", list(range(len(metrics["loss_history"]))))
-                    fig.add_trace(go.Scatter(x=steps, y=metrics["loss_history"], mode="lines", name="Loss"))
-                    if metrics.get("reward_history"):
-                        fig.add_trace(go.Scatter(x=steps[: len(metrics["reward_history"])], y=metrics["reward_history"], mode="lines", name="Reward"))
-                    fig.update_layout(template="plotly_dark", height=320, margin=dict(l=0, r=0, t=30, b=0))
-                    st.plotly_chart(fig, use_container_width=True, key=f"vlm_metrics_{selected_run}")
-                except Exception:
-                    pass
-            if metrics.get("sample_outputs"):
-                with st.expander("Сэмплы ответов"):
-                    for idx, sample in enumerate(metrics["sample_outputs"][-5:], start=1):
-                        st.markdown(f"**Сэмпл {idx}**")
-                        st.caption(f"Reward: {sample.get('reward', '—')}")
-                        st.code(sample.get("prompt", ""), language="text")
-                        st.write(sample.get("response", ""))
-            checkpoints = metrics.get("checkpoints", [])
-            if checkpoints:
-                with st.expander("Чекпоинты"):
-                    for idx, ckpt in enumerate(checkpoints):
-                        col_ckpt1, col_ckpt2 = st.columns([5, 1])
-                        with col_ckpt1:
-                            st.caption(f"Step {ckpt.get('step')}: {ckpt.get('path')}")
-                        with col_ckpt2:
-                            if st.button("🗑️", key=f"del_ckpt_{selected_run}_{idx}"):
-                                ok, message = _delete_checkpoint(selected_run, ckpt.get("path", ""))
-                                st.toast(message, icon="✅" if ok else "❌")
-                                if ok:
-                                    st.rerun()
-            for title, file_name in [("stdout", "stdout.log"), ("stderr", "stderr.log")]:
-                with st.expander(title):
-                    log_path = RUNS_DIR / selected_run / file_name
-                    if log_path.exists():
-                        st.text(log_path.read_text(encoding="utf-8", errors="replace")[-50000:])
-                    else:
-                        st.caption("Пусто")
+            st.caption("🔄 Метрики обновляются автоматически каждые 2 секунды")
+            _vlm_live_monitor()
 
     with tab_chat:
         models = get_available_vlm_models()
@@ -1317,70 +2076,298 @@ def main() -> None:
                                 st.rerun()
 
     with tab_data:
-        st.subheader(t("vlm.data.download_hf"))
-        dataset_labels = [f"{item['name']} — {item['id']}" for item in VLM_HF_DATASETS]
-        selected_dataset_idx = st.selectbox("HF dataset", range(len(dataset_labels)), format_func=lambda idx: dataset_labels[idx])
-        dataset_out_name = st.text_input("Сохранить как", value="vlm_dataset.jsonl")
-        if st.button(t("vlm.data.download_button")):
-            dataset_info = VLM_HF_DATASETS[selected_dataset_idx]
-            with st.spinner(f"Downloading {dataset_info['id']}..."):
-                result = _download_hf_vlm_dataset(dataset_info["id"], dataset_info["split"], dataset_out_name, dataset_info["format"])
-            if result and Path(result).exists():
-                st.success(f"Сохранено: {result}")
-                st.rerun()
-            elif result:
-                st.error(result)
+        st.header(f"💾 {t('vlm.tabs.data')}")
+        col_dl, col_list = st.columns([1, 2])
+
+        with col_dl:
+            with st.expander("📤 Загрузить свой файл (JSONL)", expanded=False):
+                uploaded = st.file_uploader(
+                    "JSONL (image + messages / caption / question+answer)",
+                    type=["jsonl"],
+                    key="vlm_upload_ds",
+                    help="Строки JSON с полем 'image' (путь/URL) и 'messages'/'caption'/'question'+'answer'.",
+                )
+                if uploaded is not None:
+                    up_name = st.text_input("Имя файла", value=uploaded.name, key="vlm_upload_name")
+                    if st.button("📥 Сохранить файл", key="vlm_upload_save"):
+                        target = DATASET_DIR / (up_name if up_name.endswith(".jsonl") else up_name + ".jsonl")
+                        with open(target, "wb") as f:
+                            f.write(uploaded.getbuffer())
+                        st.toast(f"Файл {target.name} сохранён!", icon="✅")
+                        time.sleep(0.5)
+                        st.rerun()
+
+            st.subheader("🤗 Скачать с HuggingFace")
+
+            selected_cat = st.selectbox(
+                "Категория задачи",
+                VLM_DATASET_CATEGORIES,
+                key="vlm_ds_category",
+                help="Фильтр курируемого списка небольших VLM-датасетов по типу задачи.",
+            )
+            filtered_datasets = [
+                item for item in VLM_HF_DATASETS
+                if selected_cat == "Все" or item.get("category") == selected_cat
+            ]
+
+            preset_by_label: Dict[str, Dict[str, Any]] = {
+                f"{d['name']} · {d.get('size', '?')}": d for d in filtered_datasets
+            }
+            preset_labels = list(preset_by_label.keys()) + ["✏️ Ввести вручную..."]
+
+            format_labels = {
+                "image_messages": "Инструкции (image + messages)",
+                "image_caption": "Описания (image + caption)",
+                "ocr_qa": "VQA / OCR (image + question + answer)",
+            }
+
+            def _apply_vlm_ds_preset() -> None:
+                ds = preset_by_label.get(st.session_state.get("vlm_ds_preset_sel", ""))
+                if not ds:
+                    return
+                st.session_state.vlm_dsdl_repo_id = ds["id"]
+                st.session_state.vlm_dl_subset = ds.get("subset") or ""
+                st.session_state.vlm_dl_split = ds.get("split", "train")
+                st.session_state.vlm_dl_format = ds["format"]
+                st.session_state.vlm_dl_max_rows = int(ds.get("recommended_rows", 2000))
+                st.session_state.vlm_dl_out_name = ds["id"].split("/")[-1]
+                st.session_state.pop("vlm_dl_subset_pick", None)
+                st.session_state.pop("vlm_dl_split_pick", None)
+
+            # Initialise defaults from the first preset once.
+            if "vlm_dsdl_repo_id" not in st.session_state and filtered_datasets:
+                first = filtered_datasets[0]
+                st.session_state.vlm_dsdl_repo_id = first["id"]
+                st.session_state.vlm_dl_subset = first.get("subset") or ""
+                st.session_state.vlm_dl_split = first.get("split", "train")
+                st.session_state.vlm_dl_format = first["format"]
+                st.session_state.vlm_dl_max_rows = int(first.get("recommended_rows", 2000))
+                st.session_state.vlm_dl_out_name = first["id"].split("/")[-1]
+
+            st.selectbox(
+                "📚 Готовый датасет",
+                preset_labels,
+                key="vlm_ds_preset_sel",
+                on_change=_apply_vlm_ds_preset,
+                help="Выберите курируемый датасет — поля заполнятся автоматически.",
+            )
+            if preset_by_label.get(st.session_state.get("vlm_ds_preset_sel", "")):
+                st.caption(preset_by_label[st.session_state["vlm_ds_preset_sel"]]["description"])
+
+            repo_id = st.text_input("Репозиторий (ID)", key="vlm_dsdl_repo_id")
+
+            repo_info_store: Dict[str, Any] = st.session_state.setdefault("vlm_ds_repo_info", {})
+            if st.button("🔍 Проверить репозиторий", key="vlm_ds_check"):
+                with st.spinner(f"Анализируем {repo_id}..."):
+                    info, msg = _inspect_hf_dataset(repo_id.strip())
+                if info:
+                    repo_info_store[repo_id.strip()] = info
+                    st.session_state.pop("vlm_dl_subset_pick", None)
+                    st.session_state.pop("vlm_dl_split_pick", None)
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
+            info = repo_info_store.get(repo_id.strip(), {})
+            configs = info.get("configs") or []
+            splits = info.get("splits") or []
+
+            if configs:
+                cur = st.session_state.get("vlm_dl_subset", "")
+                idx = configs.index(cur) if cur in configs else 0
+                subset_val = st.selectbox("Subset (конфиг)", configs, index=idx, key="vlm_dl_subset_pick")
             else:
-                st.warning("Не удалось получить ни одной записи")
-        st.markdown("---")
-        st.subheader(t("vlm.data.preview"))
-        local_datasets = _get_vlm_datasets()
-        if not local_datasets:
-            st.info("Локальные VLM-датасеты пока не найдены.")
-        else:
-            dataset_name = st.selectbox("Локальный датасет", [item["name"] for item in local_datasets])
-            dataset_meta = next(item for item in local_datasets if item["name"] == dataset_name)
-            preview = _read_dataset_preview(Path(dataset_meta["path"]), limit=5)
-            st.caption(f"Schema: `{preview['schema']}` | Поля: {', '.join(preview['fields']) if preview['fields'] else '—'}")
-            if st.button("Использовать этот датасет", key="use_dataset_for_launch"):
-                st.session_state.vlm_cfg_data_path = dataset_meta["path"]
-                st.rerun()
-            for idx, sample in enumerate(preview["samples"], start=1):
-                with st.expander(f"Пример {idx}"):
-                    if sample.get("image") and not str(sample["image"]).startswith("http"):
-                        image_path = Path(dataset_meta["path"]).parent / str(sample["image"])
-                        if image_path.exists():
-                            st.image(str(image_path), width=280)
-                    st.json(sample)
+                subset_val = st.text_input(
+                    "Subset (конфиг)",
+                    key="vlm_dl_subset",
+                    help="Оставьте пустым или 'default', если конфиг не нужен. Нажмите «Проверить репозиторий», чтобы увидеть список.",
+                )
+            if splits:
+                cur = st.session_state.get("vlm_dl_split", "train")
+                idx = splits.index(cur) if cur in splits else 0
+                split_val = st.selectbox("Split", splits, index=idx, key="vlm_dl_split_pick")
+            else:
+                split_val = st.text_input("Split", key="vlm_dl_split")
+
+            fmt_keys = list(format_labels.keys())
+            # Значение приходит из session_state (в т.ч. из колбэков пресетов), поэтому
+            # index не передаём — иначе Streamlit ругается на дублирование default + session_state.
+            if st.session_state.get("vlm_dl_format") not in fmt_keys:
+                st.session_state.vlm_dl_format = "image_messages" if "image_messages" in fmt_keys else fmt_keys[0]
+            dl_format = st.selectbox(
+                "Формат конвертации",
+                fmt_keys,
+                format_func=lambda k: format_labels[k],
+                key="vlm_dl_format",
+                help="Как интерпретировать поля датасета при сохранении в JSONL.",
+            )
+
+            with st.expander("🛠️ Лимиты скачивания", expanded=True):
+                limit_type_label = st.radio(
+                    "Ограничить по",
+                    ["Кол-во строк", "Размеру (ГБ)"],
+                    key="vlm_dl_limit_type",
+                    horizontal=True,
+                )
+                if limit_type_label == "Кол-во строк":
+                    st.number_input("Число строк (0 = всё)", min_value=0, step=500, key="vlm_dl_max_rows")
+                else:
+                    st.number_input(
+                        "Размер, ГБ (вкл. картинки)",
+                        min_value=0.1,
+                        value=float(st.session_state.get("vlm_dl_max_gb", 1.0)),
+                        step=0.5,
+                        key="vlm_dl_max_gb",
+                    )
+
+            out_name = st.text_input("Сохранить как", key="vlm_dl_out_name")
+
+            if limit_type_label == "Кол-во строк" and int(st.session_state.get("vlm_dl_max_rows", 0)) == 0:
+                st.warning("Лимит = 0: датасет будет скачан целиком. Для больших наборов это займёт много места и времени.")
+
+            if st.button("⬇️ Скачать и конвертировать", type="primary", key="vlm_dl_btn"):
+                status_box = st.empty()
+
+                def _progress(n: int, nbytes: int) -> None:
+                    status_box.info(f"Обработано: {n} примеров, {nbytes / 1024**2:.1f} МБ...")
+
+                is_rows = limit_type_label == "Кол-во строк"
+                max_bytes = int(float(st.session_state.get("vlm_dl_max_gb", 1.0)) * 1024**3)
+                with st.spinner(f"Скачиваем {repo_id} (streaming)..."):
+                    path, message = _download_hf_vlm_dataset(
+                        repo_id.strip(),
+                        (split_val or "train").strip(),
+                        out_name.strip(),
+                        dl_format,
+                        subset=(subset_val.strip() if isinstance(subset_val, str) else subset_val) or None,
+                        limit_type="rows" if is_rows else "gb",
+                        max_rows=int(st.session_state.get("vlm_dl_max_rows", 0)),
+                        max_bytes=max_bytes,
+                        progress_cb=_progress,
+                    )
+                if path:
+                    status_box.success(message)
+                    st.rerun()
+                else:
+                    status_box.error(message)
+
+        with col_list:
+            st.subheader("📁 Локальные датасеты")
+            local_datasets = _get_vlm_datasets()
+            if not local_datasets:
+                st.info("Локальные VLM-датасеты пока не найдены. Скачайте набор слева или загрузите свой файл.")
+            else:
+                def _fmt_count(d: Dict[str, Any]) -> str:
+                    prefix = "" if d.get("count_exact") else "~"
+                    return f"{prefix}{d['count']} строк"
+
+                dataset_name = st.selectbox(
+                    "Датасет",
+                    [item["name"] for item in local_datasets],
+                    format_func=lambda n: next(
+                        (f"{d['name']}  ·  {_fmt_count(d)}  ·  {d['size']}" for d in local_datasets if d["name"] == n),
+                        n,
+                    ),
+                    key="vlm_local_ds_select",
+                )
+                dataset_meta = next(item for item in local_datasets if item["name"] == dataset_name)
+                preview = _read_dataset_preview(Path(dataset_meta["path"]), limit=5)
+                st.caption(
+                    f"Schema: `{preview['schema']}`  ·  {_fmt_count(dataset_meta)}  ·  "
+                    f"Поля: {', '.join(preview['fields']) if preview['fields'] else '—'}"
+                )
+
+                act1, act2 = st.columns(2)
+                with act1:
+                    if st.button("✅ Использовать для обучения", key="use_dataset_for_launch", use_container_width=True):
+                        st.session_state.vlm_cfg_data_path = dataset_meta["path"]
+                        st.success("Датасет выбран во вкладке «Запуск»")
+                with act2:
+                    if st.button("🗑️ Удалить датасет", key="delete_vlm_dataset", use_container_width=True):
+                        ok, msg = _delete_vlm_dataset(dataset_meta["path"])
+                        (st.success if ok else st.error)(msg)
+                        if ok:
+                            st.rerun()
+
+                for idx, sample in enumerate(preview["samples"], start=1):
+                    with st.expander(f"Пример {idx}"):
+                        if sample.get("image") and not str(sample["image"]).startswith("http"):
+                            image_path = Path(dataset_meta["path"]).parent / str(sample["image"])
+                            if image_path.exists():
+                                st.image(str(image_path), width=280)
+                        st.json(sample)
 
     with tab_models:
         st.header(f"🤖 {t('vlm.models.available')}")
-        col_download, col_list = st.columns([1, 2])
-        with col_download:
-            st.subheader("🤗 Скачать с HuggingFace")
-            preset_names = [preset["name"] for preset in VLM_HF_PRESETS] + ["Ввести вручную"]
-            preset_name = st.selectbox("Пресет", preset_names)
-            preset = next((item for item in VLM_HF_PRESETS if item["name"] == preset_name), None)
-            repo_id = st.text_input("Repo ID", value=preset["repo_id"] if preset else "")
-            save_name = st.text_input("Имя папки в models/", value=preset["save_name"] if preset else "")
-            if preset:
-                st.caption(preset["description"])
-            if st.button("Скачать модель", type="primary") and repo_id and save_name:
-                if _download_hf_vlm_model(repo_id.strip(), save_name.strip()):
-                    st.success("Модель скачана")
-                    st.rerun()
-        with col_list:
-            st.subheader("Локальные и доступные VLM")
-            models = get_available_vlm_models()
-            for idx, model in enumerate(models):
-                with st.expander(model["name"]):
-                    st.caption(f"Путь: `{model['path']}`")
-                    if st.button("🚀 Использовать в Launch", key=f"use_launch_model_{idx}"):
+
+        st.subheader("🤗 Скачать VLM с HuggingFace")
+        st.caption("Курируемые небольшие мультимодальные модели, подходящие для локального обучения (QLoRA/LoRA).")
+
+        preset_names = [preset["name"] for preset in VLM_HF_PRESETS]
+        selected_preset_name = st.selectbox(
+            "Модель",
+            preset_names + ["✏️ Ввести вручную"],
+            format_func=lambda n: next(
+                (f"{p['name']}  ·  {p['params']}  ·  {p['vram']}  ·  {p['task']}" for p in VLM_HF_PRESETS if p["name"] == n),
+                n,
+            ),
+            key="vlm_model_preset_select",
+        )
+        preset = next((item for item in VLM_HF_PRESETS if item["name"] == selected_preset_name), None)
+
+        if preset:
+            st.info(f"**{preset['name']}** — {preset['description']}")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Параметры", preset["params"])
+            m2.metric("VRAM (обучение)", preset["vram"])
+            m3.metric("Задача", preset["task"])
+            if preset.get("trust_remote_code"):
+                st.caption("⚠️ Эта модель требует `trust_remote_code=True` при загрузке.")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            repo_id = st.text_input("Repo ID", value=preset["repo_id"] if preset else "", key="vlm_dl_repo_id")
+        with c2:
+            save_name = st.text_input("Имя папки в models/", value=preset["save_name"] if preset else "", key="vlm_dl_save_name")
+
+        if st.button("⬇️ Скачать модель", type="primary", key="vlm_dl_model_btn") and repo_id and save_name:
+            if _download_hf_vlm_model(repo_id.strip(), save_name.strip()):
+                st.success("Модель скачана")
+                st.rerun()
+
+        st.markdown("---")
+        st.subheader("📁 Доступные VLM")
+        models = get_available_vlm_models()
+        local_models = [m for m in models if m.get("type") == "local"]
+        hf_models = [m for m in models if m.get("type") == "hf"]
+
+        st.markdown("**Локальные модели** (скачанные / обученные)")
+        if not local_models:
+            st.info("Локальных VLM пока нет — скачайте модель выше или обучите свою.")
+        for idx, model in enumerate(local_models):
+            with st.expander(model["name"]):
+                st.caption(f"Путь: `{model['path']}`  ·  Архитектура: `{model.get('family', '—')}`")
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    if st.button("🚀 В Launch", key=f"use_launch_model_{idx}", use_container_width=True):
                         st.session_state.vlm_selected_base_path = model["path"]
-                        st.rerun()
-                    if st.button("💬 Использовать в Chat", key=f"use_chat_model_{idx}"):
+                        st.success("Выбрано для обучения")
+                with b2:
+                    if st.button("💬 В Chat", key=f"use_chat_model_{idx}", use_container_width=True):
                         st.session_state.vlm_selected_chat_model = model["path"]
-                        st.rerun()
+                        st.success("Выбрано для чата")
+                with b3:
+                    if str(model["path"]).startswith(str(MODELS_DIR)):
+                        if st.button("🗑️ Удалить", key=f"del_model_{idx}", use_container_width=True):
+                            ok, msg = _delete_vlm_model(model["path"])
+                            (st.success if ok else st.error)(msg)
+                            if ok:
+                                st.rerun()
+
+        with st.expander(f"🤗 Готовые модели HuggingFace ({len(hf_models)})"):
+            st.caption("Их можно использовать напрямую по repo_id (скачаются при первом запуске) или скачать заранее выше.")
+            for model in hf_models:
+                st.markdown(f"- {model['name']} — `{model['path']}`")
 
     with tab_docs:
         st.caption(t("vlm.docs.source"))
