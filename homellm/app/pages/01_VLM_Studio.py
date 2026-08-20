@@ -449,11 +449,21 @@ def _is_process_running(run_id: str) -> bool:
         with open(pid_path, "r", encoding="utf-8") as f:
             pid = int(f.read().strip())
         os.kill(pid, 0)
-        return True
     except PermissionError:
         return True
     except Exception:
         return False
+    # Завершённый воркер, которого родитель (Streamlit) ещё не «пожал», остаётся
+    # zombie (defunct) и продолжает отвечать на kill(0). Фактически он не работает —
+    # иначе кнопка «Остановить» висела бы после завершения обучения.
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        state = stat.rsplit(")", 1)[1].split()[0]
+        if state in ("Z", "X"):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def _list_vlm_runs() -> List[Path]:
@@ -521,7 +531,6 @@ def _download_hf_vlm_model(repo_id: str, save_name: str) -> bool:
             snapshot_download(
                 repo_id=repo_id,
                 local_dir=str(save_path),
-                local_dir_use_symlinks=False,
                 ignore_patterns=["*.md", "*.txt", "*.gitattributes", ".git*"],
             )
         return (save_path / "config.json").exists()
@@ -897,10 +906,27 @@ def get_available_vlm_models() -> List[Dict[str, Any]]:
     for preset in VLM_HF_PRESETS:
         models.append({"name": f"🤗 {preset['name']}", "path": preset["repo_id"], "type": "hf", "family": preset["name"]})
     for final in OUTPUT_DIR.rglob("final_model"):
+        if not final.is_dir():
+            continue
         cfg = _load_json(final / "config.json")
-        if final.is_dir() and cfg:
-            rel = final.relative_to(OUTPUT_DIR)
+        rel = final.relative_to(OUTPUT_DIR)
+        if cfg:
             models.append({"name": f"📁 {rel}", "path": str(final), "type": "local", "family": cfg.get("model_type", "local")})
+            continue
+        # LoRA/QLoRA-обучение сохраняет только адаптер (adapter_config.json), без
+        # полного config.json базовой модели. Такие чекпоинты всё равно нужно показывать —
+        # _load_chat_model умеет подгружать базовую модель и объединять адаптер на лету.
+        adapter_cfg = _load_json(final / "adapter_config.json")
+        if adapter_cfg:
+            base_name = Path(str(adapter_cfg.get("base_model_name_or_path") or "?")).name
+            models.append(
+                {
+                    "name": f"📁 {rel} (LoRA → {base_name})",
+                    "path": str(final),
+                    "type": "local_lora",
+                    "family": "lora",
+                }
+            )
     for model_dir in MODELS_DIR.iterdir() if MODELS_DIR.exists() else []:
         cfg = _load_json(model_dir / "config.json")
         if model_dir.is_dir() and cfg and _model_looks_like_vlm(cfg):
@@ -1209,7 +1235,7 @@ def render_vlm_sft_main_config(data_path: str) -> Dict[str, Any]:
                     img_path = img_ref
                     if not Path(img_path).is_absolute() and not img_path.startswith(("http://", "https://")):
                         img_path = str(Path(data_path).parent / img_ref)
-                    st.image(img_path, use_container_width=True)
+                    st.image(img_path, width="stretch")
                 else:
                     st.caption("Изображение недоступно для превью")
             except Exception as exc:
@@ -1244,13 +1270,30 @@ def _load_chat_model(model_path: str):
             from transformers import AutoModelForVision2Seq
 
             model_cls = AutoModelForVision2Seq
-        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-        model = model_cls.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else (torch.float16 if torch.cuda.is_available() else torch.float32),
-            device_map="auto" if torch.cuda.is_available() else None,
-        )
+
+        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else (torch.float16 if torch.cuda.is_available() else torch.float32)
+        device_map = "auto" if torch.cuda.is_available() else None
+
+        adapter_config_path = Path(model_path) / "adapter_config.json"
+        if adapter_config_path.exists():
+            # LoRA/QLoRA-обучение сохраняет только адаптер — грузим базовую модель
+            # (из adapter_config.json) и объединяем адаптер, как это делает LLM Studio.
+            adapter_cfg = _load_json(adapter_config_path) or {}
+            base_model_id = adapter_cfg.get("base_model_name_or_path")
+            if not base_model_id:
+                raise ValueError(f"base_model_name_or_path не найден в {adapter_config_path}")
+            try:
+                processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+            except Exception:
+                processor = AutoProcessor.from_pretrained(base_model_id, trust_remote_code=True)
+            base_model = model_cls.from_pretrained(base_model_id, trust_remote_code=True, dtype=dtype, device_map=device_map)
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(base_model, model_path)
+            model = model.merge_and_unload()
+        else:
+            processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+            model = model_cls.from_pretrained(model_path, trust_remote_code=True, dtype=dtype, device_map=device_map)
         cache[model_path] = {"processor": processor, "model": model}
     return cache[model_path]["processor"], cache[model_path]["model"]
 
@@ -1271,12 +1314,13 @@ def _generate_vlm_response(model_path: str, image, prompt: str, system_prompt: s
     inputs = processor(text=[text], images=[image], return_tensors="pt", padding=True)
     model_device = getattr(model, "device", None) or next(model.parameters()).device
     inputs = {k: v.to(model_device) if hasattr(v, "to") else v for k, v in inputs.items()}
-    generated_ids = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=temperature > 0,
-        temperature=max(temperature, 0.1),
-    )
+    do_sample = temperature > 0
+    gen_kwargs: Dict[str, Any] = {"max_new_tokens": max_new_tokens, "do_sample": do_sample}
+    if do_sample:
+        # temperature только валиден при выборке (do_sample=True) — иначе transformers
+        # выдаёт "generation flags are not valid and may be ignored".
+        gen_kwargs["temperature"] = max(temperature, 0.1)
+    generated_ids = model.generate(**inputs, **gen_kwargs)
     trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)]
     return processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
@@ -1668,11 +1712,13 @@ def _vlm_live_monitor() -> None:
         "saving_model": "💾",
     }.get(status, "⏳")
 
+    is_terminal = status in ("completed", "error", "stopped")
+    active = alive and not is_terminal
     head_l, head_r = st.columns([0.8, 0.2])
     with head_l:
         st.subheader(f"{status_emoji} Статус: {status.upper()}")
     with head_r:
-        if alive and st.button("⏹ Остановить", key=f"vlm_stop_{selected_run}", use_container_width=True):
+        if active and st.button("⏹ Остановить", key=f"vlm_stop_{selected_run}", width="stretch"):
             _stop_vlm_training(selected_run)
             st.rerun()
 
@@ -1718,7 +1764,7 @@ def _vlm_live_monitor() -> None:
         st.metric(
             "Время",
             _vlm_fmt_time(metrics.get("elapsed_seconds", 0)),
-            delta=f"ETA {_vlm_fmt_time(metrics.get('eta_seconds', 0))}" if metrics.get("eta_seconds") else None,
+            delta=(f"ETA {_vlm_fmt_time(metrics.get('eta_seconds', 0))}" if metrics.get("eta_seconds") and not is_terminal else None),
         )
 
     st.progress(
@@ -1736,14 +1782,14 @@ def _vlm_live_monitor() -> None:
             if metrics.get("val_loss_history"):
                 fig_loss.add_trace(go.Scatter(x=metrics.get("val_steps_history", []), y=metrics["val_loss_history"], mode="lines", name="Val Loss", line=dict(dash="dash", color="#60a5fa", width=2)))
             fig_loss.update_layout(title="Training Loss", xaxis_title="Step", yaxis_title="Loss", template="plotly_dark", height=300, margin=dict(l=0, r=0, t=40, b=0))
-            st.plotly_chart(fig_loss, use_container_width=True, key=f"vlm_loss_{selected_run}")
+            st.plotly_chart(fig_loss, width="stretch", key=f"vlm_loss_{selected_run}")
         with cc2:
             lr_history = metrics.get("lr_history", [])
             if lr_history:
                 fig_lr = go.Figure()
                 fig_lr.add_trace(go.Scatter(x=steps_history[: len(lr_history)], y=lr_history, mode="lines", name="LR", line=dict(color="#60a5fa", width=2)))
                 fig_lr.update_layout(title="Learning Rate Schedule", xaxis_title="Step", yaxis_title="LR", template="plotly_dark", height=300, margin=dict(l=0, r=0, t=40, b=0))
-                st.plotly_chart(fig_lr, use_container_width=True, key=f"vlm_lr_{selected_run}")
+                st.plotly_chart(fig_lr, width="stretch", key=f"vlm_lr_{selected_run}")
         if is_grpo and (metrics.get("reward_history") or metrics.get("kl_history")):
             rc1, rc2 = st.columns(2)
             with rc1:
@@ -1752,14 +1798,14 @@ def _vlm_live_monitor() -> None:
                     fig_r = go.Figure()
                     fig_r.add_trace(go.Scatter(x=steps_history[: len(rh)], y=rh, mode="lines", name="Reward", line=dict(color="#10b981", width=2)))
                     fig_r.update_layout(title="🎯 Reward (GRPO)", xaxis_title="Step", yaxis_title="Reward", template="plotly_dark", height=300, margin=dict(l=0, r=0, t=40, b=0))
-                    st.plotly_chart(fig_r, use_container_width=True, key=f"vlm_reward_{selected_run}")
+                    st.plotly_chart(fig_r, width="stretch", key=f"vlm_reward_{selected_run}")
             with rc2:
                 kh = metrics.get("kl_history", [])
                 if kh:
                     fig_k = go.Figure()
                     fig_k.add_trace(go.Scatter(x=steps_history[: len(kh)], y=kh, mode="lines", name="KL", line=dict(color="#f59e0b", width=2)))
                     fig_k.update_layout(title="📊 KL Divergence (GRPO)", xaxis_title="Step", yaxis_title="KL", template="plotly_dark", height=300, margin=dict(l=0, r=0, t=40, b=0))
-                    st.plotly_chart(fig_k, use_container_width=True, key=f"vlm_kl_{selected_run}")
+                    st.plotly_chart(fig_k, width="stretch", key=f"vlm_kl_{selected_run}")
     else:
         st.info("📊 Графики появятся после первого залогированного шага.")
 
@@ -1930,7 +1976,21 @@ def main() -> None:
         with col2:
             st.subheader(f"🎮 {t('common.control')}")
 
-            if st.session_state.get("vlm_training_active"):
+            # Активность определяем по РЕАЛЬНОМУ состоянию процесса и статусу метрик,
+            # а не по «залипающему» флагу session_state — иначе кнопка «Стоп» остаётся
+            # висеть после завершения обучения.
+            _active_run = st.session_state.get("vlm_current_run_id")
+            _run_status = (_load_metrics(_active_run) or {}).get("status") if _active_run else None
+            _is_training = (
+                bool(_active_run)
+                and _is_process_running(_active_run)
+                and _run_status not in ("completed", "error", "stopped")
+            )
+            if st.session_state.get("vlm_training_active") and not _is_training:
+                st.session_state.vlm_training_active = False
+                clear_active_run()
+
+            if _is_training:
                 st.info("🚀 Обучение запущено. Открой вкладку «📊 Мониторинг» — метрики обновляются live.")
                 if st.button(f"⏹️ {t('button.stop_training')}", type="primary"):
                     run_id = st.session_state.get("vlm_current_run_id")
@@ -2279,11 +2339,11 @@ def main() -> None:
 
                 act1, act2 = st.columns(2)
                 with act1:
-                    if st.button("✅ Использовать для обучения", key="use_dataset_for_launch", use_container_width=True):
+                    if st.button("✅ Использовать для обучения", key="use_dataset_for_launch", width="stretch"):
                         st.session_state.vlm_cfg_data_path = dataset_meta["path"]
                         st.success("Датасет выбран во вкладке «Запуск»")
                 with act2:
-                    if st.button("🗑️ Удалить датасет", key="delete_vlm_dataset", use_container_width=True):
+                    if st.button("🗑️ Удалить датасет", key="delete_vlm_dataset", width="stretch"):
                         ok, msg = _delete_vlm_dataset(dataset_meta["path"])
                         (st.success if ok else st.error)(msg)
                         if ok:
@@ -2349,16 +2409,16 @@ def main() -> None:
                 st.caption(f"Путь: `{model['path']}`  ·  Архитектура: `{model.get('family', '—')}`")
                 b1, b2, b3 = st.columns(3)
                 with b1:
-                    if st.button("🚀 В Launch", key=f"use_launch_model_{idx}", use_container_width=True):
+                    if st.button("🚀 В Launch", key=f"use_launch_model_{idx}", width="stretch"):
                         st.session_state.vlm_selected_base_path = model["path"]
                         st.success("Выбрано для обучения")
                 with b2:
-                    if st.button("💬 В Chat", key=f"use_chat_model_{idx}", use_container_width=True):
+                    if st.button("💬 В Chat", key=f"use_chat_model_{idx}", width="stretch"):
                         st.session_state.vlm_selected_chat_model = model["path"]
                         st.success("Выбрано для чата")
                 with b3:
                     if str(model["path"]).startswith(str(MODELS_DIR)):
-                        if st.button("🗑️ Удалить", key=f"del_model_{idx}", use_container_width=True):
+                        if st.button("🗑️ Удалить", key=f"del_model_{idx}", width="stretch"):
                             ok, msg = _delete_vlm_model(model["path"])
                             (st.success if ok else st.error)(msg)
                             if ok:

@@ -49,6 +49,11 @@ def run_vlm_sft(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
 
 
 def _run_vlm_sft_impl(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
+    # Ставим stage самой первой строкой — если запуск упадёт даже на валидации
+    # конфига (например, отсутствует data_path), metrics.json всё равно будет
+    # помечен правильным stage (vlm_sft, либо vlm_pretrain через прокси-логгер),
+    # а не показывать сбивающий с толку fallback в UI.
+    metrics_logger.update(status="initializing", stage="vlm_sft")
     if config.get("stage") not in (None, "vlm_sft"):
         raise ValueError(f"vlm_sft worker supports only stage=vlm_sft, got {config.get('stage')}")
 

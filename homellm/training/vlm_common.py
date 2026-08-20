@@ -320,7 +320,7 @@ def load_vlm_model(model_name_or_path: str, config: Dict[str, Any], device: str)
         if device == "cuda":
             model_kwargs["device_map"] = {"": local_rank}
     else:
-        model_kwargs["torch_dtype"] = get_requested_torch_dtype(device, config)
+        model_kwargs["dtype"] = get_requested_torch_dtype(device, config)
         # Single-process, single-GPU: pin to the visible device. Under DDP/accelerate
         # (world_size > 1) let the launcher place the model to avoid clashes.
         if device == "cuda" and world_size == 1:

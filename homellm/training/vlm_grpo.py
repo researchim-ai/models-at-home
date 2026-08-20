@@ -82,6 +82,10 @@ def run_vlm_grpo(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
 
 
 def _run_vlm_grpo_impl(config: Dict[str, Any], metrics_logger: MetricsLogger) -> None:
+    # Ставим stage самой первой строкой — если запуск упадёт даже на валидации
+    # конфига (например, отсутствует data_path), metrics.json всё равно будет
+    # помечен как vlm_grpo, а не показывать сбивающий с толку fallback в UI.
+    metrics_logger.update(status="initializing", stage="vlm_grpo")
     if config.get("stage") not in (None, "vlm_grpo"):
         raise ValueError(f"vlm_grpo worker supports only stage=vlm_grpo, got {config.get('stage')}")
 
@@ -97,6 +101,8 @@ def _run_vlm_grpo_impl(config: Dict[str, Any], metrics_logger: MetricsLogger) ->
     base_dir = Path(config.get("data_base_dir") or Path(data_path).parent)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    metrics_logger.update(status="loading_dataset", stage="vlm_grpo")
+
     train_dataset = VLMJsonlDataset(
         data_path,
         prompt_for_caption=str(config.get("caption_prompt", "Describe this image.")),
@@ -106,6 +112,7 @@ def _run_vlm_grpo_impl(config: Dict[str, Any], metrics_logger: MetricsLogger) ->
         raise ValueError("No valid examples in dataset")
 
     ensure_cuda_available()
+    metrics_logger.update(status="loading_model", stage="vlm_grpo", model_name_or_path=model_name_or_path)
     configure_sdpa_kernels(config)
     processor = load_vlm_processor(model_name_or_path, config)
     model = load_vlm_model(model_name_or_path, config, device)
