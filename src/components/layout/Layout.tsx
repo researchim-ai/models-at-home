@@ -7,11 +7,11 @@ import { ErrorBoundary } from '@/components/ErrorBoundary'
 export function Layout() {
   const location = useLocation()
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-background">
+    <div className="studio-shell flex h-screen w-screen overflow-hidden bg-background" data-space={location.pathname.split('/')[1] || 'training'}>
       <Sidebar />
-      <div className="flex flex-1 flex-col overflow-hidden">
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <Header />
-        <main className="flex-1 overflow-auto">
+        <main className="studio-content min-h-0 flex-1 overflow-auto">
           <ErrorBoundary resetKey={location.pathname}>
             <Outlet />
           </ErrorBoundary>

@@ -1,420 +1,139 @@
-# Models at Home Studio
+# 🏠 Models at Home
 
-Десктопное приложение для тренировки ML-моделей на своём железе.
-Билдится под **Linux**, **Windows**, **macOS**.
+**Своя модель. Свои данные. Свои эксперименты.**
 
-Electron-окно с React UI внутри. Бэкенд на Python (FastAPI) запускается
-автоматически при старте приложения: через Docker в режиме `Auto`, либо
-нативно через локальный Python как fallback/ручной режим.
+Models at Home — открытая студия для обучения моделей на своём компьютере.
+Здесь можно собрать маленькую языковую модель с нуля, дообучить готовую,
+научить модель работать с изображениями или попробовать модели действий и динамики среды.
 
+Идея простая: меньше времени на склеивание скриптов, больше — на сами эксперименты.
+Вы выбираете модель и данные, настраиваете обучение и наблюдаете, что получается,
+в одном рабочем пространстве.
 
-## World Models Studio
+![Training Studio: настройка эксперимента, проверка готовности и запуск](docs/screenshots/training-studio.png)
 
-Отдельная `/world-models` страница: собственные Latent GRU и Gaussian RSSM,
-обучение динамики по эпизодам с continuous/discrete/hybrid действиями,
-optional states/rewards/dones, preflight, validation, checkpoints/resume и
-предсказанные кадры в Rollout. Есть встроенное синтетическое демо.
-Во вкладке «Готовые модели» встроены DIAMOND CS:GO и Atari (Breakout/Pong):
-собственные локальные model workers, pretrained weights, игровой экран,
-WASD/камера, step/pause/reset. Архитектуры и sampler включены в репозиторий.
-Есть CPU-проба и GPU-режим; после скачивания весов inference работает офлайн.
-Cosmos 3 оставлен дополнительным локальным pipeline.
-Инструкция: [docs/WORLD_FOUNDATION_MODELS.md](docs/WORLD_FOUNDATION_MODELS.md).
-Подробности: [docs/WORLD_MODELS_STUDIO.md](docs/WORLD_MODELS_STUDIO.md).
+## Что можно делать
 
-## VLA Studio
+- **Обучать языковые модели.** Pretraining с нуля, продолжение обучения на своих текстах,
+  SFT на инструкциях и диалогах, обучение с наградами через собственные GRPO / Dr.GRPO / DAPO / SDPO.
+- **Работать с изображениями.** В VLM Studio есть SFT и native GRPO для vision-language моделей,
+  пресеты Qwen3-VL, Qwen3.5 и Gemma 3, обычный Transformers и дополнительный Unsloth.
+- **Учить модели действовать.** VLA Studio обучает по демонстрациям (SFT / behavior cloning):
+  изображение, инструкция и состояние превращаются в действия. Поддерживаются непрерывные,
+  дискретные и смешанные действия для робототехники, симуляторов и desktop-задач.
+- **Исследовать world models.** Обучать собственные Latent GRU и Gaussian RSSM на эпизодах,
+  смотреть предсказанные траектории или запускать встроенный локальный DIAMOND для Atari и CS:GO.
+- **Собирать архитектуры.** Model Builder позволяет составить модель из блоков и передать её
+  конфигурацию в Training Studio.
+- **Разбирать результаты.** Смотреть метрики, логи и историю запусков, продолжать совместимые
+  чекпоинты, проверять модели в чате и работать в JupyterLab. В Study Center есть материалы
+  по обучению, а в Agent Studio — помощник с локальным llama-server.
 
-Отдельная страница **VLA Studio** обучает action-модели для робототехники,
-игр/симуляторов и mouse/keyboard-сценариев. Есть непрерывные, дискретные
-и смешанные action chunks, Native VLA с нуля и VLM + Action Head с
-Full/LoRA/QLoRA и optional Unsloth. Встроены синтетические примеры,
-preflight, метрики/графики, validation, checkpoints/resume и action preview.
+Для текстовых и мультимодальных моделей доступны разные способы настройки весов,
+включая Full, LoRA и QLoRA; точный набор зависит от архитектуры и выбранного backend.
+Интерфейс работает на русском и английском, в тёмной и светлой теме.
 
-Контракты JSONL, установка и проверенные границы — [docs/VLA_STUDIO.md](docs/VLA_STUDIO.md).
+## Как устроен эксперимент
 
-## Проверка и исправления (23 ноября 2026)
+1. **Выберите раздел и модель.** Начните с небольшой архитектуры или готовой базы.
+   Для VLA и собственных world models есть синтетические примеры без скачивания больших весов.
+2. **Подготовьте данные.** Укажите локальный датасет или поддерживаемый источник Hugging Face.
+   Формат зависит от задачи: тексты, диалоги, изображения с ответами или эпизоды с действиями.
+3. **Проверьте настройки.** Используйте Readiness или preflight выбранного раздела.
+   В World Models также есть оценка памяти и времени и короткий замер на вашем устройстве.
+4. **Запустите обучение.** Следите за метриками и логами; результаты сохраняются в каталоге запуска.
+5. **Попробуйте результат.** Откройте чат, Action preview или Rollout — в зависимости от типа модели.
 
-Актуальные изменения и границы проверки описаны в [docs/FIXES.md](docs/FIXES.md).
-Первоначальная карта находится в [docs/PROJECT_MAP.md](docs/PROJECT_MAP.md).
-Реальные VLM-прогоны, исправления, окружение и приоритеты: [docs/VLM_VALIDATION.md](docs/VLM_VALIDATION.md).
-В VLM Studio перед запуском нажми **Проверить эксперимент**: будет показан пример
-картинки и масок loss, проверены окружение и выборка данных без загрузки весов.
+Оценки памяти и времени помогают выбрать настройки, но не гарантируют, что любая модель
+поместится на любой GPU. Сначала полезно сделать короткий пробный запуск.
 
-Актуальные VLM-пресеты: **Qwen3-VL, Qwen3.5 и Gemma 3** (Gemma пока без локальной GPU-проверки).
-Для VLM подключены **наши GRPO / Dr.GRPO / DAPO / SDPO** из `homellm.training.rl`:
-собственные losses, advantages и ReplayBuffer с мультимодальным policy/reference/teacher.
-Выбор **Transformers или Unsloth** относится к модели и ускорению; TRL trainer
-для GRPO не используется. Обычный профиль не требует TRL, optional Unsloth
-имеет собственную зависимость от него. Новые VLM используют отдельную `.venv-vlm`
-или `MAH_VLM_PYTHON`; основной API и текстовые модели сохраняют прежний Python.
-Установка, текущие GPU-проверки и границы — в [руководстве VLM](docs/VLM_VALIDATION.md).
+![World Models Studio: локальные модели и проверка ресурсов](docs/screenshots/world-models.png)
 
-- ML-исходники могут лежать в `./models-at-home`, соседнем `../models-at-home`
-  или в каталоге `MAH_RUNTIME_ROOT`. Сборка проверяет наличие runtime и включает его код.
-- Native использует `MAH_PYTHON`, затем проектное `.venv`, затем Python из PATH.
-  Проверяются импорты FastAPI, uvicorn, psutil, Accelerate и Transformers.
-  Для другого интерпретатора: `MAH_PYTHON=/path/to/python npm run dev`.
-- В установленной программе данные находятся в `userData/workspace`, а не в ресурсах
-  приложения. `MODELS_AT_HOME_ROOT` позволяет выбрать другой workspace.
-- Каждый новый запуск получает отдельный `output_dir/<run_id>`. Продолжение
-  восстанавливает последний checkpoint; для увеличения законченного плана API принимает
-  `POST /api/training/runs/{id}/continue` с `{"max_steps": <новый предел>}`.
-  Legacy GRPO runtime не поддерживает resume — API возвращает явную ошибку.
-- Закрытие или перезапуск backend останавливает принадлежащие ему дочерние задачи.
-  Старые живые PID из неподтверждённых файлов не завершаются автоматически.
-- Electron передаёт случайный токен сессии HTTP/WS-клиенту. Jupyter использует
-  случайный токен; кнопка Start Jupyter получает его вместе с URL.
-- Для standalone Compose сначала собери базовый ML-образ:
-  `docker build -t models-at-home-base:latest ../models-at-home`, затем
-  `docker compose up --build`. Профиль `notebooks` публикует отдельный Jupyter на 8889;
-  его случайный токен показывается в логах. Управляемый через API Jupyter использует 8888.
+## Первый запуск из исходников
 
-Проверки: `npm run typecheck`, `npm test`,
-`.venv/bin/python -m pytest backend/tests -q`, `npx vite build`.
-Дополнительные интеграционные сценарии: `scripts/smoke-desktop.cjs` и
-`scripts/smoke-training.py` (последнему нужен ML runtime на PYTHONPATH и GPU).
-Он поддерживает `--multi-gpu` (GPU 0 и 1) и `--architecture home|gpt2|home_moe|blueprint`;
-по умолчанию использует GPU 1. Проверяет pretrain, resume, inference и SFT chat/instruct
-на временных локальных данных без скачиваний.
-
-В Model Builder собери схему и нажми **Обучить эту модель**. Training Studio получит
-её снимок; выбери tokenizer и данные перед запуском. **Edit JSON → Apply JSON**
-позволяет редактировать связи графа с проверкой структуры. Для Blueprint проверены
-pretrain, resume, inference и SFT; GRPO, Unsloth и QLoRA отклоняются явно.
-
-
----
-
-## Быстрый старт
-
-### Требования
-
-- **Node.js** >= 20
-- **Python** >= 3.10 + pip
-- **Docker** + **NVIDIA Container Toolkit** — для GPU-тренировки (опционально)
-
-### 1. Установка
+Нужны **Node.js 22.12+**, **Python 3.12** и Git. Для серьёзного обучения рекомендуется
+NVIDIA GPU с подходящей сборкой PyTorch/CUDA. Небольшие Native VLA и world-model демо
+можно попробовать на CPU.
 
 ```bash
-# JS-зависимости
-npm install
+git clone https://github.com/researchim-ai/models-at-home.git
+cd models-at-home
+npm ci
 
-# Отдельный Python с ML- и API-зависимостями
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e "../models-at-home[full,rl]"
-pip install -r backend/requirements-dev.txt
-```
+python -m pip install --upgrade pip
+python -m pip install -r backend/requirements.txt
+python -m pip install -e ./models-at-home "transformers==4.57.3" datasets peft Pillow
 
-На Windows активируй `.venv\Scripts\activate` вместо `source`. Если ML-runtime
-находится в другом месте, используй его путь при установке и `MAH_RUNTIME_ROOT`.
-
-### 2. Запуск (dev mode)
-
-```bash
 npm run dev
 ```
 
-Это **одна команда**. Она:
-1. Запускает Vite dev server (hot-reload React)
-2. Компилирует Electron `main`/`preload`
-3. Открывает **настоящее Electron-окно** (десктоп-прила, не браузер!)
-4. Electron пробует поднять Docker backend (`models-at-home-studio:latest`)
-5. Если Docker недоступен или контейнер не поднялся — fallback на локальный Python FastAPI
-6. Порт подбирается автоматически (обычно `:8000`, при конфликте `:8001+`)
-7. Пока бэкенд грузится — в окне показан splash-экран с прогрессом
-8. Когда `/api/system/health` отвечает 200 — UI подменяется на рабочий
+На Windows активируйте окружение командой `.venv\Scripts\activate`.
+PyTorch должен соответствовать вашему устройству; установка выше сама по себе не настраивает
+CUDA-драйвер. Для quantization, Jupyter, Unsloth и отдельных семейств моделей нужны
+дополнительные зависимости.
 
-В sidebar внизу всегда видно статус бэкенда — `Online` / `Offline`.
+Команда `npm run dev` открывает Electron-приложение и запускает API. В Settings можно выбрать
+режим **Native** для локального Python или **Docker** для контейнера; в режиме **Auto**
+приложение пробует Docker и при необходимости переходит на локальный Python.
 
-**Single instance**: второй запуск `npm run dev` поднимет на передний план уже открытое окно.
-
-**Где смотреть логи бэкенда:**
-- **Меню приложения → Backend → Show Backend Logs**
-- Или напрямую: `~/.config/Models at Home Studio/logs/backend.log` (Linux)
-  - macOS: `~/Library/Logs/Models at Home Studio/backend.log`
-  - Windows: `%APPDATA%\Models at Home Studio\logs\backend.log`
-
-### 3. Остановка
-
-Закрой окно Electron — бэкенд остановится автоматически.
-
----
-
-## Сборка приложения
-
-Собирает готовые инсталлеры для OS:
+Если интерпретатор лежит в другом месте, задайте его явно:
 
 ```bash
-# Linux — AppImage + .deb (x64)
-npm run build:linux
+MAH_PYTHON=/path/to/python npm run dev
+```
 
-# Windows — .exe (NSIS installer) + portable .exe (x64)
-npm run build:win
+Современные VLM используют отдельное окружение `.venv-vlm` или `MAH_VLM_PYTHON`:
+инструкция по совместимым версиям находится в [руководстве VLM](docs/VLM_VALIDATION.md).
+Для первого знакомства с VLA откройте **VLA Studio → Синтетическое демо**, выберите CPU / Float32,
+выполните проверку и начните короткое обучение.
 
-# macOS — .dmg + .zip (x64 + arm64)
-npm run build:mac
+## Ваше рабочее пространство
 
-# Текущая платформа
+Студия состоит из Electron/React-интерфейса, Python API и ML runtime в каталоге `models-at-home/`.
+Обучение выполняют локальные процессы Python или Docker; это не клиент облачного API.
+Первичная загрузка моделей и датасетов из Hugging Face требует сети, а некоторые веса —
+принятия условий их авторов. Локальные данные, скачанные веса и результаты остаются на вашем диске.
+
+В установленном приложении рабочие файлы хранятся в пользовательском `workspace`, отдельно от
+ресурсов приложения. Путь можно изменить через `MODELS_AT_HOME_ROOT`.
+Датасеты, веса, кеши и сборки не должны попадать в Git.
+
+![Светлая тема Training Studio](docs/screenshots/training-studio-light.png)
+
+## Что стоит учитывать
+
+Проект развивается: поддержка режима в одном разделе не означает поддержку во всех остальных.
+В частности, **VLA сейчас обучается через SFT**, а **предобученный DIAMOND доступен для inference**;
+обучение world models в интерфейсе относится к собственным GRU/RSSM.
+Поддержка Unsloth, QLoRA, multi-GPU и продолжения обучения зависит от конкретного пути запуска.
+
+Для воспроизводимого эксперимента начинайте с подходящего окружения и короткой проверки.
+Поддерживаемые форматы, зависимости и границы проверок описаны отдельно:
+
+- [VLM: модели, SFT, native GRPO и Unsloth](docs/VLM_VALIDATION.md)
+- [VLA: демонстрации, action spaces и обучение](docs/VLA_STUDIO.md)
+- [World Models: обучение динамики и Rollout](docs/WORLD_MODELS_STUDIO.md)
+- [DIAMOND и другие локальные world models](docs/WORLD_FOUNDATION_MODELS.md)
+
+## Для разработчиков
+
+```bash
+npm run typecheck
+npm test
+python -m pip install -r backend/requirements-dev.txt
+python -m pytest backend/tests -q
 npm run build
 ```
 
-Готовые файлы окажутся в `release/` с именем вида
-`Models at Home Studio-0.1.0-linux-x64.AppImage`.
+`npm run build` собирает интерфейс и пакет приложения для текущей ОС.
+Также есть команды `build:linux`, `build:win` и `build:mac`; доступность конкретного пакета
+зависит от платформы сборки. Python-окружение и веса моделей устанавливаются отдельно.
 
-**Что попадает в сборку:**
-- `dist/` — собранный React (renderer)
-- `dist-electron/` — скомпилированный main/preload
-- `resources/backend/` — Python FastAPI API
-- `resources/models-at-home/` — ML-код (без `models/`, `datasets/`, `out/`, `logs/`, `.venv/`)
-- `build/icons/` — иконки под все платформы
+Исходники интерфейса находятся в `src/`, Electron — в `electron/`, API и workers — в `backend/`,
+ML-код — в `models-at-home/homellm/`. Для проверки собранного приложения с настоящим backend
+есть `scripts/smoke-desktop.cjs`. Скриншоты в этом README сняты с работающего приложения.
 
-**Иконки:** `build/icon.png` (Linux/общая), `build/icon.ico` (Windows), `build/icon.icns` (macOS).
-
----
-
-## Backend modes
-
-В приложении есть три режима backend, выбрать можно в **Settings → Backend Mode**:
-
-| Режим | Поведение |
-|-------|-----------|
-| `Auto` | Сначала Docker, если не вышло — локальный Python |
-| `Docker` | Только Docker. Если Docker daemon/образ/контейнер не поднялись — будет ошибка на splash |
-| `Native` | Только локальный Python (`python3 -m uvicorn backend.api:app`) |
-
-Docker-образ состоит из двух слоёв:
-
-- `models-at-home-base:latest` — тяжёлый ML runtime (CUDA, PyTorch, vLLM, Deepspeed и ML-код)
-- `models-at-home-studio:latest` — финальный backend app image с FastAPI API (`backend/`)
-
-Electron автоматически использует `models-at-home-studio:latest`. Если образа нет и
-`dockerAutoBuild=true`, приложение соберёт его само. Первый build может занять долго
-и занять десятки гигабайт.
-
-В Docker backend переменная `MODELS_AT_HOME_ROOT=/app`, поэтому API, WebSocket метрик,
-модели, датасеты, `.runs`, blueprints, configs и notebooks смотрят в один и тот же корень.
-
-JupyterLab запускается из страницы **Notebooks**. В Docker-режиме Electron выбирает
-свободный host-port начиная с `8888` и пробрасывает его в контейнер как
-`JUPYTER_PUBLIC_URL`, поэтому backend не падает, если стандартный порт уже занят.
-
----
-
-## Как это устроено
-
-```
-┌─────────────────────────────────────────┐
-│         Electron Desktop App            │
-│                                         │
-│  ┌─────────────┐  ┌──────────────────┐  │
-│  │ Main Process│  │ Renderer (React) │  │
-│  │             │  │                  │  │
-│  │ Стартует    │  │ 7 страниц:       │  │
-│  │ Python      │  │  - Training      │  │
-│  │ бэкенд     │  │  - VLM Studio    │  │
-│  │ автоматом   │  │  - Model Builder │  │
-│  │             │  │  - Study Center  │  │
-│  │ Управляет   │  │  - Notebooks     │  │
-│  │ Docker      │  │  - Agent Studio  │  │
-│  │ (optional)  │  │  - Settings      │  │
-│  └──────┬──────┘  └────────┬─────────┘  │
-│         │                  │             │
-└─────────┼──────────────────┼─────────────┘
-          │                  │
-          │        HTTP + WebSocket
-          │                  │
-  ┌───────▼──────────────────▼──────────┐
-  │  FastAPI Backend (Python, :8000)    │
-  │                                     │
-  │  /api/training/*  — обучение        │
-  │  /api/models/*    — модели          │
-  │  /api/datasets/*  — датасеты        │
-  │  /api/chat/*      — чат с моделью   │
-  │  /api/agent/*     — AI-агент        │
-  │  /ws/metrics/*    — метрики (WS)    │
-  │                                     │
-  │  subprocess → trainer_worker,       │
-  │               train_rl, vllm, etc.  │
-  └─────────────────────────────────────┘
-```
-
-При нажатии «Start Training» → FastAPI запускает `trainer_worker` как subprocess →
-метрики пишутся в `.runs/{id}/metrics.json` → FastAPI читает и шлёт по WebSocket →
-React рисует графики в реальном времени.
-
-Backend закрепляет один канонический config contract перед запуском legacy worker:
-
-- `dataset_path` из React превращается в `data_path` для старого ML-кода
-- `num_epochs` синхронизируется с `epochs`
-- `model_path` для SFT/continual/GRPO синхронизируется с `base_model_path`
-- `lr_scheduler` синхронизируется с worker-полем `lr_schedule`
-- `flash_attention`/`liger_kernel` синхронизируются с `use_flash_attention`/`use_liger`
-- GRPO получает worker-поля `grpo_learning_rate`, `grpo_max_optim_steps`, `lora_r`, `grad_checkpoint`
-- VLM получает `model_name_or_path`, `lora_r`, `tuning_method`, `lr_schedule`, `num_epochs`
-- архитектурные поля (`hidden_size`, `num_layers`, `n_heads`, `seq_len`) сохраняются в `config.json`
-- если обязательных данных нет, API возвращает `400`, а не запускает падающий subprocess
-- если subprocess умер сразу после старта, API возвращает ошибку с хвостом `stderr.log`
-
-Метрики старого worker (`current_step`, `current_loss`, `current_lr`) нормализуются
-в WebSocket до полей React UI (`step`, `loss`, `learning_rate`).
-
----
-
-## Проверенный training path
-
-Проверено end-to-end:
-
-1. **Мини pretrain 2 шага**:
-   - HomeModel с нуля
-   - tiny text dataset
-   - `max_steps=2`
-   - worker дошёл до `current_step=2`, loss и GPU stats записались
-
-2. **Multi-GPU DDP pretrain 200 шагов**:
-   - `parallel_mode=multi_gpu`
-   - `accelerate_multi_gpu.yaml`
-   - 2 GPU
-   - HomeModel примерно 252M параметров
-   - `hidden_size=1024`, `num_layers=12`, `seq_len=512`
-   - результат: `status=completed`, `step=200/200`, `final_model` сохранён
-
-Пример фактической нагрузки GPU из теста:
-
-```text
-10s: GPU0 4649 MiB, 87%  | GPU1 4283 MiB, 85%
-20s: GPU0 4644 MiB, 80%  | GPU1 4283 MiB, 100%
-25s: GPU0 4644 MiB, 100% | GPU1 4283 MiB, 99%
-35s: GPU0 4655 MiB, 100% | GPU1 4283 MiB, 98%
-```
-
-Известный нюанс: в DDP-прогоне debug warning показал duplicate samples между
-процессами на первых шагах. Это не ломает запуск/GPU usage, но для качества
-долгих multi-GPU тренировок стоит отдельно улучшить шардирование датасета.
-
----
-
-## Agent Studio и Notebooks
-
-**Agent Studio** запускает `llama-server` через backend, скачивает выбранный GGUF
-из Hugging Face в `models-at-home/models/`, проверяет `/health` на порту `8787` и
-использует реальный `homellm.app.agent_runtime.run_agent_turn`. Tool calls идут из
-trace рантайма и стримятся в UI как SSE-события. Сессии хранятся в
-`models-at-home/.runs/agent_sessions/`.
-
-**Notebooks** теперь не требуют ручного запуска. Кнопка **Start Jupyter** вызывает
-backend route, который стартует `python -m jupyterlab` с root directory
-`models-at-home/notebooks/` и токеном `mah-local` (или `JUPYTER_TOKEN`). В Docker
-папка `notebooks/` примонтирована как volume, а внешний URL приходит из
-`JUPYTER_PUBLIC_URL`.
-
-Выполнение ячеек происходит внутри JupyterLab. Studio управляет запуском, статусом,
-открытием notebook'ов и embed/openExternal, но не заменяет сам Jupyter kernel.
-
----
-
-## Структура проекта
-
-```
-models-at-home-studio/
-├── electron/               # Electron main process
-│   ├── main.ts             #   Окно, бэкенд lifecycle, IPC
-│   ├── preload.ts          #   contextBridge (безопасный API)
-│   └── docker.ts           #   Docker management (dockerode)
-├── src/                    # React frontend (renderer)
-│   ├── pages/              #   9 страниц
-│   │   ├── TrainingStudio  #   Обучение (7 вкладок)
-│   │   ├── VLMStudio       #   Visual Language Models
-│   │   ├── WorldModelsStudio #   Обучение динамики и imagined rollouts
-│   │   ├── VLAStudio       #   Vision-Language-Action policies
-│   │   ├── ModelBuilder    #   Визуальный конструктор
-│   │   ├── StudyCenter     #   Учебные материалы
-│   │   ├── Notebooks       #   JupyterLab
-│   │   ├── AgentStudio     #   AI-агент (llama.cpp)
-│   │   └── Settings        #   Настройки
-│   ├── components/ui/      #   Компоненты (shadcn-стиль)
-│   ├── api/                #   REST/WS клиент + React Query
-│   ├── stores/             #   Zustand (training, settings, docker)
-│   └── i18n/               #   Переводы en/ru
-├── backend/                # FastAPI Python бэкенд
-│   ├── api.py              #   Точка входа
-│   ├── ws.py               #   WebSocket метрик
-│   └── routes/             #   training, models, datasets, chat, agent, vlm, system, study
-├── models-at-home/         # Исходный ML-код (не трогаем)
-│   ├── homellm/            #   Модели, обучение, inference
-│   ├── Dockerfile          #   CUDA + PyTorch
-│   └── ...
-├── docker-compose.yml      # Docker-оркестрация (опционально)
-├── package.json
-└── vite.config.ts
-```
-
----
-
-## npm-скрипты
-
-| Команда            | Что делает                                     |
-|--------------------|------------------------------------------------|
-| `npm run dev`      | Запускает Electron-прилу в dev mode            |
-| `npm run build`    | Production build + electron-builder            |
-| `npm run build:linux` | Сборка под Linux (AppImage + deb)           |
-| `npm run build:win`   | Сборка под Windows (NSIS .exe)              |
-| `npm run build:mac`   | Сборка под macOS (.dmg)                     |
-| `npm run typecheck`   | Проверка типов TypeScript                   |
-
----
-
-## FAQ
-
-**Q: Нужен ли Docker?**
-В режиме `Auto` приложение сначала пробует Docker, потому что это самый
-надёжный путь для CUDA/GPU окружения. Если Docker недоступен, Electron
-fallback'нется на локальный Python backend. Для полноценной GPU-тренировки
-рекомендуется Docker + NVIDIA Container Toolkit.
-
-**Q: Где ML-код?**
-В `models-at-home/homellm/`. Он не менялся — FastAPI просто вызывает те же
-функции, что раньше вызывал Streamlit.
-
-**Q: Как добавить свою страницу?**
-1. Создай `src/pages/MyPage.tsx`
-2. Добавь `lazy(() => import(...))` роут в `src/App.tsx`
-3. Добавь навигацию в `src/components/layout/Sidebar.tsx`
-
-**Q: Бэкенд не стартует, что делать?**
-- Проверь установленные пакеты: `pip install fastapi "uvicorn[standard]" websockets pydantic`
-- Проверь Docker: `docker info`
-- Проверь GPU runtime: `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`
-- Открой логи: меню **Backend → Show Backend Logs**
-- Splash-экран в приложении сам покажет ошибку через 20 секунд и предложит перезапуск
-- Убедись, что `python3 --version` работает в PATH (на Windows: `python --version`)
-
-**Q: Порт 8000 занят?**
-Электрон автоматически подберёт следующий свободный (8001, 8002, ...). React видит порт через IPC и общается с правильным.
-
-**Q: Где данные пользователя?**
-- Тренировочные ранчи, чекпоинты, датасеты — в `models-at-home/` (как в оригинале)
-- Логи бэкенда — в стандартной директории ОС для логов приложения (см. выше)
-
----
-
-## Стек
-
-| Слой       | Технология                              |
-|------------|-----------------------------------------|
-| Desktop    | Electron 35                             |
-| Frontend   | React 19, TypeScript, Vite 6            |
-| Стили      | Tailwind CSS 4, shadcn/ui              |
-| Графики    | Recharts                                |
-| Стейт      | Zustand, React Query                    |
-| i18n       | i18next (en + ru)                       |
-| Backend    | FastAPI, uvicorn, WebSocket             |
-| ML         | PyTorch, Transformers, Accelerate       |
-| Inference  | vLLM, llama.cpp                         |
-| Сборка     | electron-builder (Linux/Win/Mac)        |
-
----
-
-## Лицензия
-
-Apache 2.0
+Нашли ошибку или хотите добавить архитектуру? Создайте issue с конфигурацией запуска,
+версией окружения и логом ошибки — так проблему будет гораздо проще воспроизвести.

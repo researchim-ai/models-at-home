@@ -1,3 +1,4 @@
+import { WorkspaceIntro } from '@/components/layout/WorkspaceIntro'
 import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Play, Square, Loader2, CheckCircle2, Bot, Upload } from 'lucide-react'
@@ -147,8 +148,8 @@ export function VLAStudio() {
           options={[{ value: 'bf16', label: 'BF16' }, { value: 'fp16', label: 'FP16' }, { value: 'no', label: 'Float32' }]} />
       </div>
     </aside>
-    <main className="flex-1 overflow-auto p-6 space-y-4">
-      <div><h2 className="text-xl font-semibold">VLA Studio</h2><p className="text-sm text-muted-foreground">Обучение action-моделей по демонстрациям — behavior cloning.</p></div>
+    <main className="min-w-0 flex-1 overflow-auto p-6 space-y-4">
+      <WorkspaceIntro space="vla" />
       <Tabs value={tab} onValueChange={setTab}><TabsList><TabsTrigger value="launch">Обучение</TabsTrigger><TabsTrigger value="predict">Action preview</TabsTrigger><TabsTrigger value="history">История</TabsTrigger><TabsTrigger value="data">Формат данных</TabsTrigger></TabsList>
         <TabsContent value="launch"><div className="space-y-4">
           <Card><CardHeader><CardTitle>Action policy training</CardTitle><CardDescription>Native VLA учится с нуля; VLM + Action Head использует визуально-языковую основу и отдельный выход действий.</CardDescription></CardHeader><CardContent className="space-y-3">
@@ -156,8 +157,8 @@ export function VLAStudio() {
               <Button onClick={start} disabled={!ready || busy || !!active}><Play className="h-4 w-4" />Начать VLA обучение</Button>
               {active && <Button variant="destructive" onClick={stop} disabled={busy}><Square className="h-4 w-4" />Остановить</Button>}</div>
             {report?.key === key && <div className="space-y-2"><Badge variant={ready ? 'success' : 'destructive'}>{ready ? 'VLA проверка пройдена' : 'Исправьте настройки или данные'}</Badge>
-              {report.value.checks.map((item, index) => <p key={index} className={`text-xs ${item.status === 'error' ? 'text-destructive' : item.status === 'warning' ? 'text-amber-500' : 'text-muted-foreground'}`}><strong>{item.name}</strong>: {item.detail}</p>)}
-              {sample && <div className="grid grid-cols-[160px_1fr] gap-3 rounded-lg bg-muted/40 p-3"><img src={sample.image} alt="VLA observation" className="w-40 rounded" /><div className="space-y-2 text-xs"><p>{sample.instruction}</p><p>State: {JSON.stringify(sample.state)}</p><p>Действий в примере: {sample.valid_timesteps} / {sample.horizon}</p><pre className="max-h-36 overflow-auto">{JSON.stringify(sample.actions, null, 2)}</pre></div></div>}
+              {report.value.checks.map((item, index) => <p key={index} className={`text-xs ${item.status === 'error' ? 'text-destructive' : item.status === 'warning' ? 'text-warning' : 'text-muted-foreground'}`}><strong>{item.name}</strong>: {item.detail}</p>)}
+              {sample && <div className="grid grid-cols-[minmax(80px,160px)_minmax(0,1fr)] gap-3 rounded-lg bg-muted/40 p-3"><img src={sample.image} alt="VLA observation" className="w-40 rounded" /><div className="space-y-2 text-xs"><p>{sample.instruction}</p><p>State: {JSON.stringify(sample.state)}</p><p>Действий в примере: {sample.valid_timesteps} / {sample.horizon}</p><pre className="max-h-36 overflow-auto">{JSON.stringify(sample.actions, null, 2)}</pre></div></div>}
             </div>}
           </CardContent></Card>
           {selected && <Card><CardHeader><CardTitle>Эксперимент {selected}</CardTitle></CardHeader><CardContent className="space-y-2 text-sm">

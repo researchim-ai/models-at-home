@@ -1,3 +1,4 @@
+import { WorkspaceIntro } from '@/components/layout/WorkspaceIntro'
 import { useState, useRef, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
@@ -117,7 +118,7 @@ function VLMConfigSidebar({
             onChange={(e) => setDatasetPath(e.target.value)}
           />
           {!datasetPath && (
-            <p className="text-[11px] text-amber-500">
+            <p className="text-[11px] text-warning">
               Для VLM-тренировки нужен dataset_path
             </p>
           )}
@@ -355,7 +356,7 @@ function VLMLaunchTab({ config }: { config: Record<string, unknown> }) {
             <span>Loss {metrics?.loss?.toFixed(5) ?? '—'}</span>
           </div>
           {metrics?.error && <pre role="alert" className="max-h-48 overflow-auto whitespace-pre-wrap text-xs text-destructive">{metrics.error}</pre>}
-          {metrics?.training_warning && <p role="status" className="text-xs text-amber-500">{metrics.training_warning}</p>}
+          {metrics?.training_warning && <p role="status" className="text-xs text-warning">{metrics.training_warning}</p>}
           {config.stage === 'vlm_grpo' && <p className="text-xs text-muted-foreground">
             Reward: {metrics?.reward ?? '—'} · KL: {metrics?.kl_divergence ?? '—'}
           </p>}
@@ -689,7 +690,8 @@ export function VLMStudio() {
         tuningMethod={tuningMethod} setTuningMethod={setTuningMethod} gpuId={gpuId} setGpuId={setGpuId}
         seqLen={seqLen} setSeqLen={setSeqLen} maxPixels={maxPixels} setMaxPixels={setMaxPixels} precision={precision} setPrecision={setPrecision}
       />
-      <div className="flex-1 p-6 overflow-auto">
+      <div className="min-w-0 flex-1 p-6 overflow-auto">
+        <WorkspaceIntro space="vlm" />
         <Tabs value={activeTab} onValueChange={setActiveTab}>
           <TabsList>
             <TabsTrigger value="launch">{t('tabs.launch')}</TabsTrigger>

@@ -320,8 +320,8 @@ export function ModelBuilder() {
   }
 
   return (
-    <div className="flex h-full">
-      <div className="w-64 shrink-0 border-r border-border flex flex-col">
+    <div className="builder-workspace flex h-full">
+      <div className="builder-palette min-h-0 w-64 shrink-0 border-r border-border flex flex-col">
         <ScrollArea className="flex-1 p-4">
           <div className="space-y-4">
             <div>
@@ -381,9 +381,9 @@ export function ModelBuilder() {
         </ScrollArea>
       </div>
 
-      <div className="flex-1 flex flex-col">
-        <div className="flex items-center justify-between px-6 py-3 border-b border-border gap-3">
-          <div className="flex items-center gap-3 flex-1">
+      <div className="min-h-0 min-w-0 flex-1 flex flex-col">
+        <div className="flex flex-col items-stretch px-6 py-3 border-b border-border gap-3">
+          <div className="flex min-w-0 flex-wrap items-center gap-3 flex-1">
             <Input
               value={blueprintName}
               onChange={(e) => setBlueprintName(e.target.value)}
@@ -395,7 +395,7 @@ export function ModelBuilder() {
             </Badge>
             <Badge variant="outline">{blocks.length} blocks</Badge>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button variant="outline" size="sm" onClick={() => { setJsonDraft(JSON.stringify(blueprint, null, 2)); setJsonError(null) }}>
               Edit JSON
             </Button>
@@ -430,7 +430,7 @@ export function ModelBuilder() {
               <div className="text-center text-muted-foreground">
                 <Layers className="mx-auto h-12 w-12 mb-3 opacity-30" />
                 <p className="text-sm">Добавь блоки из палитры слева</p>
-                <p className="text-xs mt-1">Или выбери сохранённый blueprint справа</p>
+                <p className="text-xs mt-1">Или открой blueprint из списка сохранённых</p>
               </div>
             </div>
           ) : (
@@ -477,7 +477,7 @@ export function ModelBuilder() {
         </ScrollArea>
       </div>
 
-      <div className="w-72 shrink-0 border-l border-border flex flex-col">
+      <div className="builder-saved min-h-0 w-72 shrink-0 border-l border-border flex flex-col">
         <div className="px-4 py-3 border-b border-border flex items-center justify-between">
           <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground flex items-center gap-2">
             <FolderOpen className="h-3.5 w-3.5" />

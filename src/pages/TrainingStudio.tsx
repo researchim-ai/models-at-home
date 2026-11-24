@@ -1,3 +1,4 @@
+import { WorkspaceIntro } from '@/components/layout/WorkspaceIntro'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
@@ -197,7 +198,7 @@ function ConfigSidebar() {
             />
           )}
           {requiresBaseModel && !config.base_model_path && !config.model_path && (
-            <p className="text-[11px] text-amber-500">
+            <p className="text-[11px] text-warning">
               Для этого этапа нужна базовая модель (HF repo или локальный путь)
             </p>
           )}
@@ -217,7 +218,7 @@ function ConfigSidebar() {
         {/* Architecture params (pretrain from scratch) */}
         {isPretrainArch && (
           <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-3">
-            <Label className="text-xs font-semibold uppercase tracking-wide text-blue-500">
+            <Label className="text-xs font-semibold uppercase tracking-wide text-primary">
               {t('arch.title')}
             </Label>
             <Slider
@@ -482,7 +483,7 @@ function ConfigSidebar() {
         {/* PRETRAIN / CONTINUAL-specific */}
         {(stage === 'pretrain' || stage === 'continual_pretrain') && (
           <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-3">
-            <Label className="text-xs font-semibold uppercase tracking-wide text-blue-500">
+            <Label className="text-xs font-semibold uppercase tracking-wide text-primary">
               {stage === 'pretrain' ? 'Pretrain' : 'Continual Pretrain'}
             </Label>
             <Slider
@@ -896,13 +897,13 @@ function ReadinessRow({ ok, label, value }: { ok: boolean; label: string; value:
   return (
     <div className="flex items-center gap-3 rounded-lg bg-muted/40 p-3">
       {ok ? (
-        <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-500" />
+        <CheckCircle2 className="h-5 w-5 shrink-0 text-success" />
       ) : (
-        <AlertCircle className="h-5 w-5 shrink-0 text-amber-500" />
+        <AlertCircle className="h-5 w-5 shrink-0 text-warning" />
       )}
       <div className="min-w-0 flex-1">
         <div className="text-xs text-muted-foreground">{label}</div>
-        <div className="truncate text-sm font-medium">{value}</div>
+        <div className="truncate text-sm font-medium" title={value}>{value}</div>
       </div>
     </div>
   )
@@ -1050,11 +1051,11 @@ function LaunchTab({ onNavigate }: { onNavigate: (tab: string) => void }) {
       <Card className={allReady ? 'border-emerald-500/40' : 'border-amber-500/40'}>
         <CardHeader className="pb-2">
           <CardTitle className="text-sm flex items-center gap-2">
-            {allReady ? <CheckCircle2 className="h-4 w-4 text-emerald-500" /> : <AlertCircle className="h-4 w-4 text-amber-500" />}
+            {allReady ? <CheckCircle2 className="h-4 w-4 text-success" /> : <AlertCircle className="h-4 w-4 text-warning" />}
             {t('launch.readiness')} — {readyCount}/3
           </CardTitle>
         </CardHeader>
-        <CardContent className="grid grid-cols-3 gap-3">
+        <CardContent className="readiness-grid grid gap-3">
           <ReadinessRow ok={modelReady} label={t('launch.model')} value={modelValue} />
           <ReadinessRow ok={dataReady} label={t('launch.data')} value={dataPath ? dataPath.split('/').pop()! : t('launch.not_selected')} />
           <ReadinessRow ok={modeReady} label={t('launch.training_mode')} value={config.parallel_mode ?? 'single'} />
@@ -1100,7 +1101,7 @@ function LaunchTab({ onNavigate }: { onNavigate: (tab: string) => void }) {
             </div>
           </div>
 
-          <div className="mt-6 flex items-center gap-3">
+          <div className="mt-6 flex flex-wrap items-center gap-3">
             {isRunning ? (
               <Button variant="destructive" onClick={handleStop} disabled={stopMutation.isPending}>
                 <Square className="h-4 w-4" />
@@ -1113,7 +1114,7 @@ function LaunchTab({ onNavigate }: { onNavigate: (tab: string) => void }) {
               </Button>
             )}
             {!isRunning && !allReady && (
-              <span className="text-xs text-amber-500">{t('launch.not_ready_hint')}</span>
+              <span className="text-xs text-warning">{t('launch.not_ready_hint')}</span>
             )}
           </div>
         </CardContent>
@@ -2373,7 +2374,8 @@ export function TrainingStudio() {
   return (
     <div className="flex h-full">
       <ConfigSidebar />
-      <div className="flex-1 p-6 overflow-auto">
+      <div className="min-w-0 flex-1 p-6 overflow-auto">
+        <WorkspaceIntro space="training" />
         <Tabs value={activeTab} onValueChange={setActiveTab}>
           <TabsList>
             <TabsTrigger value="launch">{t('tabs.launch')}</TabsTrigger>

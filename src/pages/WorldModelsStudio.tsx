@@ -1,3 +1,4 @@
+import { WorkspaceIntro } from '@/components/layout/WorkspaceIntro'
 import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Activity, Play, Square } from 'lucide-react'
@@ -107,7 +108,7 @@ export function WorldModelsStudio() {
       <Label className="block space-y-1 text-xs">Precision<Select value={config.mixed_precision} onChange={e => patch({ mixed_precision: e.target.value })} options={['no', 'bf16', 'fp16'].map(value => ({ value, label: value === 'no' ? 'FP32' : value }))} /></Label>
     </aside>}
     <main className="flex-1 min-w-0 overflow-auto p-6 space-y-5">
-      <div><h1 className="text-xl font-semibold">World Models Studio</h1><p className="text-sm text-muted-foreground">Обучение динамики среды и предпросмотр воображаемых траекторий.</p></div>
+      <WorkspaceIntro space="world" />
       {error && <div role="alert" className="text-sm text-destructive whitespace-pre-wrap">{error}</div>}
       <Tabs value={tab} onValueChange={setTab}><TabsList><TabsTrigger value="foundation">Готовые модели</TabsTrigger><TabsTrigger value="train">Обучение</TabsTrigger><TabsTrigger value="rollout">Rollout</TabsTrigger><TabsTrigger value="history">История</TabsTrigger><TabsTrigger value="format">Данные</TabsTrigger></TabsList>
         <TabsContent value="foundation"><WorldFoundationModels gpuId={gpuId} onGpuChange={setGpuId} /></TabsContent>
@@ -119,7 +120,7 @@ export function WorldModelsStudio() {
           {selected && <Card><CardHeader><CardTitle>{selected}</CardTitle></CardHeader><CardContent className="space-y-3">
             <p className="text-sm">{current?.status ?? selectedRun?.status} · Осталось: {current?.estimated_remaining_seconds != null ? durationLabel(current.estimated_remaining_seconds) : '—'} · Шаг {current?.step ?? 0} / {selectedRun?.total_steps ?? 0} · Loss {current?.loss?.toFixed(5) ?? '—'} · Validation MSE {current?.val_loss?.toFixed(5) ?? '—'}</p>
             {current?.error && <p className="text-destructive whitespace-pre-wrap">{current.error}</p>}
-            {!!metrics.data?.history.length && <div className="h-56"><ResponsiveContainer width="100%" height="100%"><LineChart data={metrics.data.history}><XAxis dataKey="step" /><YAxis /><Tooltip contentStyle={{ background: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8 }} /><Line dataKey="loss" stroke="#38bdf8" dot={false} isAnimationActive={false} /><Line dataKey="val_loss" stroke="#34d399" dot={false} connectNulls isAnimationActive={false} /></LineChart></ResponsiveContainer></div>}
+            {!!metrics.data?.history.length && <div className="h-56"><ResponsiveContainer width="100%" height="100%"><LineChart data={metrics.data.history}><XAxis dataKey="step" /><YAxis /><Tooltip contentStyle={{ background: 'var(--color-popover)', border: '1px solid var(--color-border)', borderRadius: 8 }} /><Line dataKey="loss" stroke="#38bdf8" dot={false} isAnimationActive={false} /><Line dataKey="val_loss" stroke="#34d399" dot={false} connectNulls isAnimationActive={false} /></LineChart></ResponsiveContainer></div>}
             {exportPath && <div className="space-y-2"><p className="text-xs break-all">Экспорт: {exportPath}</p><Button variant="outline" onClick={() => { setModelPath(exportPath); setState(JSON.stringify(Array(selectedRun?.config.state_dim ?? 0).fill(0))); setTrajectory(null); setTab('rollout') }}>Открыть Rollout</Button></div>}
             <pre className="max-h-64 overflow-auto text-xs bg-muted rounded p-3">{logs.data?.stderr || logs.data?.stdout || 'Ожидание логов…'}</pre>
           </CardContent></Card>}

@@ -74,6 +74,13 @@ async function main() {
       }
       throw new Error(`Renderer missing ${text}: ${await evaluate('document.body.innerText')}`)
     }
+    const screenshot = async name => {
+      if (!process.env.MAH_DESKTOP_SCREENSHOT_DIR) return
+      mkdirSync(process.env.MAH_DESKTOP_SCREENSHOT_DIR, { recursive: true })
+      await delay(350)
+      const shot = await command('Page.captureScreenshot', { format: 'png' })
+      writeFileSync(path.join(process.env.MAH_DESKTOP_SCREENSHOT_DIR, `${name}.png`), Buffer.from(shot.data, 'base64'))
+    }
     await waitFor('Readiness')
     assert.equal(await evaluate('window.electronAPI.backend.status().then(s => s.running)'), true)
     for (const [route, text] of [
@@ -83,6 +90,20 @@ async function main() {
     ]) {
       await evaluate(`location.hash = ${JSON.stringify(route)}`)
       await waitFor(text)
+      if (route === '/builder') await waitFor('token_embedding')
+      await screenshot(route === '/' ? 'training-studio' : route.slice(1))
+      // Both themes and the minimum supported desktop width must keep the shell usable.
+      await evaluate(`document.querySelector('button[aria-label="Switch to light theme"]').click()`)
+      assert.equal(await evaluate(`document.documentElement.classList.contains('dark')`), false)
+      if (route === '/') await screenshot('training-studio-light')
+      await command('Emulation.setDeviceMetricsOverride', { width: 1024, height: 768, deviceScaleFactor: 1, mobile: false })
+      assert.equal(await evaluate(`document.documentElement.scrollWidth <= innerWidth`), true, `Shell overflow: ${route}`)
+      const overflows = await evaluate(`Array.from(document.querySelectorAll('.studio-content, .studio-content>div, .studio-content>div>main, .studio-content>div>div.flex-1')).filter(el => el.scrollWidth > el.clientWidth + 1).map(el => ({className: el.className, width: el.clientWidth, scroll: el.scrollWidth}))`)
+      assert.deepEqual(overflows, [], `Content overflow: ${route}`)
+      await screenshot(`${route === '/' ? 'training-studio' : route.slice(1)}-1024`)
+      await command('Emulation.clearDeviceMetricsOverride')
+      await evaluate(`document.querySelector('button[aria-label="Switch to dark theme"]').click()`)
+      assert.equal(await evaluate(`document.documentElement.classList.contains('dark')`), true)
       if (route === '/vlm') {
         assert.equal(await evaluate(`[...document.querySelectorAll('button')].find(button => button.textContent.includes('Start Training'))?.disabled`), true)
         await waitFor('Проверить эксперимент')
@@ -264,10 +285,15 @@ async function main() {
     console.log('PASS packaged Builder save and handoff to Training Studio')
     await evaluate('location.hash = "/settings"')
     await waitFor('Configure your studio preferences')
+    await evaluate(`document.querySelector('button[aria-label="Switch to light theme"]').click()`)
     // Exercise packaged hash routing on a full reload, not just in-app navigation.
     await command('Page.reload')
     await waitFor('Configure your studio preferences')
-    console.log('PASS packaged reload and native backend health')
+    assert.equal(await evaluate(`document.documentElement.classList.contains('dark')`), false, 'Theme must survive reload')
+    await evaluate(`document.querySelector('button[aria-label="Switch to dark theme"]').click()`)
+    await evaluate(`document.querySelector('button[aria-label="Переключить на русский"]').click()`)
+    assert.equal(await evaluate(`document.querySelector('button[aria-label="Switch to English"]') !== null`), true)
+    console.log('PASS packaged reload, theme persistence, language switch and native backend health')
     await evaluate('window.close()').catch(() => {})
     for (let attempt = 0; attempt < 60 && child.exitCode === null && child.signalCode === null; attempt++) await delay(250)
     assert(child.exitCode !== null || child.signalCode !== null, 'Desktop did not shut down')
