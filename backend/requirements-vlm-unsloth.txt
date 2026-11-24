@@ -1,0 +1,8 @@
+-r requirements-vlm-modern.txt
+# Unsloth imports/depends on TRL internally; our native objective never uses
+# GRPOTrainer/TRL loss. These pins keep the optional accelerator compatible.
+trl==1.15.0
+unsloth==2026.11.9
+unsloth_zoo==2026.11.9
+torchao==0.14.1
+datasets==4.8.5

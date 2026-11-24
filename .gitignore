@@ -215,3 +215,75 @@ out/*
 blueprints/*
 models/*
 !models/.gitkeep
+
+# Generated Unsloth trainers and lock files
+*unsloth_compiled*
+
+
+# Desktop dependencies and generated bundles (not application source)
+node_modules/
+dist-electron/
+release/
+coverage/
+*.tsbuildinfo
+
+# Additional Python environments and compiler caches
+.venv*/
+*.egg-info/
+.mypy_cache/
+.tox/
+.nox/
+wandb/
+mlruns/
+lightning_logs/
+
+# Model weights and training exports
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+*.hdf5
+pytorch_model*.bin
+adapter_model*.bin
+optimizer*.bin
+training_state*.bin
+checkpoint-[0-9]*/
+checkpoint_step[0-9]*/
+final_model/
+
+# Data generated beside the bundled runtime
+/models-at-home/models/
+/models-at-home/datasets/
+/models-at-home/out/
+/models-at-home/outputs/
+/models-at-home/checkpoints/
+/models-at-home/.runs/
+/models-at-home/.cache/
+/models-at-home/logs/
+
+# Installers copied outside release/
+*.AppImage
+*.deb
+*.rpm
+*.dmg
+*.msi
+*.exe
+*.blockmap
+
+# Local secrets, with sanitized templates allowed
+.env.*
+!.env.example
+!.env.*.example
+!.env.template
+
+# Root build/ holds required icon inputs; ignore other generated build files
+!/build/
+/build/*
+!/build/icon.png
+!/build/icon.ico
+!/build/icon.icns
+!/build/icons/
+!/build/icons/*.png

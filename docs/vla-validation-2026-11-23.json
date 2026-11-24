@@ -1,0 +1,762 @@
+{
+  "date": "2026-11-23",
+  "method": "native behavior cloning with continuous/discrete/hybrid actions",
+  "scope": "Synthetic demonstrations validate training mechanics, not real-world closed-loop policy quality",
+  "pretrained_backbone": "Qwen/Qwen3.5-0.8B",
+  "pretrained_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "full_finetuning_scope": "Tiny random Qwen3-VL with real processor; Full on 0.8B not certified",
+  "resume_equivalence": "Native CPU resumed weights bitwise identical to uninterrupted training",
+  "experiments": [
+    {
+      "case": "mah-vla-backbone",
+      "domain": "robotics",
+      "architecture": "vlm_action",
+      "action_type": "continuous",
+      "backend": "transformers",
+      "tuning_method": "lora",
+      "backbone": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "state_dim": 1,
+      "action_dim": 2,
+      "vision_grid": null,
+      "horizon": 2,
+      "discrete_classes": [],
+      "loss_history": [
+        0.6318771243095398,
+        0.9519851803779602,
+        0.6717866659164429
+      ],
+      "gradient_norms": [
+        11.831143379211426,
+        25.314538955688477,
+        20.615036010742188
+      ],
+      "val_loss": 0.6412215658596584,
+      "resumed_step": 5,
+      "prediction": {
+        "actions": [
+          [
+            0.3130795955657959,
+            -0.5145372152328491
+          ],
+          [
+            0.28653091192245483,
+            -0.8424914479255676
+          ]
+        ],
+        "action_type": "continuous",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": []
+      },
+      "device": "cuda",
+      "precision": "bf16"
+    },
+    {
+      "case": "mah-vla-continuous",
+      "domain": "robotics",
+      "architecture": "native_vla",
+      "action_type": "continuous",
+      "backend": "transformers",
+      "tuning_method": "full",
+      "backbone": "",
+      "state_dim": 1,
+      "action_dim": 2,
+      "vision_grid": 1,
+      "horizon": 2,
+      "discrete_classes": [],
+      "loss_history": [
+        0.5052135586738586,
+        0.4435265064239502,
+        0.38877221941947937,
+        0.36621183156967163,
+        0.2573988139629364,
+        0.188900426030159,
+        0.12553484737873077,
+        0.09387001395225525,
+        0.030945785343647003,
+        0.03836876526474953,
+        0.011209562420845032,
+        0.009318463504314423
+      ],
+      "gradient_norms": [
+        0.32223156094551086,
+        0.46355292201042175,
+        0.3921462297439575,
+        0.8102930784225464,
+        0.5305801630020142,
+        0.56684410572052,
+        0.5587252378463745,
+        0.733393669128418,
+        0.5055510401725769,
+        0.5396742224693298,
+        0.3028353750705719,
+        0.2705727517604828
+      ],
+      "val_loss": 0.015839044536863054,
+      "resumed_step": 14,
+      "prediction": {
+        "actions": [
+          [
+            0.7598811388015747,
+            -0.8291784524917603
+          ],
+          [
+            0.6088553667068481,
+            -0.8148608207702637
+          ]
+        ],
+        "action_type": "continuous",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": []
+      },
+      "device": "cpu",
+      "precision": "no"
+    },
+    {
+      "case": "mah-vla-desktop",
+      "domain": "desktop",
+      "architecture": "native_vla",
+      "action_type": "hybrid",
+      "backend": "transformers",
+      "tuning_method": "full",
+      "backbone": "",
+      "state_dim": 0,
+      "action_dim": 2,
+      "vision_grid": 4,
+      "horizon": 2,
+      "discrete_classes": [
+        4,
+        16
+      ],
+      "loss_history": [
+        2.5594916343688965,
+        2.3808000087738037,
+        2.171658515930176,
+        1.868436336517334,
+        1.3447041511535645,
+        1.0226482152938843,
+        0.8591846823692322,
+        0.7420708537101746,
+        0.7150930166244507,
+        0.5771691799163818,
+        0.5737001299858093,
+        0.5452600717544556
+      ],
+      "gradient_norms": [
+        0.4298754036426544,
+        0.747173547744751,
+        1.298235535621643,
+        3.289698600769043,
+        2.315335512161255,
+        2.158271551132202,
+        3.292539358139038,
+        4.336485385894775,
+        7.93927001953125,
+        4.661021709442139,
+        7.648046016693115,
+        7.411710262298584
+      ],
+      "val_loss": 0.5201550636972699,
+      "resumed_step": 14,
+      "prediction": {
+        "actions": [
+          {
+            "continuous": [
+              1.8607113361358643,
+              -1.1111016273498535
+            ],
+            "discrete": [
+              1,
+              0
+            ]
+          },
+          {
+            "continuous": [
+              1.4796596765518188,
+              -1.4109455347061157
+            ],
+            "discrete": [
+              1,
+              0
+            ]
+          }
+        ],
+        "action_type": "hybrid",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": [],
+        "discrete_names": [],
+        "discrete_classes": [
+          4,
+          16
+        ],
+        "discrete_labels": []
+      },
+      "device": "cuda",
+      "precision": "bf16"
+    },
+    {
+      "case": "mah-vla-discrete",
+      "domain": "robotics",
+      "architecture": "native_vla",
+      "action_type": "discrete",
+      "backend": "transformers",
+      "tuning_method": "full",
+      "backbone": "",
+      "state_dim": 1,
+      "action_dim": 2,
+      "vision_grid": 1,
+      "horizon": 2,
+      "discrete_classes": [],
+      "loss_history": [
+        0.6889166831970215,
+        0.6198961734771729,
+        0.5616917610168457,
+        0.5174428820610046,
+        0.40667498111724854,
+        0.32642990350723267,
+        0.2536852955818176,
+        0.24084921181201935,
+        0.11892734467983246,
+        0.17416322231292725,
+        0.08598656952381134,
+        0.08036287873983383
+      ],
+      "gradient_norms": [
+        0.3236853778362274,
+        0.45551782846450806,
+        0.41239482164382935,
+        0.8650487065315247,
+        0.5647291541099548,
+        0.5956025719642639,
+        0.5847347378730774,
+        0.756474494934082,
+        0.6267049312591553,
+        0.6701984405517578,
+        0.5234816074371338,
+        0.5023819804191589
+      ],
+      "val_loss": 0.11763642834765571,
+      "resumed_step": 14,
+      "prediction": {
+        "actions": [
+          1,
+          1
+        ],
+        "action_type": "discrete",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": []
+      },
+      "device": "cuda",
+      "precision": "bf16"
+    },
+    {
+      "case": "mah-vla-hf-full",
+      "domain": "robotics",
+      "architecture": "vlm_action",
+      "action_type": "continuous",
+      "backend": "transformers",
+      "tuning_method": "full",
+      "backbone": "tiny random Qwen3-VL with official processor",
+      "state_dim": 1,
+      "action_dim": 2,
+      "vision_grid": null,
+      "horizon": 2,
+      "discrete_classes": [],
+      "loss_history": [
+        0.5664896965026855,
+        0.6090279221534729,
+        0.530969500541687
+      ],
+      "gradient_norms": [
+        1.9050796031951904,
+        3.029536247253418,
+        1.65440034866333
+      ],
+      "val_loss": 0.5552712849208287,
+      "resumed_step": 5,
+      "prediction": {
+        "actions": [
+          [
+            -0.3350204527378082,
+            0.11872681975364685
+          ],
+          [
+            0.22562512755393982,
+            -0.037832289934158325
+          ]
+        ],
+        "action_type": "continuous",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": []
+      },
+      "device": "cuda",
+      "precision": "bf16"
+    },
+    {
+      "case": "mah-vla-hf-hybrid-qlora",
+      "domain": "robotics",
+      "architecture": "vlm_action",
+      "action_type": "hybrid",
+      "backend": "transformers",
+      "tuning_method": "qlora",
+      "backbone": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "state_dim": 1,
+      "action_dim": 2,
+      "vision_grid": null,
+      "horizon": 2,
+      "discrete_classes": [
+        2,
+        3
+      ],
+      "loss_history": [
+        1.8616585731506348,
+        1.7703050374984741,
+        1.1628847122192383
+      ],
+      "gradient_norms": [
+        22.165742874145508,
+        33.105552673339844,
+        15.75973892211914
+      ],
+      "val_loss": 1.0971389668328422,
+      "resumed_step": 5,
+      "prediction": {
+        "actions": [
+          {
+            "continuous": [
+              0.5207839608192444,
+              -0.49892035126686096
+            ],
+            "discrete": [
+              1,
+              0
+            ]
+          },
+          {
+            "continuous": [
+              0.1139645203948021,
+              -0.49579694867134094
+            ],
+            "discrete": [
+              1,
+              0
+            ]
+          }
+        ],
+        "action_type": "hybrid",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": [],
+        "discrete_names": [],
+        "discrete_classes": [
+          2,
+          3
+        ],
+        "discrete_labels": []
+      },
+      "device": "cuda",
+      "precision": "bf16"
+    },
+    {
+      "case": "mah-vla-hybrid",
+      "domain": "robotics",
+      "architecture": "native_vla",
+      "action_type": "hybrid",
+      "backend": "transformers",
+      "tuning_method": "full",
+      "backbone": "",
+      "state_dim": 1,
+      "action_dim": 2,
+      "vision_grid": 1,
+      "horizon": 2,
+      "discrete_classes": [
+        2,
+        3
+      ],
+      "loss_history": [
+        1.3998433351516724,
+        1.2938412427902222,
+        1.2032053470611572,
+        1.1575199365615845,
+        0.9550422430038452,
+        0.816281259059906,
+        0.6781342029571533,
+        0.6183959245681763,
+        0.4294400215148926,
+        0.4834473729133606,
+        0.3569110631942749,
+        0.3461962342262268
+      ],
+      "gradient_norms": [
+        0.4441744089126587,
+        0.6083304286003113,
+        0.5527780652046204,
+        1.173072338104248,
+        0.8037128448486328,
+        0.9082015156745911,
+        0.9616230130195618,
+        1.3412622213363647,
+        1.2347660064697266,
+        1.2211294174194336,
+        1.0644735097885132,
+        1.031443476676941
+      ],
+      "val_loss": 0.390987753868103,
+      "resumed_step": 14,
+      "prediction": {
+        "actions": [
+          {
+            "continuous": [
+              0.7675305008888245,
+              -0.8237512111663818
+            ],
+            "discrete": [
+              1,
+              0
+            ]
+          },
+          {
+            "continuous": [
+              0.7987642288208008,
+              -0.904958963394165
+            ],
+            "discrete": [
+              1,
+              0
+            ]
+          }
+        ],
+        "action_type": "hybrid",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": [],
+        "discrete_names": [],
+        "discrete_classes": [
+          2,
+          3
+        ]
+      },
+      "device": "cuda",
+      "precision": "bf16"
+    },
+    {
+      "case": "mah-vla-resume-equivalence",
+      "domain": "robotics",
+      "architecture": "native_vla",
+      "action_type": "continuous",
+      "backend": "transformers",
+      "tuning_method": "full",
+      "backbone": "",
+      "state_dim": 1,
+      "action_dim": 2,
+      "vision_grid": 4,
+      "horizon": 2,
+      "discrete_classes": [],
+      "loss_history": [
+        0.4974316358566284,
+        0.3902980089187622,
+        0.22555658221244812,
+        0.019435372203588486,
+        0.14906401932239532,
+        0.2521308660507202,
+        0.2120392769575119,
+        0.11809276044368744,
+        0.07611024379730225,
+        0.0510820597410202,
+        0.01943482831120491,
+        0.013556422665715218
+      ],
+      "gradient_norms": [
+        0.2568439245223999,
+        0.5590340495109558,
+        0.9217994213104248,
+        0.6027805209159851,
+        3.369837760925293,
+        4.611867904663086,
+        3.7563915252685547,
+        2.567152261734009,
+        2.6393189430236816,
+        1.5041378736495972,
+        1.0364012718200684,
+        0.7837755084037781
+      ],
+      "val_loss": 0.021467096039227078,
+      "resumed_step": 14,
+      "prediction": {
+        "actions": [
+          [
+            0.7348215579986572,
+            -0.9766833782196045
+          ],
+          [
+            0.8714538812637329,
+            -0.8483628630638123
+          ]
+        ],
+        "action_type": "continuous",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": []
+      },
+      "device": "cpu",
+      "precision": "float32"
+    },
+    {
+      "case": "mah-vla-simulation",
+      "domain": "simulation",
+      "architecture": "native_vla",
+      "action_type": "hybrid",
+      "backend": "transformers",
+      "tuning_method": "full",
+      "backbone": "",
+      "state_dim": 0,
+      "action_dim": 2,
+      "vision_grid": 1,
+      "horizon": 2,
+      "discrete_classes": [
+        6
+      ],
+      "loss_history": [
+        2.3285481929779053,
+        2.185445785522461,
+        2.0854811668395996,
+        1.9804774522781372,
+        1.8022347688674927,
+        1.633698582649231,
+        1.4578220844268799,
+        1.538504719734192,
+        0.921284019947052,
+        1.3778700828552246,
+        0.7680906057357788,
+        0.7469615936279297
+      ],
+      "gradient_norms": [
+        0.6337708830833435,
+        0.7716870307922363,
+        0.6791763305664062,
+        1.4765172004699707,
+        0.982133150100708,
+        1.1746381521224976,
+        1.3500702381134033,
+        1.7212034463882446,
+        2.5959410667419434,
+        1.8786215782165527,
+        2.5676281452178955,
+        2.559203863143921
+      ],
+      "val_loss": 1.047811644417899,
+      "resumed_step": 14,
+      "prediction": {
+        "actions": [
+          {
+            "continuous": [
+              0.8299979567527771,
+              -0.7206798791885376
+            ],
+            "discrete": [
+              1
+            ]
+          },
+          {
+            "continuous": [
+              0.4302061200141907,
+              -0.26935234665870667
+            ],
+            "discrete": [
+              1
+            ]
+          }
+        ],
+        "action_type": "hybrid",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": [],
+        "discrete_names": [],
+        "discrete_classes": [
+          6
+        ],
+        "discrete_labels": []
+      },
+      "device": "cuda",
+      "precision": "bf16"
+    },
+    {
+      "case": "mah-vla-unsloth-full",
+      "domain": "robotics",
+      "architecture": "vlm_action",
+      "action_type": "continuous",
+      "backend": "unsloth",
+      "tuning_method": "full",
+      "backbone": "tiny random Qwen3-VL with official processor",
+      "state_dim": 1,
+      "action_dim": 2,
+      "vision_grid": null,
+      "horizon": 2,
+      "discrete_classes": [],
+      "loss_history": [
+        0.5669151544570923,
+        0.609538733959198,
+        0.5308405160903931
+      ],
+      "gradient_norms": [
+        1.9065911769866943,
+        3.0167317390441895,
+        1.6497832536697388
+      ],
+      "val_loss": 0.5552934833935329,
+      "resumed_step": 5,
+      "prediction": {
+        "actions": [
+          [
+            -0.3334587812423706,
+            0.11833639442920685
+          ],
+          [
+            0.224063441157341,
+            -0.03822271525859833
+          ]
+        ],
+        "action_type": "continuous",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": []
+      },
+      "device": "cuda",
+      "precision": "bf16"
+    },
+    {
+      "case": "mah-vla-unsloth-qlora",
+      "domain": "desktop",
+      "architecture": "vlm_action",
+      "action_type": "hybrid",
+      "backend": "unsloth",
+      "tuning_method": "qlora",
+      "backbone": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "state_dim": 0,
+      "action_dim": 2,
+      "vision_grid": null,
+      "horizon": 2,
+      "discrete_classes": [
+        4,
+        16
+      ],
+      "loss_history": [
+        3.644826889038086,
+        2.1699514389038086,
+        1.8253579139709473
+      ],
+      "gradient_norms": [
+        31.39274787902832,
+        27.375850677490234,
+        21.237831115722656
+      ],
+      "val_loss": 1.630968144961766,
+      "resumed_step": 5,
+      "prediction": {
+        "actions": [
+          {
+            "continuous": [
+              0.2755991220474243,
+              -0.10849862545728683
+            ],
+            "discrete": [
+              1,
+              0
+            ]
+          },
+          {
+            "continuous": [
+              -0.14683718979358673,
+              0.10623332113027573
+            ],
+            "discrete": [
+              0,
+              1
+            ]
+          }
+        ],
+        "action_type": "hybrid",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": [],
+        "discrete_names": [],
+        "discrete_classes": [
+          4,
+          16
+        ],
+        "discrete_labels": []
+      },
+      "device": "cuda",
+      "precision": "bf16"
+    },
+    {
+      "case": "mah-vla-unsloth",
+      "domain": "desktop",
+      "architecture": "vlm_action",
+      "action_type": "hybrid",
+      "backend": "unsloth",
+      "tuning_method": "lora",
+      "backbone": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "state_dim": 0,
+      "action_dim": 2,
+      "vision_grid": null,
+      "horizon": 2,
+      "discrete_classes": [
+        4,
+        16
+      ],
+      "loss_history": [
+        3.3135154247283936,
+        2.121115207672119,
+        2.0037102699279785
+      ],
+      "gradient_norms": [
+        29.838544845581055,
+        31.663774490356445,
+        22.446990966796875
+      ],
+      "val_loss": 1.677303399358477,
+      "resumed_step": 5,
+      "prediction": {
+        "actions": [
+          {
+            "continuous": [
+              0.24748873710632324,
+              0.10662374645471573
+            ],
+            "discrete": [
+              1,
+              0
+            ]
+          },
+          {
+            "continuous": [
+              -0.17494754493236542,
+              0.06914325803518295
+            ],
+            "discrete": [
+              0,
+              1
+            ]
+          }
+        ],
+        "action_type": "hybrid",
+        "action_dim": 2,
+        "action_horizon": 2,
+        "action_names": [],
+        "discrete_names": [],
+        "discrete_classes": [
+          4,
+          16
+        ],
+        "discrete_labels": []
+      },
+      "device": "cuda",
+      "precision": "bf16"
+    }
+  ]
+}

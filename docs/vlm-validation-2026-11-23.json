@@ -1,0 +1,650 @@
+{
+  "date": "2026-11-23",
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "records": [
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "",
+      "loss_history": [
+        0.5399450659751892,
+        0.5399455428123474
+      ],
+      "reward_history": [
+        0.25
+      ],
+      "reward_std_history": [],
+      "kl_history": [
+        0.0,
+        0.0
+      ],
+      "grad_norm_history": [
+        0.05629027634859085,
+        0.04893697425723076
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "gspo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "what",
+      "loss_history": [
+        0.7244288325309753,
+        0.7244310975074768
+      ],
+      "reward_history": [
+        0.375
+      ],
+      "reward_std_history": [],
+      "kl_history": [
+        0.0,
+        0.0
+      ],
+      "grad_norm_history": [
+        0.1907300502061844,
+        0.08082979172468185
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "",
+      "loss_history": [
+        -0.9351358413696289,
+        -0.9352555274963379
+      ],
+      "reward_history": [
+        0.5,
+        0.5
+      ],
+      "reward_std_history": [],
+      "kl_history": [
+        5.697289395811822e-08,
+        2.076328513567205e-07
+      ],
+      "grad_norm_history": [
+        0.10802572965621948,
+        0.08660048246383667
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "full",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "loss_history": [
+        0.5399450659751892,
+        0.5405700206756592
+      ],
+      "reward_history": [
+        0.25,
+        0.25
+      ],
+      "reward_std_history": [
+        0.4629100561141968
+      ],
+      "kl_history": [
+        0.0,
+        3.668955287139397e-06
+      ],
+      "grad_norm_history": [
+        2.2726781368255615,
+        1.9515544176101685
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "bnpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "",
+      "loss_history": [
+        -1.207381248474121,
+        0.7244345545768738
+      ],
+      "reward_history": [
+        0.375
+      ],
+      "reward_std_history": [],
+      "kl_history": [
+        0.0,
+        0.0
+      ],
+      "grad_norm_history": [
+        0.2897396385669708,
+        0.3776722848415375
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "dapo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "",
+      "loss_history": [
+        -1.3556561470031738,
+        0.20334778726100922
+      ],
+      "reward_history": [
+        0.375,
+        0.375
+      ],
+      "reward_std_history": [
+        0.5175492167472839
+      ],
+      "kl_history": [
+        0.0,
+        0.0
+      ],
+      "grad_norm_history": [
+        0.22813354432582855,
+        0.12410124391317368
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "dr_grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "loss_history": [
+        -0.75,
+        0.06249774247407913
+      ],
+      "reward_history": [
+        0.25,
+        0.25
+      ],
+      "reward_std_history": [
+        0.4629100561141968
+      ],
+      "kl_history": [
+        0.0,
+        0.0
+      ],
+      "grad_norm_history": [
+        0.2037057876586914,
+        0.04840405285358429
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "gspo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "",
+      "loss_history": [
+        -2.4741740226745605,
+        0.35344821214675903
+      ],
+      "reward_history": [
+        0.125
+      ],
+      "reward_std_history": [],
+      "kl_history": [
+        0.0,
+        0.0
+      ],
+      "grad_norm_history": [
+        0.7175838351249695,
+        0.5033401846885681
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "qlora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "",
+      "loss_history": [
+        -1.6198352575302124,
+        0.5403506755828857
+      ],
+      "reward_history": [
+        0.25,
+        0.25
+      ],
+      "reward_std_history": [
+        0.4629100561141968
+      ],
+      "kl_history": [
+        0.0,
+        4.775108095600444e-07
+      ],
+      "grad_norm_history": [
+        0.3671875,
+        0.6953125
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "full",
+      "backend": "transformers",
+      "stage": "vlm_sft",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "square",
+      "loss_history": [
+        2.7753946781158447,
+        2.7675564289093018
+      ],
+      "reward_history": [],
+      "reward_std_history": [],
+      "kl_history": [],
+      "grad_norm_history": [],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "qlora",
+      "backend": "transformers",
+      "stage": "vlm_sft",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "color color",
+      "loss_history": [
+        2.686105728149414,
+        2.6861343383789062
+      ],
+      "reward_history": [],
+      "reward_std_history": [],
+      "kl_history": [],
+      "grad_norm_history": [],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "full",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "loss_history": [
+        -0.9352219700813293,
+        -0.9335792064666748
+      ],
+      "reward_history": [
+        0.5,
+        0.5
+      ],
+      "reward_std_history": [
+        0.5345224738121033
+      ],
+      "kl_history": [
+        9.60373824909766e-08,
+        4.2064357330673374e-06
+      ],
+      "grad_norm_history": [
+        3.282970666885376,
+        3.583792209625244
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "bnpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "loss_history": [
+        -0.9355455636978149,
+        -0.9353219866752625
+      ],
+      "reward_history": [
+        0.5,
+        0.5
+      ],
+      "reward_std_history": [],
+      "kl_history": [
+        2.923592319348245e-07,
+        2.4378575602668207e-08
+      ],
+      "grad_norm_history": [
+        0.528136134147644,
+        0.5411474108695984
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "dapo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "",
+      "loss_history": [
+        0.0,
+        1.053930640220642
+      ],
+      "reward_history": [
+        0.375,
+        0.375
+      ],
+      "reward_std_history": [
+        0.5175492167472839
+      ],
+      "kl_history": [
+        0.0,
+        3.1530216659803045e-08
+      ],
+      "grad_norm_history": [
+        0.0,
+        0.8166790008544922
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "dr_grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "loss_history": [
+        -0.4999523460865021,
+        -0.4999040961265564
+      ],
+      "reward_history": [
+        0.5,
+        0.5
+      ],
+      "reward_std_history": [
+        0.5345224738121033
+      ],
+      "kl_history": [
+        1.6209533271194232e-07,
+        1.1857464699005504e-07
+      ],
+      "grad_norm_history": [
+        0.17208947241306305,
+        0.17771926522254944
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "gspo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "",
+      "loss_history": [
+        -0.9352957606315613,
+        -0.935431718826294
+      ],
+      "reward_history": [
+        0.5,
+        0.5
+      ],
+      "reward_std_history": [],
+      "kl_history": [
+        1.2705497454135184e-07,
+        1.976670205294795e-07
+      ],
+      "grad_norm_history": [
+        0.292036235332489,
+        0.40209946036338806
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "qlora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "",
+      "loss_history": [
+        -0.9350669384002686,
+        -0.9352565407752991
+      ],
+      "reward_history": [
+        0.5,
+        0.5
+      ],
+      "reward_std_history": [
+        0.5345224738121033
+      ],
+      "kl_history": [
+        1.4317490126813937e-07,
+        5.4438888952290654e-08
+      ],
+      "grad_norm_history": [
+        0.40102171897888184,
+        0.34079277515411377
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "full",
+      "backend": "unsloth",
+      "stage": "vlm_sft",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "",
+      "loss_history": [
+        2.7829267978668213,
+        2.7735188007354736
+      ],
+      "reward_history": [],
+      "reward_std_history": [],
+      "kl_history": [],
+      "grad_norm_history": [],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "qlora",
+      "backend": "unsloth",
+      "stage": "vlm_sft",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "square",
+      "loss_history": [
+        2.7211391925811768,
+        2.7211415767669678
+      ],
+      "reward_history": [],
+      "reward_std_history": [],
+      "kl_history": [],
+      "grad_norm_history": [],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_sft",
+      "algorithm": "grpo",
+      "pretrained": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "The image",
+      "loss_history": [
+        4.83106803894043,
+        4.826694965362549
+      ],
+      "reward_history": [],
+      "reward_std_history": [],
+      "kl_history": [],
+      "grad_norm_history": [],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_sft",
+      "algorithm": "grpo",
+      "pretrained": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "The image",
+      "loss_history": [
+        4.891521453857422,
+        4.867150783538818
+      ],
+      "reward_history": [],
+      "reward_std_history": [],
+      "kl_history": [],
+      "grad_norm_history": [],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "The image",
+      "loss_history": [
+        1.6198352575302124,
+        -0.540047287940979
+      ],
+      "reward_history": [
+        0.75,
+        0.75
+      ],
+      "reward_std_history": [],
+      "kl_history": [
+        0.0,
+        0.00028869626112282276
+      ],
+      "grad_norm_history": [
+        14.079985618591309,
+        1.3084694147109985
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "The image",
+      "loss_history": [
+        0.539976954460144,
+        -1.4845759868621826
+      ],
+      "reward_history": [
+        0.25,
+        0.25
+      ],
+      "reward_std_history": [
+        0.4629100561141968
+      ],
+      "kl_history": [
+        2.1480427676578984e-05,
+        0.021245380863547325
+      ],
+      "grad_norm_history": [
+        1.0766515731811523,
+        37.06564712524414
+      ],
+      "scope": "2 optimizer steps, resume to 4; synthetic red-image VQA; quality not evaluated"
+    }
+  ],
+  "additional_successful_smokes": [
+    "Qwen3-VL SFT LoRA, Transformers and Unsloth",
+    "Qwen3.5 SFT LoRA, Transformers and Unsloth",
+    "Qwen3-VL GRPO LoRA, Transformers and Unsloth",
+    "Qwen3.5 Dr.GRPO LoRA, Transformers",
+    "Legacy API -> modern VLM Python preflight/train/resume/persistent inference/unload, both backends"
+  ],
+  "negative_checks": [
+    "Missing or invalid JSON/image rejected",
+    "Legacy reward-SFT checkpoint cannot resume as true GRPO",
+    "SDPO rejects image-dropping trainer",
+    "Uniform group rewards trigger warning; no reward-driven signal claimed"
+  ],
+  "pretrained_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "engine": "historical_trl",
+  "superseded": true,
+  "notice": "This report validates the replaced TRL implementation, not the current native homellm RL engine."
+}

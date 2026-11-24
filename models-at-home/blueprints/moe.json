@@ -1,0 +1,78 @@
+{
+  "model_type": "homellm_blueprint",
+  "vocab_size": 50257,
+  "hidden_size": 512,
+  "max_position_embeddings": 2048,
+  "auto_project": true,
+  "blocks": [
+    {
+      "id": "token_embedding_6",
+      "type": "token_embedding",
+      "params": {
+        "vocab_size": 50257,
+        "hidden_size": 512
+      },
+      "inputs": []
+    },
+    {
+      "id": "positional_embedding_7",
+      "type": "positional_embedding",
+      "params": {
+        "max_position_embeddings": 2048,
+        "hidden_size": 512
+      },
+      "inputs": []
+    },
+    {
+      "id": "add_8",
+      "type": "add",
+      "params": {},
+      "inputs": [
+        "token_embedding_6",
+        "positional_embedding_7"
+      ]
+    },
+    {
+      "id": "moe_9",
+      "type": "moe",
+      "params": {
+        "num_experts": 8,
+        "num_select": 2,
+        "dropout": 0,
+        "expert_type": "mlp"
+      },
+      "inputs": [
+        "add_8"
+      ]
+    },
+    {
+      "id": "moe_10",
+      "type": "moe",
+      "params": {
+        "num_experts": 8,
+        "num_select": 2,
+        "dropout": 0,
+        "expert_type": "mlp"
+      },
+      "inputs": [
+        "moe_9"
+      ]
+    },
+    {
+      "id": "rmsnorm_11",
+      "type": "rmsnorm",
+      "params": {
+        "eps": 1e-05
+      },
+      "inputs": [
+        "moe_10"
+      ]
+    }
+  ],
+  "training": {
+    "optimizer": "adamw",
+    "lr": 0.001,
+    "weight_decay": 0.01,
+    "loss_fn": "cross_entropy"
+  }
+}

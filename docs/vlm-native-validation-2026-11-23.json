@@ -1,0 +1,914 @@
+{
+  "date": "2026-11-23",
+  "engine": "homellm_native",
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "scope": "2 optimizer steps, resume to 4, synthetic VQA; not a held-out quality evaluation",
+  "pretrained_model": "Qwen/Qwen3.5-0.8B",
+  "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "uninterrupted_vs_resumed_bitwise_equal": true,
+  "standard_grpo_completed_with_trl_import_disabled": true,
+  "experiments": [
+    {
+      "family": "qwen3_vl",
+      "method": "full",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        0.0,
+        5.662441253662109e-07
+      ],
+      "rewards": [
+        0.25,
+        0.5
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.5345224738121033
+      ],
+      "grad_norm": [
+        1.8727006912231445,
+        2.337754249572754
+      ],
+      "kl": [
+        0.0,
+        1.4356275414684205e-05
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "fp16",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        0.0,
+        7.450580596923828e-09
+      ],
+      "rewards": [
+        0.25,
+        0.5
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.5345224738121033
+      ],
+      "grad_norm": [
+        0.2024841159582138,
+        0.21911413967609406
+      ],
+      "kl": [
+        0.0,
+        0.0
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        0.0,
+        7.450580596923828e-09
+      ],
+      "rewards": [
+        0.25,
+        0.5
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.5345224738121033
+      ],
+      "grad_norm": [
+        0.2024841159582138,
+        0.21911413967609406
+      ],
+      "kl": [
+        0.0,
+        0.0
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": true
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        -1.4901161193847656e-08,
+        0.0
+      ],
+      "rewards": [
+        0.25,
+        0.25
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.4629100561141968
+      ],
+      "grad_norm": [
+        0.14361929893493652,
+        0.11052614450454712
+      ],
+      "kl": [
+        0.0,
+        2.7939677238464355e-09
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "sdpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.SDPOLoss",
+      "loss_history": [
+        -0.04296096507459879,
+        -0.0859295828267932
+      ],
+      "rewards": [
+        0.25,
+        0.25
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.4629100561141968
+      ],
+      "grad_norm": [
+        0.06741359829902649,
+        0.04231346398591995
+      ],
+      "kl": [
+        0.0,
+        1.862645149230957e-09
+      ],
+      "sdpo_distillation": [
+        7.784609167060808e-06,
+        7.913327536357428e-06
+      ],
+      "sdpo_teacher_forwards": 16,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        9.908527135848999e-05,
+        -5.765259265899658e-05
+      ],
+      "rewards": [
+        0.5,
+        0.25
+      ],
+      "reward_std": [
+        0.5345224738121033,
+        0.4629100561141968
+      ],
+      "grad_norm": [
+        0.064039446413517,
+        0.02258145622909069
+      ],
+      "kl": [
+        1.8862386430562594e-07,
+        1.2342241628715556e-07
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "sdpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.SDPOLoss",
+      "loss_history": [
+        -0.06245863810181618,
+        -0.023456325754523277
+      ],
+      "rewards": [
+        0.5,
+        0.25
+      ],
+      "reward_std": [
+        0.5345224738121033,
+        0.4629100561141968
+      ],
+      "grad_norm": [
+        0.015332644805312157,
+        0.010190771892666817
+      ],
+      "kl": [
+        1.8862386430562594e-07,
+        1.2342241628715556e-07
+      ],
+      "sdpo_distillation": [
+        8.773638050740828e-06,
+        2.2019118546268146e-06
+      ],
+      "sdpo_teacher_forwards": 16,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "full",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        0.0,
+        5.587935447692871e-07
+      ],
+      "rewards": [
+        0.25,
+        0.5
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.5345224738121033
+      ],
+      "grad_norm": [
+        1.8724358081817627,
+        2.337688684463501
+      ],
+      "kl": [
+        0.0,
+        1.3990576007927302e-05
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "dapo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        -0.125,
+        -0.21794871794871795
+      ],
+      "rewards": [
+        0.25,
+        0.5
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.5345224738121033
+      ],
+      "grad_norm": [
+        0.0985969603061676,
+        0.07878655195236206
+      ],
+      "kl": [
+        0.0,
+        0.0
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "dr_grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        -0.0625,
+        -0.1328125
+      ],
+      "rewards": [
+        0.25,
+        0.5
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.5345224738121033
+      ],
+      "grad_norm": [
+        0.0492984801530838,
+        0.048010557889938354
+      ],
+      "kl": [
+        0.0,
+        0.0
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "qlora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        0.0,
+        7.450580596923828e-09
+      ],
+      "rewards": [
+        0.25,
+        0.5
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.5345224738121033
+      ],
+      "grad_norm": [
+        0.19412022829055786,
+        0.20689156651496887
+      ],
+      "kl": [
+        0.0,
+        2.5331974073949937e-08
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "full",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        1.1764466762542725e-05,
+        -9.069591760635376e-05
+      ],
+      "rewards": [
+        0.25,
+        0.5
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.5345224738121033
+      ],
+      "grad_norm": [
+        1.8725569248199463,
+        2.3332226276397705
+      ],
+      "kl": [
+        2.3158888140528688e-07,
+        2.063934999796402e-06
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "dapo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        -0.15302399530702704,
+        -0.04604643478728178
+      ],
+      "rewards": [
+        0.5,
+        0.375
+      ],
+      "reward_std": [
+        0.5345224738121033,
+        0.5175491571426392
+      ],
+      "grad_norm": [
+        0.09029153734445572,
+        0.08881034702062607
+      ],
+      "kl": [
+        1.2407497483856822e-07,
+        1.6103711144304516e-07
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "dr_grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        -0.11715899780392647,
+        -0.04101010411977768
+      ],
+      "rewards": [
+        0.5,
+        0.375
+      ],
+      "reward_std": [
+        0.5345224738121033,
+        0.5175491571426392
+      ],
+      "grad_norm": [
+        0.06918291002511978,
+        0.07910655438899994
+      ],
+      "kl": [
+        1.0058283805847168e-07,
+        1.7278251362995434e-07
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "sdpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.SDPOLoss",
+      "loss_history": [
+        -0.1171502647921443,
+        -0.04100058972835541
+      ],
+      "rewards": [
+        0.5,
+        0.375
+      ],
+      "reward_std": [
+        0.5345224738121033,
+        0.5175491571426392
+      ],
+      "grad_norm": [
+        0.06924577057361603,
+        0.07915743440389633
+      ],
+      "kl": [
+        1.0058283805847168e-07,
+        1.7278251362995434e-07
+      ],
+      "sdpo_distillation": [
+        8.725415611365861e-06,
+        9.518385169826615e-06
+      ],
+      "sdpo_teacher_forwards": 16,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "qlora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        6.0088932514190674e-05,
+        -9.068101644515991e-05
+      ],
+      "rewards": [
+        0.5,
+        0.375
+      ],
+      "reward_std": [
+        0.5345224738121033,
+        0.5175491571426392
+      ],
+      "grad_norm": [
+        0.22121065855026245,
+        0.16149382293224335
+      ],
+      "kl": [
+        1.471489667892456e-07,
+        1.7952351250016818e-07
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "The image",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        0.010842382907867432,
+        0.022819574922323227
+      ],
+      "rewards": [
+        0.25,
+        0.125
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.3535533845424652
+      ],
+      "grad_norm": [
+        3.4535372257232666,
+        2.02168345451355
+      ],
+      "kl": [
+        0.0015613343566656113,
+        0.0024692688166396692
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "The image",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        -1.1175870895385742e-08,
+        2.2624283303684933e-05
+      ],
+      "rewards": [
+        0.125,
+        0.0
+      ],
+      "reward_std": [
+        0.3535533845424652,
+        0.0
+      ],
+      "grad_norm": [
+        1.796327829360962,
+        0.0019475447479635477
+      ],
+      "kl": [
+        0.0,
+        0.000565607100725174
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "sdpo",
+      "pretrained": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "The image",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.SDPOLoss",
+      "loss_history": [
+        0.13559100031852722,
+        0.0773672005161643
+      ],
+      "rewards": [
+        0.25,
+        0.125
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.3535533845424652
+      ],
+      "grad_norm": [
+        0.8720869421958923,
+        0.5193518400192261
+      ],
+      "kl": [
+        0.0015613343566656113,
+        0.001508854329586029
+      ],
+      "sdpo_distillation": [
+        0.04020952800055966,
+        0.026531323208473623
+      ],
+      "sdpo_teacher_forwards": 16,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_5",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "sdpo",
+      "pretrained": "/tmp/mah-modern-models/Qwen3.5-0.8B",
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "The image",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.SDPOLoss",
+      "loss_history": [
+        0.07464816514402628,
+        0.1221670713275671
+      ],
+      "rewards": [
+        0.125,
+        0.125
+      ],
+      "reward_std": [
+        0.3535533845424652,
+        0.17251639068126678
+      ],
+      "grad_norm": [
+        0.46617910265922546,
+        0.9337592720985413
+      ],
+      "kl": [
+        0.0,
+        0.0011963844299316406
+      ],
+      "sdpo_distillation": [
+        0.03363254072610289,
+        0.028384615150571335
+      ],
+      "sdpo_teacher_forwards": 16,
+      "filtered_groups": 2,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "transformers",
+      "stage": "vlm_grpo",
+      "algorithm": "sdpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.SDPOLoss",
+      "loss_history": [
+        -0.06249594176188111,
+        -0.1328068794682622
+      ],
+      "rewards": [
+        0.25,
+        0.5
+      ],
+      "reward_std": [
+        0.4629100561141968,
+        0.5345224738121033
+      ],
+      "grad_norm": [
+        0.04928433522582054,
+        0.04798753187060356
+      ],
+      "kl": [
+        0.0,
+        0.0
+      ],
+      "sdpo_distillation": [
+        4.058931892814144e-06,
+        5.618751629299368e-06
+      ],
+      "sdpo_teacher_forwards": 16,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    },
+    {
+      "family": "qwen3_vl",
+      "method": "lora",
+      "backend": "unsloth",
+      "stage": "vlm_grpo",
+      "algorithm": "grpo",
+      "pretrained": null,
+      "weights_changed": true,
+      "resume_step": 4,
+      "image_inference": "? square",
+      "engine": "homellm_native",
+      "loss_class": "homellm.training.rl.loss.GRPOLoss",
+      "loss_history": [
+        7.846951484680176e-05,
+        -7.954239845275879e-05
+      ],
+      "rewards": [
+        0.5,
+        0.375
+      ],
+      "reward_std": [
+        0.5345224738121033,
+        0.5175491571426392
+      ],
+      "grad_norm": [
+        0.22347725927829742,
+        0.1619868129491806
+      ],
+      "kl": [
+        1.0058283805847168e-07,
+        1.6932331536878564e-07
+      ],
+      "sdpo_distillation": [
+        0.0,
+        0.0
+      ],
+      "sdpo_teacher_forwards": 0,
+      "filtered_groups": 0,
+      "precision": "smoke default",
+      "trl_import_blocked": false
+    }
+  ]
+}

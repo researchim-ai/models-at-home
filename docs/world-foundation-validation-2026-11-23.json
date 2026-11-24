@@ -1,0 +1,101 @@
+{
+  "date": "2026-11-23",
+  "scope": "Foundation integrations; generation/download, not pretrained fine-tuning",
+  "backend_tests": {
+    "api_python": 206,
+    "modern_ml_python": 206
+  },
+  "frontend_tests": 35,
+  "typescript": "passed",
+  "vite_build": "passed",
+  "cosmos3": {
+    "pretrained_numerical_gpu": {
+      "model": "Cosmos3-Edge",
+      "pretrained": true,
+      "device": "NVIDIA GeForce RTX 3090 Ti",
+      "parameters": 3369657024,
+      "prediction_shape": [
+        1,
+        48,
+        2,
+        4,
+        4
+      ],
+      "action_influence_max_abs": 0.82763671875,
+      "finite": true,
+      "peak_memory_gb": 6.29535436630249,
+      "scope": "Numerical denoising/action-conditioning test only; no decoded media or full guarded video generation"
+    },
+    "tiny_official_class_gpu": {
+      "model": "tiny random official Cosmos3 class",
+      "pretrained": false,
+      "device": "NVIDIA GeForce RTX 3090 Ti",
+      "parameters": 65328,
+      "prediction_shape": [
+        1,
+        4,
+        2,
+        4,
+        4
+      ],
+      "action_influence_max_abs": 0.271484375,
+      "finite": true,
+      "peak_memory_gb": 0.009065628051757812,
+      "scope": "Numerical denoising/action-conditioning test only; no decoded media or full guarded video generation"
+    },
+    "model_repo": "nvidia/Cosmos3-Edge",
+    "revision": "6afc1256321c3a8e623d89be3bc5117a1e90f96b",
+    "local_snapshot": "/tmp/mah-world-pretrained/Cosmos3-Edge",
+    "full_guarded_video_generation": "blocked: nvidia/Cosmos-1.0-Guardrail auth-check returned HTTP 401; HF access/token required",
+    "nano_super_gpu_execution": "not tested"
+  },
+  "matrix_game4": {
+    "source_commit": "51913b2bfa78a6d54de912b8348b1d318f4d36e2",
+    "weights_manifest_revision": "2c53100457da7abcf0e966f75637c644d3423a63",
+    "official_render_help": "passed",
+    "official_download_help": "passed",
+    "gpu_inference": "not run: requires separate official Torch 2.12/CUDA 13.2 runtime and compatible hardware/resources"
+  },
+  "genie4": {
+    "sdk": "google-genai 3.6.1",
+    "api_version": "v1beta",
+    "sdk_connect_cancel_methods": "verified installed SDK",
+    "live_paid_generation": "not run: no GEMINI_API_KEY configured",
+    "paid_requests_performed": 0,
+    "protocol_mock_checks": [
+      "completion acknowledgement",
+      "lost complete transport with REST cancel fallback",
+      "send failure with cancel fallback",
+      "connect failure with cancel fallback"
+    ]
+  },
+  "codec": {
+    "actual_ffmpeg_mp4_encode_decode": "passed",
+    "frames": 4,
+    "shape": [
+      32,
+      64,
+      3
+    ],
+    "previews": 4
+  },
+  "electron_native_backend": {
+    "all_nine_pages": "passed",
+    "foundation_catalog": "passed",
+    "foundation_real_preflight": "passed: displays gated HF access failure without launching generation",
+    "native_world_model_train_export_rollout": "passed",
+    "builder_handoff_reload_health": "passed"
+  },
+  "fixes": [
+    "Preserve venv Python symlinks for MAH_WORLD_PYTHON and Matrix runtime_python",
+    "ML atomic_json helper can import without FastAPI",
+    "Foundation generation/download cannot resume as training",
+    "Remote Genie complete requires terminal acknowledgement or confirmed REST cancel; failure remains visible"
+  ],
+  "docker": {
+    "configuration": "ships optional requirements, isolated world-venv discovery, selected provider environment forwarding",
+    "image_rebuild_gpu_execution": "not run"
+  },
+  "status": "superseded",
+  "superseded_by": "world-local-validation-2026-11-23.json"
+}

@@ -1,0 +1,13 @@
+# Install into the isolated World Models Python, not the legacy text/API runtime.
+# Torch is supplied by your CUDA environment. DIAMOND uses embedded Torch modules.
+diffusers==0.43.0
+transformers==5.17.0
+accelerate>=1.12,<2
+psutil>=5.9
+safetensors>=0.5
+Pillow>=10
+numpy>=1.26
+huggingface-hub>=1.0,<2
+imageio==2.37.2
+imageio-ffmpeg==0.6.0
+cosmos-guardrail==0.3.2

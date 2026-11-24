@@ -1,0 +1,154 @@
+{
+  "date": "2026-11-23",
+  "scope": "Synthetic implementation checks, not real-world quality evaluation",
+  "gpu_experiments": [
+    {
+      "architecture": "latent_gru",
+      "action_type": "continuous",
+      "device": "cuda",
+      "precision": "no",
+      "gpu": "NVIDIA GeForce RTX 3090 Ti",
+      "steps": 60,
+      "first_loss": 1.7747039794921875,
+      "last_loss": 0.3569205403327942,
+      "val_rollout_mse": 0.01642655978600184,
+      "resume_step": 62,
+      "export_reload_frames": 4,
+      "states": [
+        [
+          7.113387409423311,
+          14.872469103180995
+        ],
+        [
+          4.787409672439102,
+          16.22959494706086
+        ],
+        [
+          5.103496185107405,
+          15.683273906529363
+        ],
+        [
+          3.513498266096242,
+          13.992783257373203
+        ]
+      ],
+      "rewards": [
+        -0.0919126570224762,
+        -0.22764378786087036,
+        -0.20739583671092987,
+        -0.2560271918773651
+      ],
+      "done_probabilities": [
+        0.0278189517557621,
+        0.05706636607646942,
+        0.08244171738624573,
+        0.12801532447338104
+      ],
+      "artifact_dir": "/tmp/mah-world-smoke-ktvbcu4q",
+      "amp_overflows": 0
+    },
+    {
+      "architecture": "rssm",
+      "action_type": "discrete",
+      "device": "cuda",
+      "precision": "bf16",
+      "gpu": "NVIDIA GeForce RTX 3090 Ti",
+      "steps": 60,
+      "first_loss": 1.8657983541488647,
+      "last_loss": 0.45994770526885986,
+      "val_rollout_mse": 0.01619247297445933,
+      "resume_step": 62,
+      "export_reload_frames": 4,
+      "states": [
+        [
+          6.9863470009478705,
+          16.734327077601893
+        ],
+        [
+          5.454978704892412,
+          17.56692632243363
+        ],
+        [
+          5.25479887669695,
+          17.27976781219995
+        ],
+        [
+          4.533065622547201,
+          16.14693160448519
+        ]
+      ],
+      "rewards": [
+        -0.11318615823984146,
+        -0.20716968178749084,
+        -0.2256370186805725,
+        -0.24968594312667847
+      ],
+      "done_probabilities": [
+        0.04170028120279312,
+        0.06221819296479225,
+        0.09206133335828781,
+        0.13206380605697632
+      ],
+      "artifact_dir": "/tmp/mah-world-smoke-pnkoes5j",
+      "amp_overflows": 0
+    },
+    {
+      "architecture": "rssm",
+      "action_type": "hybrid",
+      "device": "cuda",
+      "precision": "fp16",
+      "gpu": "NVIDIA GeForce RTX 3090 Ti",
+      "steps": 60,
+      "first_loss": 1.911916971206665,
+      "last_loss": 0.40292224287986755,
+      "val_rollout_mse": 0.01611863523721695,
+      "resume_step": 62,
+      "export_reload_frames": 4,
+      "states": [
+        [
+          7.1063073256549165,
+          15.724100701341644
+        ],
+        [
+          4.449673720946962,
+          16.634348292780736
+        ],
+        [
+          5.40281887704296,
+          15.639338727960382
+        ],
+        [
+          3.9768705944971225,
+          13.566154358867331
+        ]
+      ],
+      "rewards": [
+        -0.10071364045143127,
+        -0.15563836693763733,
+        -0.16082575917243958,
+        -0.1893555223941803
+      ],
+      "done_probabilities": [
+        0.03939580172300339,
+        0.06332466751337051,
+        0.08371713012456894,
+        0.10940200835466385
+      ],
+      "artifact_dir": "/tmp/mah-world-smoke-nqkg2zl8",
+      "amp_overflows": 1
+    }
+  ],
+  "cpu_checks": [
+    "both architectures: nonzero gradients, finite losses, action/time conditioning",
+    "prior image objective excludes future observations",
+    "exact same-plan checkpoint resume: bitwise equal weights",
+    "terminal boundaries, independent train/validation, optional target masks"
+  ],
+  "verification": {
+    "backend_tests": 191,
+    "frontend_tests": 34,
+    "typescript": "passed",
+    "vite_build": "passed",
+    "packaged_electron": "all nine pages, world-model preflight/train/export/upload/rollout, Builder handoff, reload health passed"
+  }
+}

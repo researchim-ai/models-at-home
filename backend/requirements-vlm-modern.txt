@@ -1,0 +1,9 @@
+# Plain Transformers + homellm native VLM RL. No TRL or Unsloth required.
+# Install into an isolated venv with a matching CUDA torch/torchvision pair.
+torch==2.9.1
+torchvision==0.24.1
+transformers==5.17.0
+peft==0.22.0
+bitsandbytes==0.50.2
+accelerate==1.12.0
+Pillow==12.0.0

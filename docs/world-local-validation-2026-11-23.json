@@ -1,0 +1,83 @@
+{
+  "date": "2026-11-23",
+  "scope": "Embedded local pretrained DIAMOND architectures and playable Studio UI; cloud inference removed",
+  "models": [
+    {
+      "model_id": "diamond_csgo",
+      "pretrained": true,
+      "embedded_architecture": true,
+      "device": "cuda",
+      "gpu": "NVIDIA GeForce RTX 3090 Ti",
+      "parameters": 381638406,
+      "steps": 6,
+      "load_seconds": 2.479372769001202,
+      "seconds_per_step": [
+        0.30338766999921063,
+        0.06344662500123377,
+        0.07070278100218275,
+        0.07790452299741446,
+        0.0823814659997879,
+        0.08169749399894499
+      ],
+      "reset_replay_equal": true,
+      "action_influence": true,
+      "network_attempts": 0,
+      "upsampler": true,
+      "resolution": [
+        150,
+        280
+      ],
+      "unique_frames": 7,
+      "peak_vram_gib": 1.6398448944091797
+    },
+    {
+      "model_id": "diamond_atari",
+      "pretrained": true,
+      "embedded_architecture": true,
+      "device": "cpu",
+      "gpu": null,
+      "parameters": 4405955,
+      "steps": 6,
+      "load_seconds": 0.08210165000127745,
+      "seconds_per_step": [
+        0.05160211800102843,
+        0.039186837999295676,
+        0.038958010998612735,
+        0.03752095299932989,
+        0.039259695000509964,
+        0.04328184800033341
+      ],
+      "reset_replay_equal": true,
+      "action_influence": true,
+      "network_attempts": 0,
+      "upsampler": false,
+      "resolution": [
+        64,
+        64
+      ],
+      "unique_frames": 7,
+      "peak_vram_gib": 0
+    }
+  ],
+  "weights_repo": "eloialonso/diamond",
+  "weights_revision": "5d4abca9af6ab1b3ab1c6fc228cacb7281130f7f",
+  "code_revisions": {
+    "atari": "5bcd1599755b4f2fae8e5e079e02f0728e174965",
+    "csgo": "851cefb497733d27f1b85c804104638765860fca"
+  },
+  "local_snapshot_for_validation": "/tmp/mah-local-world-weights/diamond",
+  "verification": {
+    "backend_tests": 209,
+    "frontend_tests": 35,
+    "typescript": "passed",
+    "vite_build": "passed",
+    "electron": "passed: real pretrained CS:GO GPU load, WASD/autoplay, decoded frames, pause/reset/release; CPU Breakout with packaged example; all nine pages, native training/rollout, Builder handoff, reload health"
+  },
+  "limits": [
+    "DIAMOND/Cosmos fine-tuning is not exposed in Studio",
+    "Atari verification uses Breakout; Pong requires a supplied initial screenshot",
+    "Model FPS excludes frontend HTTP scheduling",
+    "Long-rollout physics/game accuracy is not benchmarked",
+    "Docker configuration prepared; full container GPU run not performed"
+  ]
+}
