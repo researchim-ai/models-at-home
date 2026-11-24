@@ -26,3 +26,14 @@ it('synchronizes default dimensions while preserving custom widths', () => {
 it('recognizes graphs that cannot safely be reordered as a sequence', () => {
   expect(isSequence([{ id: 'a', inputs: [] }, { id: 'b', inputs: [] }, { id: 'c', inputs: ['a', 'b'] }])).toBe(false)
 })
+
+it('resizes nested loop and independent-stack bodies without changing custom widths', () => {
+  const blocks = [{ id: 'core', inputs: [], type: 'loop', params: { iterations: 7, body: [
+    { type: 'repeater', params: { num_repeats: 2, block_type: 'llama_block', block_params: { intermediate_size: 2048 } } },
+    { type: 'linear', params: { in_features: 512, out_features: 96 } },
+  ] } }]
+  const changed = syncBlueprintDimensions(blocks, { hidden: 512, vocab: 100, positions: 64 }, { hidden: 256, vocab: 100, positions: 64 })
+  expect((changed[0].params.body[0].params.block_params as Record<string, unknown>).intermediate_size).toBe(1024)
+  expect(changed[0].params.body[1].params.out_features).toBe(96)
+  expect(blocks[0].params.body[0].params.block_params?.intermediate_size).toBe(2048)
+})

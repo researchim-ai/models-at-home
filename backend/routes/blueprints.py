@@ -74,7 +74,9 @@ def get_blueprint(name: str):
 
     try:
         data = json.loads(path.read_text())
-        return {"blueprint": data}
+        return {"blueprint": validate(data)}
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, f"Invalid saved blueprint: {exc}") from exc
     except Exception as e:
         raise HTTPException(500, f"Failed to read blueprint: {e}")
 
@@ -105,35 +107,65 @@ def delete_blueprint(name: str):
     return {"success": True}
 
 
-@router.get("/blocks")
+@router.get('/blocks')
 def list_blocks():
-    """List all available block types from the BLOCK_REGISTRY."""
-    try:
-        import sys
-        sys.path.insert(0, str(PROJECT_ROOT))
-        from homellm.models.blocks import BLOCK_REGISTRY
+    from backend.services.blueprint_catalog import catalog
+    return {'blocks': catalog()}
 
-        blocks = []
-        for name, builder in BLOCK_REGISTRY.items():
-            blocks.append({
-                "type": name,
-                "description": getattr(builder, "description", "") or "",
-            })
-        return {"blocks": blocks}
-    except Exception as e:
-        fallback = [
-            {"type": "token_embedding", "description": "Token embedding layer"},
-            {"type": "positional_embedding", "description": "Learnable positional embeddings"},
-            {"type": "attention", "description": "Self-attention"},
-            {"type": "causal_self_attention", "description": "Flash causal self-attention"},
-            {"type": "mlp", "description": "Two-layer MLP"},
-            {"type": "swiglu", "description": "SwiGLU feed-forward"},
-            {"type": "rmsnorm", "description": "RMS normalization"},
-            {"type": "layernorm", "description": "Layer normalization"},
-            {"type": "moe", "description": "Mixture of Experts"},
-            {"type": "llama_block", "description": "Full Llama transformer block"},
-            {"type": "add", "description": "Elementwise sum"},
-            {"type": "dropout", "description": "Dropout"},
-            {"type": "linear", "description": "Linear projection"},
-        ]
-        return {"blocks": fallback, "error": str(e)}
+
+@router.post('/analyze')
+def analyze_blueprint(blueprint: dict):
+    try:
+        from backend.services.blueprint_analysis import analyze
+        return analyze(blueprint)
+    except ImportError as exc:
+        raise HTTPException(503, f'Architecture analysis needs the ML runtime and Torch: {exc}') from exc
+    except (ValueError, TypeError, KeyError, RuntimeError, AssertionError) as exc:
+        raise HTTPException(400, f'Invalid architecture: {exc}') from exc
+
+
+class ResearchRequest(BaseModel):
+    blueprint: dict
+    profile: dict = {}
+
+
+@router.post('/research/analyze')
+def research_analyze(req: ResearchRequest):
+    try:
+        from backend.services.blueprint_analysis import analyze
+        return analyze(req.blueprint, req.profile)
+    except ImportError as exc:
+        raise HTTPException(503, f'Research analysis needs the ML runtime: {exc}') from exc
+    except (ValueError, TypeError, KeyError, RuntimeError, AssertionError) as exc:
+        raise HTTPException(400, f'Research analysis: {exc}') from exc
+
+
+@router.post('/research/probe')
+def research_probe(req: ResearchRequest):
+    import subprocess
+    import sys
+    import os
+    try:
+        from backend.services.blueprint_analysis import analyze
+        result=analyze(req.blueprint, req.profile)
+        if result['parameters']>8_000_000 or result['output_tensor_volume_mib']>32:
+            raise ValueError('Synthetic CPU probe budget exceeded: max 8M parameters and 32 MiB output-tensor volume; use a smaller research recipe')
+        env=os.environ.copy(); env.update(CUDA_VISIBLE_DEVICES='',OMP_NUM_THREADS='2',MKL_NUM_THREADS='2')
+        completed=subprocess.run([sys.executable,str(Path(__file__).resolve().parents[1]/'services'/'blueprint_probe_worker.py')],
+            input=json.dumps({'blueprint':result['blueprint'],'profile':result['profile']}),text=True,capture_output=True,
+            cwd=PROJECT_ROOT,env=env,timeout=90)
+        if completed.returncode:
+            raise ValueError(completed.stderr[-3000:] or 'Synthetic probe failed')
+        return json.loads(completed.stdout)
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(408,'Synthetic CPU probe exceeded 90 seconds; reduce depth or sequence size') from exc
+    except ImportError as exc:
+        raise HTTPException(503,f'Synthetic probe requires ML dependencies: {exc}') from exc
+    except (ValueError,TypeError,KeyError,RuntimeError,AssertionError) as exc:
+        raise HTTPException(400,f'Synthetic probe: {exc}') from exc
+
+
+@router.get('/research/examples')
+def research_examples():
+    directory=Path(__file__).resolve().parents[2]/'examples'/'research-lab'
+    return {'train':str(directory/'train.jsonl'),'validation':str(directory/'validation.jsonl')}

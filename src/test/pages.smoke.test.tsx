@@ -172,6 +172,7 @@ describe('page smoke tests', () => {
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>
 
   beforeEach(() => {
+    localStorage.removeItem("mah-builder-draft")
     capturedErrors.length = 0
     installFetchMock()
     consoleErrorSpy = installErrorCapture(capturedErrors)
@@ -372,6 +373,35 @@ describe('page smoke tests', () => {
       expect(starts[0].sequence_length).toBe(6)
       expect(capturedErrors).toHaveLength(0)
     } finally { queryClient.clear() }
+  })
+
+  it('selects standalone VLA policies with their actual action contracts and clears the preflight gate', async () => {
+    let checked:Record<string,unknown>|null=null
+    vi.mocked(fetch).mockImplementation(async (input,options)=>{
+      if(String(input).endsWith('/vla/preflight')){checked=JSON.parse(String(options?.body));return makeResponse({ready:true,checks:[],sample:null})}
+      return makeResponse(payloadFor(String(input)))
+    })
+    const {queryClient}=renderAt('/vla')
+    try {
+      const selector=await screen.findByLabelText('VLA architecture')
+      fireEvent.change(selector,{target:{value:'openvla'}})
+      expect(screen.getByLabelText('Pretrained policy ID / local path')).toHaveValue('openvla/openvla-7b')
+      expect(screen.getByLabelText('VLA action type')).toHaveValue('continuous')
+      expect(screen.getByLabelText('VLA domain')).toBeDisabled()
+      fireEvent.change(screen.getByLabelText('Демонстрации JSONL'),{target:{value:'/robot.jsonl'}})
+      fireEvent.click(screen.getByRole('button',{name:'Проверить VLA'}))
+      await screen.findByText('VLA проверка пройдена')
+      expect(checked).toEqual(expect.objectContaining({architecture:'openvla',action_dim:7,action_horizon:1,state_dim:0,tuning_method:'lora',training_backend:'transformers'}))
+      fireEvent.change(selector,{target:{value:'smolvla'}})
+      expect(screen.getByRole('button',{name:'Начать VLA обучение'})).toBeDisabled()
+      expect(screen.getByLabelText('Pretrained policy ID / local path')).toHaveValue('lerobot/smolvla_base')
+      expect(screen.getByLabelText('Train action expert only')).toBeChecked()
+      fireEvent.change(selector,{target:{value:'pi0'}})
+      expect(screen.getByLabelText('Pretrained policy ID / local path')).toHaveValue('lerobot/pi0_base')
+      fireEvent.change(selector,{target:{value:'act'}})
+      expect(screen.getByLabelText('ACT checkpoint (пусто — с нуля)')).toHaveValue('')
+      expect(screen.getByText(/ACT не использует текст/)).toBeInTheDocument()
+    } finally {queryClient.clear()}
   })
 
   it('supports VLA domain presets and rejects stale action preflight results', async () => {

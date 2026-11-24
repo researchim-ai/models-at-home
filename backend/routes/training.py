@@ -30,6 +30,7 @@ OUTPUT_DIR = PROJECT_ROOT / "out"
 class TrainingRequest(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
 
+    research_diagnostics: bool = False
     stage: Literal["pretrain", "continual_pretrain", "sft", "grpo"] = "pretrain"
     model_type: Literal['home', 'hf', 'home_moe', 'gpt2', 'blueprint'] = "home"
     model_blueprint: str = ''
@@ -398,6 +399,9 @@ def continue_training(run_id: str, options: ResumeRequest | None = None):
         raise HTTPException(400, 'Foundation generation/download jobs are not training checkpoints')
     artifact_dir = _artifact_dir(config, run_id)
     checkpoints = [p for p in artifact_dir.glob("checkpoint*") if p.is_dir()]
+    if config.get('architecture') == 'blueprint_vlm':
+        from backend.services.blueprint_vlm import complete_checkpoint
+        checkpoints = [p for p in checkpoints if complete_checkpoint(p)]
     if config.get('stage') == 'vla_sft':
         from backend.routes.vla import complete_checkpoint
         checkpoints = [p for p in checkpoints if complete_checkpoint(p)]

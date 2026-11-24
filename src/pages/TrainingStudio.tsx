@@ -1,3 +1,4 @@
+import { RunResearchSignals } from '@/components/builder/RunResearchSignals'
 import { WorkspaceIntro } from '@/components/layout/WorkspaceIntro'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -175,6 +176,7 @@ function ConfigSidebar() {
           </div>
         </div>
 
+        {config.model_type==='blueprint'&&<Label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={!!config.research_diagnostics} onChange={e=>updateConfig({research_diagnostics:e.target.checked})}/>Capture research batch signals</Label>}
         {/* Model / Architecture */}
         <div className="space-y-2">
           <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -1332,6 +1334,7 @@ function MonitoringTab() {
         </CardContent>
       </Card>
 
+      <RunResearchSignals signals={currentMetrics?.research_signals} />
       {/* Stats cards */}
       {currentMetrics && (
         <div className="grid grid-cols-4 gap-4">
@@ -1393,24 +1396,24 @@ function MonitoringTab() {
           {chartData.length > 0 ? (
             <ResponsiveContainer width="100%" height={300}>
               <LineChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis dataKey="step" tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" />
-                <YAxis tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" />
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
+                <XAxis dataKey="step" tick={{ fontSize: 11 }} stroke="var(--color-muted-foreground)" />
+                <YAxis tick={{ fontSize: 11 }} stroke="var(--color-muted-foreground)" />
                 <RTooltip
                   contentStyle={{
-                    backgroundColor: 'hsl(var(--card))',
-                    border: '1px solid hsl(var(--border))',
+                    backgroundColor: 'var(--color-popover)',
+                    border: '1px solid var(--color-border)',
                     borderRadius: '8px',
                     fontSize: '12px',
                   }}
                 />
                 <Legend />
                 {isGrpo ? (
-                  <Line type="monotone" dataKey="reward" name="reward" stroke="hsl(var(--primary))" strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="reward" name="reward" stroke="var(--color-chart-training)" strokeWidth={2} dot={false} />
                 ) : (
                   <>
-                    <Line type="monotone" dataKey="loss" name="train" stroke="hsl(var(--primary))" strokeWidth={2} dot={false} />
-                    {hasVal && <Line type="monotone" dataKey="val_loss" name="val" stroke="hsl(var(--warning))" strokeWidth={1.5} dot={false} />}
+                    <Line type="monotone" dataKey="loss" name="train" stroke="var(--color-chart-training)" strokeWidth={2} dot={false} />
+                    {hasVal && <Line type="monotone" dataKey="val_loss" name="val" strokeDasharray="6 4" stroke="var(--color-chart-validation)" strokeWidth={1.5} dot={false} />}
                   </>
                 )}
               </LineChart>
@@ -1433,10 +1436,10 @@ function MonitoringTab() {
             <CardContent>
               <ResponsiveContainer width="100%" height={200}>
                 <LineChart data={chartData}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                  <XAxis dataKey="step" tick={{ fontSize: 10 }} stroke="hsl(var(--muted-foreground))" />
-                  <YAxis tick={{ fontSize: 10 }} stroke="hsl(var(--muted-foreground))" />
-                  <Line type="monotone" dataKey={isGrpo && hasReward ? 'kl' : 'lr'} stroke="hsl(var(--success))" strokeWidth={1.5} dot={false} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
+                  <XAxis dataKey="step" tick={{ fontSize: 10 }} stroke="var(--color-muted-foreground)" />
+                  <YAxis tick={{ fontSize: 10 }} stroke="var(--color-muted-foreground)" />
+                  <Line type="monotone" dataKey={isGrpo && hasReward ? 'kl' : 'lr'} stroke="var(--color-muted-foreground)" strokeWidth={1.5} dot={false} />
                 </LineChart>
               </ResponsiveContainer>
             </CardContent>
@@ -1448,10 +1451,10 @@ function MonitoringTab() {
             <CardContent>
               <ResponsiveContainer width="100%" height={200}>
                 <LineChart data={chartData}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                  <XAxis dataKey="step" tick={{ fontSize: 10 }} stroke="hsl(var(--muted-foreground))" />
-                  <YAxis tick={{ fontSize: 10 }} stroke="hsl(var(--muted-foreground))" />
-                  <Line type="monotone" dataKey="grad_norm" stroke="hsl(var(--warning))" strokeWidth={1.5} dot={false} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
+                  <XAxis dataKey="step" tick={{ fontSize: 10 }} stroke="var(--color-muted-foreground)" />
+                  <YAxis tick={{ fontSize: 10 }} stroke="var(--color-muted-foreground)" />
+                  <Line type="monotone" dataKey="grad_norm" stroke="var(--color-chart-validation)" strokeWidth={1.5} dot={false} />
                 </LineChart>
               </ResponsiveContainer>
             </CardContent>

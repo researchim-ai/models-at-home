@@ -1,3 +1,10 @@
+import { ResearchPanel } from '@/components/builder/ResearchPanel'
+import { defaultLabProfile, type LabAnalysis } from '@/lib/research'
+import { useLabStore } from '@/stores/labStore'
+import { useBuilderDraft } from '@/stores/builderDraft'
+import { BlockEditor } from '@/components/builder/BlockEditor'
+import { Select } from '@/components/ui/select'
+import { initialParams, recipe, duplicateSequenceBlock, type BlockDefinition, type BlueprintAnalysis } from '@/lib/builder'
 import { useState, useCallback, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
@@ -24,16 +31,17 @@ import {
   ArrowUp,
   ArrowDown,
   Play,
+  CheckCircle2,
+  X,
+  Undo2,
+  Redo2,
 } from 'lucide-react'
 import { api } from '@/api/client'
 import { isSequence, connectSequence, syncBlueprintDimensions } from '@/lib/blueprint'
 import { toast } from 'sonner'
 import { useTrainingStore } from '@/stores/trainingStore'
 
-interface BlockDef {
-  type: string
-  description: string
-}
+type BlockDef = BlockDefinition
 
 interface BlockInstance {
   id: string
@@ -69,6 +77,9 @@ const ICON_BY_TYPE: Record<string, { icon: typeof Cpu; color: string }> = {
   linear: { icon: ChevronRight, color: 'bg-teal-500/20 text-teal-400' },
   llama_block: { icon: Layers, color: 'bg-indigo-500/20 text-indigo-400' },
   liger_llama_block: { icon: Layers, color: 'bg-indigo-600/20 text-indigo-300' },
+  loop: { icon: Repeat, color: 'bg-primary/15 text-primary' },
+  repeater: { icon: Layers, color: 'bg-primary/15 text-primary' },
+  residual: { icon: Shuffle, color: 'bg-primary/15 text-primary' },
   dropout: { icon: Shuffle, color: 'bg-gray-500/20 text-gray-400' },
 }
 
@@ -76,41 +87,26 @@ function getIconFor(type: string) {
   return ICON_BY_TYPE[type] ?? { icon: Cpu, color: 'bg-muted text-muted-foreground' }
 }
 
-function getDefaultParams(type: string, hiddenSize: number, vocabSize: number, maxPositions: number): Record<string, number | string | boolean> {
-  switch (type.replace(/^liger_/, '')) {
-    case 'token_embedding': return { vocab_size: vocabSize, hidden_size: hiddenSize }
-    case 'positional_embedding': return { max_position_embeddings: maxPositions, hidden_size: hiddenSize }
-    case 'attention': return { num_heads: 8, dropout: 0 }
-    case 'causal_self_attention': return { num_heads: 8, use_rope: true }
-    case 'mlp': return { intermediate_size: hiddenSize * 4, activation: 'gelu' }
-    case 'swiglu': return { intermediate_size: hiddenSize * 4 }
-    case 'rmsnorm': return { eps: 1e-6 }
-    case 'layernorm': return { eps: 1e-5 }
-    case 'moe': return { num_experts: 8, num_select: 2, expert_type: 'swiglu' }
-    case 'llama_block': return { num_heads: 8, intermediate_size: hiddenSize * 4 }
-    case 'linear': return { in_features: hiddenSize, out_features: hiddenSize, bias: false }
-    case 'dropout': return { p: 0.1 }
-    default: return {}
-  }
-}
 
 export function ModelBuilder() {
   const { t } = useTranslation()
   const navigate = useNavigate()
-  const [blocks, setBlocks] = useState<BlockInstance[]>([])
-  const [blueprintName, setBlueprintName] = useState('my_model')
-  const [hiddenSize, setHiddenSize] = useState(512)
-  const [vocabSize, setVocabSize] = useState(50257)
-  const [maxPositions, setMaxPositions] = useState(2048)
-  const [autoProject, setAutoProject] = useState(true)
+  const draft = useBuilderDraft()
+  const { blocks, blueprintName, hiddenSize, vocabSize, maxPositions, autoProject, blueprintExtras } = draft
+  const setBlocks = (value: React.SetStateAction<BlockInstance[]>) => draft.setField('blocks', value)
+  const setBlueprintName = (value: string) => draft.setField('blueprintName', value)
 
+
+  const [search, setSearch] = useState('')
+  const [analyzing, setAnalyzing] = useState(false)
+  const [analysis, setAnalysis] = useState<{ key: string; value: LabAnalysis } | null>(null)
+  const [analysisError, setAnalysisError] = useState('')
   const [available, setAvailable] = useState<BlockDef[]>([])
   const [saved, setSaved] = useState<SavedBlueprint[]>([])
   const [selectedBlock, setSelectedBlock] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [jsonDraft, setJsonDraft] = useState<string | null>(null)
   const [jsonError, setJsonError] = useState<string | null>(null)
-  const [blueprintExtras, setBlueprintExtras] = useState<Record<string, unknown>>({})
 
   const loadBlocks = useCallback(async () => {
     try {
@@ -140,11 +136,12 @@ export function ModelBuilder() {
       return [...prev, {
         id,
         type,
-        params: getDefaultParams(type, hiddenSize, vocabSize, maxPositions),
+        params: initialParams(type, { hidden: hiddenSize, vocab: vocabSize, positions: maxPositions }, available),
         inputs: previousId ? [previousId] : [],
       }]
     })
-  }, [hiddenSize, vocabSize, maxPositions])
+    setSelectedBlock(id)
+  }, [hiddenSize, vocabSize, maxPositions, available])
 
   const removeBlock = (id: string) => {
     if (!isSequence(blocks) && blocks.some(b => b.inputs.includes(id))) {
@@ -173,11 +170,6 @@ export function ModelBuilder() {
     })
   }
 
-  const updateParam = (blockId: string, key: string, value: string | number | boolean) => {
-    setBlocks((prev) => prev.map((b) =>
-      b.id === blockId ? { ...b, params: { ...b.params, [key]: value } } : b,
-    ))
-  }
 
   const blueprint = {
     ...blueprintExtras,
@@ -200,18 +192,27 @@ export function ModelBuilder() {
     },
   }
 
-  const totalParams = blocks.reduce((acc, b) => {
-    if (b.type === 'token_embedding') return acc + vocabSize * hiddenSize
-    if (b.type === 'positional_embedding') return acc + maxPositions * hiddenSize
-    if (b.type === 'attention' || b.type === 'causal_self_attention') return acc + 4 * hiddenSize * hiddenSize
-    if (b.type === 'mlp' || b.type === 'swiglu' || b.type === 'liger_swiglu')
-      return acc + 3 * hiddenSize * hiddenSize * 4
-    if (b.type === 'llama_block' || b.type === 'liger_llama_block')
-      return acc + 4 * hiddenSize * hiddenSize + 3 * hiddenSize * hiddenSize * 4 + 2 * hiddenSize
-    if (b.type === 'linear') return acc + Number(b.params.in_features ?? hiddenSize) * Number(b.params.out_features ?? hiddenSize)
-    if (b.type === 'moe') return acc + Number(b.params.num_experts ?? 8) * hiddenSize * hiddenSize * 4 * 3
-    return acc
-  }, 0)
+  const labProfile = draft.labProfile ?? defaultLabProfile
+  const fingerprint = JSON.stringify({blueprint,profile:labProfile})
+  const currentAnalysis = analysis?.key === fingerprint ? analysis.value : null
+  const dimensions = { hidden: hiddenSize, vocab: vocabSize, positions: maxPositions }
+  const analyze = async () => {
+    setAnalyzing(true); setAnalysisError('')
+    try { setAnalysis({ key: fingerprint, value: await api.researchAnalyze(blueprint,labProfile) }) }
+    catch (error) { setAnalysisError(error instanceof Error ? error.message : String(error)) }
+    finally { setAnalyzing(false) }
+  }
+  const duplicate = (id: string) => {
+    if (!isSequence(blocks)) { toast.error('For a branched graph, duplicate branches through JSON or add a block and select its inputs.'); return }
+    setBlocks(current => duplicateSequenceBlock(current, id))
+  }
+  const wrapInLoop = (id: string) => {
+    const original = blocks.find(b => b.id === id)
+    if (!original || ['token_embedding', 'positional_embedding', 'add', 'multiply', 'concat'].includes(original.type)) return
+    setBlocks(current => current.map(b => b.id === id ? { ...b, type: 'loop', params: {
+      ...initialParams('loop', dimensions, available), body: [{ type: b.type, params: structuredClone(b.params) }],
+    } } : b))
+  }
 
   const handleSave = async () => {
     if (blocks.length === 0) {
@@ -233,11 +234,18 @@ export function ModelBuilder() {
   const handleTrain = async () => {
     setSaving(true)
     try {
+      if(labProfile.task!=='llm') await api.researchAnalyze(blueprint,labProfile)
       const result = await api.saveBlueprint(blueprintName, blueprint)
+      useLabStore.getState().handoff(labProfile.task,{name:blueprintName,path:result.path,blueprint,profile:labProfile})
+      if(labProfile.task!=='llm') {
+        navigate('/'+labProfile.task)
+        toast.success(`Blueprint snapshot sent to ${labProfile.task.toUpperCase()} Studio. Choose data and run preflight.`)
+        return
+      }
       const store = useTrainingStore.getState()
       store.setStage('pretrain')
       store.updateConfig({ model_type: 'blueprint', model_blueprint: result.path,
-        model_blueprint_spec: blueprint, hidden_size: hiddenSize, vocab_size: vocabSize,
+        research_diagnostics:true, model_blueprint_spec: blueprint, hidden_size: hiddenSize, vocab_size: vocabSize,
         seq_len: maxPositions, training_backend: 'models-at-home', tuning_method: 'full', use_lora: false,
         base_model_path: '', model_path: '' })
       navigate('/')
@@ -251,18 +259,10 @@ export function ModelBuilder() {
     try {
       const data = await api.getBlueprint(name)
       const bp = data.blueprint as any
-      setBlueprintName(name)
-      setHiddenSize(bp.hidden_size ?? 512)
-      setVocabSize(bp.vocab_size ?? 50257)
-      setMaxPositions(bp.max_position_embeddings ?? 2048)
-      setAutoProject(bp.auto_project ?? true)
-      setBlueprintExtras({ dtype: bp.dtype, training: bp.training })
-      setBlocks((bp.blocks ?? []).map((b: any) => ({
-        id: b.id,
-        type: b.type,
-        params: b.params ?? {},
-        inputs: b.inputs ?? [],
-      })))
+      draft.patch({ blueprintName: name, hiddenSize: bp.hidden_size ?? 512, vocabSize: bp.vocab_size ?? 50257,
+        maxPositions: bp.max_position_embeddings ?? 2048, autoProject: bp.auto_project ?? true,
+        blueprintExtras: { dtype: bp.dtype, training: bp.training },
+        blocks: (bp.blocks ?? []).map((b: any) => ({ id: b.id, type: b.type, params: b.params ?? {}, inputs: b.inputs ?? [] })) })
       toast.success(`Загружен blueprint "${name}"`)
     } catch {
       toast.error('Не удалось загрузить blueprint')
@@ -275,12 +275,9 @@ export function ModelBuilder() {
     try {
       const parsed = JSON.parse(jsonDraft)
       const { blueprint: value } = await api.validateBlueprint(parsed)
-      setHiddenSize(value.hidden_size as number)
-      setVocabSize(value.vocab_size as number)
-      setMaxPositions(value.max_position_embeddings as number)
-      setAutoProject(value.auto_project as boolean)
-      setBlueprintExtras({ dtype: value.dtype, training: value.training })
-      setBlocks(value.blocks as BlockInstance[])
+      draft.patch({ hiddenSize: value.hidden_size as number, vocabSize: value.vocab_size as number,
+        maxPositions: value.max_position_embeddings as number, autoProject: value.auto_project as boolean,
+        blueprintExtras: { dtype: value.dtype, training: value.training }, blocks: value.blocks as BlockInstance[] })
       setJsonDraft(null)
     } catch (error) {
       setJsonError(error instanceof Error ? error.message : String(error))
@@ -313,10 +310,8 @@ export function ModelBuilder() {
     const before = { hidden: hiddenSize, vocab: vocabSize, positions: maxPositions }
     const after = { ...before, ...changes }
     if (Object.values(after).some(value => !Number.isInteger(value) || value <= 0)) return
-    setBlocks(current => syncBlueprintDimensions(current, before, after))
-    setHiddenSize(after.hidden)
-    setVocabSize(after.vocab)
-    setMaxPositions(after.positions)
+    draft.patch({ hiddenSize: after.hidden, vocabSize: after.vocab, maxPositions: after.positions,
+      blocks: syncBlueprintDimensions(blocks, before, after) })
   }
 
   return (
@@ -324,6 +319,12 @@ export function ModelBuilder() {
       <div className="builder-palette min-h-0 w-64 shrink-0 border-r border-border flex flex-col">
         <ScrollArea className="flex-1 p-4">
           <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="builder-recipe" className="text-xs">Start from a recipe</Label>
+              <Select id="builder-recipe" disabled={!available.length} value="" placeholder="Choose architecture…" options={[{ value: 'transformer', label: 'Transformer · independent layers' }, { value: 'looped', label: 'Looped Transformer · shared core' }, { value: 'moe', label: 'Sparse MoE · residual branches' }, { value:'lab_tiny',label:'CPU Research Lab · small shared core' }]}
+                onChange={e => { const small=e.target.value==='lab_tiny'; const dims=small?{hidden:32,vocab:259,positions:128}:dimensions; draft.patch({ blocks: recipe(small?'looped':e.target.value, dims, available), hiddenSize:dims.hidden,vocabSize:dims.vocab,maxPositions:dims.positions,blueprintName:e.target.value+'_model',blueprintExtras:{} }); setSelectedBlock(null); setJsonDraft(null) }} />
+              <p className="text-[10px] leading-relaxed text-muted-foreground">A recipe replaces the current draft. Save your design before switching.</p>
+            </div>
             <div>
               <div className="flex items-center justify-between mb-2">
                 <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -333,8 +334,9 @@ export function ModelBuilder() {
                   <RefreshCw className="h-3 w-3" />
                 </Button>
               </div>
+              <Input aria-label="Search blocks" placeholder="Search blocks…" className="mb-3 h-8 text-xs" value={search} onChange={e => setSearch(e.target.value)} />
               <div className="space-y-1">
-                {available.map((def) => {
+                {available.filter(item => `${item.type} ${item.description} ${item.category ?? ''}`.toLowerCase().includes(search.toLowerCase())).map((def) => {
                   const { icon: Icon, color } = getIconFor(def.type)
                   return (
                     <button
@@ -355,23 +357,23 @@ export function ModelBuilder() {
             </div>
 
             <div className="space-y-2 pt-2 border-t border-border">
-              <Label className="text-xs">Hidden Size</Label>
+              <Label htmlFor="builder-hidden" className="text-xs">Hidden Size</Label>
               <Input
-                type="number"
+                id="builder-hidden" type="number"
                 value={hiddenSize}
                 onChange={(e) => resize({ hidden: Number(e.target.value) })}
                 className="h-8"
               />
-              <Label className="text-xs">Vocab Size</Label>
+              <Label htmlFor="builder-vocab" className="text-xs">Vocab Size</Label>
               <Input
-                type="number"
+                id="builder-vocab" type="number"
                 value={vocabSize}
                 onChange={(e) => resize({ vocab: Number(e.target.value) })}
                 className="h-8"
               />
-              <Label className="text-xs">Max Positions</Label>
+              <Label htmlFor="builder-positions" className="text-xs">Max Positions</Label>
               <Input
-                type="number"
+                id="builder-positions" type="number"
                 value={maxPositions}
                 onChange={(e) => resize({ positions: Number(e.target.value) })}
                 className="h-8"
@@ -390,18 +392,20 @@ export function ModelBuilder() {
               className="max-w-xs h-9"
               placeholder="Blueprint name"
             />
-            <Badge variant="secondary">
-              ~{totalParams >= 1e9 ? `${(totalParams / 1e9).toFixed(2)}B` : `${(totalParams / 1e6).toFixed(1)}M`} params
-            </Badge>
+            <Badge variant="secondary">{currentAnalysis ? `${currentAnalysis.parameters.toLocaleString()} params` : 'Parameters: analyze to count'}</Badge>
             <Badge variant="outline">{blocks.length} blocks</Badge>
+            <span className="text-[10px] text-muted-foreground">{draft.persisted ? 'Draft saved on this device' : 'Draft storage unavailable: save a blueprint'}</span>
           </div>
           <div className="flex flex-wrap gap-2">
+            <Button variant="ghost" size="sm" onClick={draft.undo} disabled={!draft.canUndo || jsonDraft !== null} aria-label="Undo architecture edit"><Undo2 className="h-3.5 w-3.5" /></Button>
+            <Button variant="ghost" size="sm" onClick={draft.redo} disabled={!draft.canRedo || jsonDraft !== null} aria-label="Redo architecture edit"><Redo2 className="h-3.5 w-3.5" /></Button>
+            <Button variant="outline" size="sm" disabled={!blocks.length || analyzing || jsonDraft !== null} onClick={analyze}><CheckCircle2 className="h-3.5 w-3.5" />{analyzing ? 'Analyzing…' : 'Analyze architecture'}</Button>
             <Button variant="outline" size="sm" onClick={() => { setJsonDraft(JSON.stringify(blueprint, null, 2)); setJsonError(null) }}>
               Edit JSON
             </Button>
             <Button variant="outline" size="sm" onClick={handleTrain} disabled={saving || !blocks.length || jsonDraft !== null}>
               <Play className="h-3.5 w-3.5" />
-              {t('builder.train')}
+              {labProfile.task==='llm'?t('builder.train'):`Train in ${labProfile.task.toUpperCase()} Studio`}
             </Button>
             <Button variant="outline" size="sm" onClick={handleCopy}>
               <Copy className="h-3.5 w-3.5" />
@@ -415,6 +419,9 @@ export function ModelBuilder() {
         </div>
 
         <ScrollArea className="flex-1 p-6">
+          {analysisError && <p role="alert" className="mb-4 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive">{analysisError}</p>}
+          <ResearchPanel blueprint={blueprint} name={blueprintName} profile={labProfile} setProfile={patch=>draft.patch({labProfile:{...labProfile,...patch}})} analysis={currentAnalysis} inspect={setSelectedBlock}
+            restore={(value,profile,name)=>{draft.patch({blocks:value.blocks as BlockInstance[],hiddenSize:Number(value.hidden_size),vocabSize:Number(value.vocab_size),maxPositions:Number(value.max_position_embeddings),autoProject:Boolean(value.auto_project??true),blueprintExtras:{training:value.training,dtype:value.dtype},blueprintName:name,labProfile:profile});setSelectedBlock(null);setJsonDraft(null)}} />
           {jsonDraft !== null && <div className="mb-4 space-y-2">
             <Label htmlFor="blueprint-json">Blueprint JSON</Label>
             <textarea id="blueprint-json" value={jsonDraft} onChange={event => setJsonDraft(event.target.value)}
@@ -441,6 +448,8 @@ export function ModelBuilder() {
                 return (
                   <Card
                     key={block.id}
+                    role="group" tabIndex={0} aria-label={`${block.type} block ${idx + 1}`}
+                    onKeyDown={e => { if (e.target === e.currentTarget && ['Enter', ' '].includes(e.key)) { e.preventDefault(); setSelectedBlock(block.id) } }}
                     className={`group cursor-pointer transition-all ${isSelected ? 'ring-2 ring-primary' : ''}`}
                     onClick={() => setSelectedBlock(block.id)}
                   >
@@ -454,17 +463,20 @@ export function ModelBuilder() {
                       <div className="flex-1 min-w-0">
                         <div className="text-sm font-medium">{block.type}</div>
                         <div className="text-xs text-muted-foreground font-mono truncate">
-                          {block.id} · {Object.entries(block.params).map(([k, v]) => `${k}=${v}`).join(', ')}
+                          {block.id} · {block.type === 'loop' ? `shared body × ${block.params.iterations ?? 4}` : Object.entries(block.params).filter(([, v]) => typeof v !== 'object').map(([k, v]) => `${k}=${v}`).join(', ')}
                         </div>
+                        <p className="mt-1 truncate text-[10px] text-muted-foreground" title={(block.inputs.length ? block.inputs : [idx ? blocks[idx - 1].id : 'input']).join(', ')}>← {(block.inputs.length ? block.inputs : [idx ? blocks[idx - 1].id : 'input']).join(', ')}</p>
                       </div>
-                      <div className="opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
-                        <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); moveBlock(block.id, -1) }}>
+                      <div className="flex flex-wrap gap-1 opacity-60 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+                        <Button variant="ghost" size="icon" aria-label="Duplicate block" title="Duplicate with independent weights" onClick={e => { e.stopPropagation(); duplicate(block.id) }}><Copy className="h-3 w-3" /></Button>
+                        {!['token_embedding', 'positional_embedding', 'add', 'multiply', 'concat'].includes(block.type) && <Button variant="ghost" size="icon" aria-label="Wrap block in loop" title="Wrap in a shared-weight loop" onClick={e => { e.stopPropagation(); wrapInLoop(block.id); setSelectedBlock(block.id) }}><Repeat className="h-3 w-3" /></Button>}
+                        <Button variant="ghost" size="icon" aria-label="Move block up" onClick={(e) => { e.stopPropagation(); moveBlock(block.id, -1) }}>
                           <ArrowUp className="h-3 w-3" />
                         </Button>
-                        <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); moveBlock(block.id, 1) }}>
+                        <Button variant="ghost" size="icon" aria-label="Move block down" onClick={(e) => { e.stopPropagation(); moveBlock(block.id, 1) }}>
                           <ArrowDown className="h-3 w-3" />
                         </Button>
-                        <Button variant="ghost" size="icon" onClick={(e) => { e.stopPropagation(); removeBlock(block.id) }}>
+                        <Button variant="ghost" size="icon" aria-label="Remove block" onClick={(e) => { e.stopPropagation(); removeBlock(block.id) }}>
                           <Trash2 className="h-3 w-3" />
                         </Button>
                       </div>
@@ -477,85 +489,29 @@ export function ModelBuilder() {
         </ScrollArea>
       </div>
 
-      <div className="builder-saved min-h-0 w-72 shrink-0 border-l border-border flex flex-col">
-        <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground flex items-center gap-2">
-            <FolderOpen className="h-3.5 w-3.5" />
-            Saved Blueprints
-          </h3>
-          <Button variant="ghost" size="icon" onClick={loadSaved}>
-            <RefreshCw className="h-3 w-3" />
-          </Button>
+      <div className="builder-saved min-h-0 w-[328px] shrink-0 border-l border-border flex flex-col">
+        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{currentBlock ? 'Block inspector' : 'Saved Blueprints'}</h3>
+          <Button variant="ghost" size="icon" aria-label={currentBlock ? 'Close block inspector' : 'Refresh blueprints'} onClick={() => currentBlock ? setSelectedBlock(null) : loadSaved()}>{currentBlock ? <X className="h-4 w-4" /> : <RefreshCw className="h-3.5 w-3.5" />}</Button>
         </div>
-
-        <ScrollArea className="flex-1">
-          <div className="p-3 space-y-1">
-            {saved.length === 0 && (
-              <p className="text-xs text-muted-foreground text-center py-4">
-                Нет сохранённых
-              </p>
-            )}
-            {saved.map((s) => (
-              <div
-                key={s.path}
-                className="group flex items-start gap-2 rounded-md p-2 hover:bg-accent transition-colors"
-              >
-                <FileText className="h-3.5 w-3.5 mt-0.5 shrink-0 text-muted-foreground" />
-                <button
-                  className="flex-1 min-w-0 text-left"
-                  onClick={() => handleLoad(s.name)}
-                >
-                  <div className="text-xs font-medium truncate">{s.name}</div>
-                  <div className="text-[10px] text-muted-foreground">
-                    {s.num_blocks} blocks · h={s.hidden_size}
-                  </div>
-                </button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="opacity-0 group-hover:opacity-100 transition-opacity h-6 w-6"
-                  onClick={() => handleDelete(s.name)}
-                >
-                  <Trash2 className="h-3 w-3" />
-                </Button>
-              </div>
-            ))}
-          </div>
-
-          {currentBlock && (
-            <div className="border-t border-border p-3 space-y-2">
-              <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                Params: {currentBlock.type}
-              </div>
-              {Object.entries(currentBlock.params).map(([k, v]) => (
-                <div key={k} className="space-y-1">
-                  <Label className="text-[10px]">{k}</Label>
-                  {typeof v === 'boolean' ? <input
-                    type="checkbox" checked={v} aria-label={k}
-                    onChange={e => updateParam(currentBlock.id, k, e.target.checked)}
-                  /> : typeof v === 'object' ? <pre className="text-xs whitespace-pre-wrap">{JSON.stringify(v, null, 2)}</pre> : <Input
-                    value={String(v)}
-                    onChange={(e) => {
-                      const val = e.target.value
-                      const parsed = val === '' ? '' : isNaN(Number(val)) ? val : Number(val)
-                      updateParam(currentBlock.id, k, parsed)
-                    }}
-                    className="h-7 text-xs"
-                  />}
-                </div>
-              ))}
-            </div>
-          )}
-
-          <details className="border-t border-border">
-            <summary className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground cursor-pointer hover:bg-accent/50">
-              JSON Preview
-            </summary>
-            <pre className="text-[10px] font-mono text-muted-foreground bg-muted/50 p-3 overflow-auto max-h-72">
-              {JSON.stringify(blueprint, null, 2)}
-            </pre>
-          </details>
+        <ScrollArea className="min-h-0 flex-1">
+          {currentBlock ? <div className="space-y-4 p-4">
+            <BlockEditor block={currentBlock} definitions={available} dimensions={dimensions} onChange={value => setBlocks(current => current.map(b => b.id === currentBlock.id ? { ...b, ...value } : b))} />
+            <fieldset className="space-y-2 border-t border-border pt-3"><legend className="text-xs font-semibold">Inputs · earlier blocks</legend>
+              <p className="text-[10px] text-muted-foreground">No explicit inputs: use the previous block. Graph joins need at least two branches.</p>
+              {['input', ...blocks.slice(0, blocks.findIndex(b => b.id === currentBlock.id)).map(b => b.id)].map(parent => <Label key={parent} className="flex min-w-0 items-center gap-2 text-[11px]">
+                <input type="checkbox" checked={currentBlock.inputs.includes(parent)} onChange={e => setBlocks(current => current.map(b => b.id === currentBlock.id ? { ...b, inputs: e.target.checked ? [...b.inputs, parent] : b.inputs.filter(id => id !== parent) } : b))} /><span className="truncate" title={parent}>{parent}</span>
+              </Label>)}
+            </fieldset>
+          </div> : <div className="space-y-1 p-3">
+            {saved.length === 0 && <p className="py-4 text-center text-xs text-muted-foreground">No saved models yet</p>}
+            {saved.map(item => <div key={item.path} className="group flex items-start gap-2 rounded-md p-2 hover:bg-accent">
+              <FileText className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" /><button className="min-w-0 flex-1 text-left" onClick={() => { handleLoad(item.name); setSelectedBlock(null) }}><div className="truncate text-xs font-medium">{item.name}</div><div className="text-[10px] text-muted-foreground">{item.num_blocks} blocks · h={item.hidden_size}</div></button>
+              <Button variant="ghost" size="icon" className="h-6 w-6" aria-label={`Delete ${item.name}`} onClick={() => handleDelete(item.name)}><Trash2 className="h-3 w-3" /></Button>
+            </div>)}
+          </div>}
         </ScrollArea>
+        <details className="border-t border-border"><summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-muted-foreground">JSON Preview</summary><pre className="max-h-72 overflow-auto bg-muted/50 p-3 font-mono text-[10px] text-muted-foreground">{JSON.stringify(blueprint, null, 2)}</pre></details>
       </div>
     </div>
   )

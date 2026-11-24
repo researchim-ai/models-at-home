@@ -11,6 +11,7 @@ module.exports = {
     if (!runtime) throw new Error('ML runtime missing: set MAH_RUNTIME_ROOT before packaging')
   },
   extraResources: [
+    { from:'examples/research-lab',to:'examples/research-lab' },
     { from: 'examples/world-local', to: 'examples/world-local' },
     { from: 'requirements-world-local.txt', to: 'requirements-world-local.txt' },
     { from: 'requirements-world-foundation.txt', to: 'requirements-world-foundation.txt' },

@@ -1,3 +1,6 @@
+import { RunResearchSignals } from '@/components/builder/RunResearchSignals'
+import { useLabStore } from '@/stores/labStore'
+import { Link } from 'react-router-dom'
 import { WorkspaceIntro } from '@/components/layout/WorkspaceIntro'
 import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
@@ -15,11 +18,19 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
 
 const initial = {
+  freeze_vision_tower:true,policy_camera_key:'',policy_revision:'',policy_train_expert_only:true,act_pretrained_backbone:false,act_dim_model:256,act_encoder_layers:4,
+  research_diagnostics:false,model_blueprint_spec:null as Record<string,unknown>|null,source_blueprint_spec:null as Record<string,unknown>|null,model_blueprint:'',vision_image_size:32,vision_patch_size:8,
   domain: 'robotics', architecture: 'native_vla', training_backend: 'transformers', action_type: 'continuous', model_path: '', dataset_path: '', val_data_path: '',
   action_dim: 7, action_horizon: 8, state_dim: 7, hidden_dim: 128, image_size: 64, vision_grid: 4, batch_size: 8,
   gradient_accumulation: 1, learning_rate: 0.0003, max_steps: 500, save_every: 100, eval_every: 20,
   mixed_precision: 'bf16', device: 'auto', tuning_method: 'full', seq_len: 2048, max_pixels: 65536,
   action_names: [] as string[], discrete_classes: [] as number[], discrete_names: [] as string[], discrete_labels: [] as string[][],
+}
+const standalonePolicies: Record<string,{name:string;model:string;objective:string;note:string;paper:string}> = {
+  act:{name:'ACT',model:'',objective:'L1 + CVAE KL',note:'Изображение + состояние. ACT не использует текст инструкции. Обучение с нуля или ACT checkpoint; одна камера.',paper:'https://arxiv.org/abs/2304.13705'},
+  smolvla:{name:'SmolVLA',model:'lerobot/smolvla_base',objective:'Flow matching',note:'Готовая политика LeRobot: изображение + инструкция + состояние. Обучается action expert; Full здесь означает без LoRA, заморозка backbone настраивается отдельно.',paper:'https://arxiv.org/abs/2506.01844'},
+  pi0:{name:'π0',model:'lerobot/pi0_base',objective:'Flow matching',note:'LeRobot/OpenPI. Требуются полные action chunks, совместимые размерности и доступ к tokenizer PaliGemma. Крупная модель.',paper:'https://arxiv.org/abs/2410.24164'},
+  openvla:{name:'OpenVLA',model:'openvla/openvla-7b',objective:'Action-token cross entropy',note:'Оригинальная 7B политика: изображение + инструкция → 7D действие. Horizon=1, state_dim=0, gripper в [0,1]. Требует CUDA.',paper:'https://arxiv.org/abs/2406.09246'},
 }
 const presets = {
   robotics: { action_type: 'continuous', action_dim: 7, state_dim: 7, action_horizon: 8,
@@ -31,7 +42,23 @@ const presets = {
 }
 
 export function VLAStudio() {
-  const [config, setConfig] = useState({ ...initial, ...presets.robotics })
+  const handoff=useLabStore(state=>state.handoffs.vla)
+  const [config, setConfig] = useState(()=>({ ...initial, ...presets.robotics,...(handoff?{
+    research_diagnostics:true,architecture:'blueprint_vla',training_backend:'transformers',tuning_method:'full',device:'auto',mixed_precision:'no',model_blueprint_spec:handoff.blueprint,source_blueprint_spec:handoff.blueprint,model_blueprint:handoff.path,
+    vision_image_size:handoff.profile.vision_image_size,vision_patch_size:handoff.profile.vision_patch_size,image_size:handoff.profile.vision_image_size,
+    action_type:handoff.profile.action_type,action_dim:handoff.profile.action_dim,action_horizon:handoff.profile.action_horizon,state_dim:handoff.profile.state_dim,hidden_dim:handoff.profile.hidden_dim,
+    action_names:[],discrete_names:[],discrete_labels:[],discrete_classes:handoff.profile.action_type==='hybrid'?handoff.profile.discrete_classes:[],seq_len:Number(handoff.blueprint.max_position_embeddings),
+  }:{}) }))
+  const standalone=standalonePolicies[config.architecture]
+  function selectArchitecture(architecture:string){
+    if(architecture!=='blueprint_vla')useLabStore.getState().clearHandoff('vla')
+    const policy=standalonePolicies[architecture]
+    patch({architecture,model_blueprint_spec:architecture==='blueprint_vla'?handoff?.blueprint??null:null,source_blueprint_spec:architecture==='blueprint_vla'?handoff?.blueprint??null:null,
+      training_backend:'transformers',tuning_method:architecture==='vlm_action'||architecture==='openvla'?'lora':'full',
+      ...(policy?{model_path:policy.model,action_type:'continuous',action_dim:7,state_dim:architecture==='openvla'?0:7,action_horizon:architecture==='openvla'?1:architecture==='act'?8:50,
+        domain:'robotics',action_names:presets.robotics.action_names,discrete_classes:[],discrete_names:[],discrete_labels:[],batch_size:1,gradient_accumulation:1,
+        learning_rate:architecture==='pi0'?2.5e-5:1e-4,device:architecture==='act'?'auto':'cuda',mixed_precision:architecture==='act'?'no':'bf16',policy_camera_key:'',policy_revision:''}:{})})
+  }
   const [gpuId, setGpuId] = useState(0)
   const [name] = useState(() => `vla_${Date.now().toString(36)}`)
   const [tab, setTab] = useState('launch')
@@ -99,14 +126,23 @@ export function VLAStudio() {
       <div className="space-y-1"><h2 className="text-sm font-semibold flex items-center gap-2"><Bot className="h-4 w-4" />VLA Configuration</h2>
         <p className="text-xs text-muted-foreground">Изображение + инструкция + состояние → action chunk.</p></div>
       <div className="space-y-2"><Label className="text-xs">Сценарий</Label>
-        <Select aria-label="VLA domain" value={config.domain} onChange={event => {
+        <Select disabled={!!standalone} aria-label="VLA domain" value={config.domain} onChange={event => {
           const domain = event.target.value as keyof typeof presets
           patch({ domain, ...presets[domain] })
         }} options={[{ value: 'robotics', label: 'Робототехника' }, { value: 'simulation', label: 'Игры и симуляторы' }, { value: 'desktop', label: 'Мышь и клавиатура' }]} /></div>
       <div className="space-y-2"><Label className="text-xs">Модель</Label>
-        <Select aria-label="VLA architecture" value={config.architecture} onChange={event => patch({ architecture: event.target.value,
-          tuning_method: event.target.value === 'native_vla' ? 'full' : 'lora', training_backend: 'transformers', device: event.target.value === 'vlm_action' ? 'auto' : config.device })}
-          options={[{ value: 'native_vla', label: 'Native VLA — с нуля' }, { value: 'vlm_action', label: 'VLM + Action Head' }]} />
+        <Select aria-label="VLA architecture" value={config.architecture} onChange={event=>selectArchitecture(event.target.value)}
+          options={[{value:'native_vla',label:'Native VLA — с нуля'},{value:'vlm_action',label:'VLM + Action Head'},{value:'blueprint_vla',label:'Research Lab blueprint + Action Head',disabled:!handoff},...Object.entries(standalonePolicies).map(([value,p])=>({value,label:p.name+' — standalone policy'}))]} />
+        {standalone&&<div className="space-y-3 rounded-lg border border-border bg-muted/30 p-3 text-xs">
+          <strong>{standalone.name} · {standalone.objective}</strong><p className="text-muted-foreground">{standalone.note}</p>
+          <a className="text-primary underline" href={standalone.paper} target="_blank" rel="noreferrer" onClick={event=>{if(window.electronAPI){event.preventDefault();void window.electronAPI.shell.openExternal(standalone.paper)}}}>Статья об архитектуре ↗</a>
+          <p className="text-[11px] text-muted-foreground">{config.architecture==='openvla'?'Окружение .venv-openvla / MAH_OPENVLA_PYTHON':'Окружение .venv-lerobot / MAH_LEROBOT_PYTHON'}. Без Unsloth и GRPO. Preflight проверяет данные и processor; полный GPU-прогон pretrained весов ещё требует проверки.</p>
+          <Label htmlFor="vla-policy-model">{config.architecture==='act'?'ACT checkpoint (пусто — с нуля)':'Pretrained policy ID / local path'}</Label>
+          <Input id="vla-policy-model" value={config.model_path} placeholder={standalone.model||'Train ACT from scratch'} onChange={e=>patch({model_path:e.target.value})}/>
+          {config.architecture==='openvla'?<><Label>Метод обучения</Label><Select aria-label="Standalone tuning" value={config.tuning_method} onChange={e=>patch({tuning_method:e.target.value})} options={['full','lora'].map(value=>({value,label:value.toUpperCase()}))}/><Input aria-label="OpenVLA revision" placeholder="Checkpoint revision / commit (optional)" value={config.policy_revision} onChange={e=>patch({policy_revision:e.target.value})}/></>:<><Input aria-label="Policy camera key" placeholder="Camera key (auto from checkpoint)" value={config.policy_camera_key} onChange={e=>patch({policy_camera_key:e.target.value})}/>{config.architecture==='act'?<>{numberField('image_size','ACT image size (scratch)',32)}{numberField('act_dim_model','ACT transformer width',32,8)}{numberField('act_encoder_layers','ACT encoder layers',1)}<Label className="flex items-center gap-2"><input type="checkbox" checked={config.act_pretrained_backbone} onChange={e=>patch({act_pretrained_backbone:e.target.checked})}/>ImageNet ResNet weights (скачивание)</Label></>:<Label className="flex items-center gap-2"><input type="checkbox" checked={config.policy_train_expert_only} onChange={e=>patch({policy_train_expert_only:e.target.checked})}/>Train action expert only</Label>}</>}
+          {config.architecture!=='act'&&<Label className="flex items-center gap-2"><input type="checkbox" checked={config.freeze_vision_tower??true} onChange={e=>patch({freeze_vision_tower:e.target.checked})}/>Freeze vision encoder</Label>}
+        </div>}
+        {config.architecture==='blueprint_vla'&&<div className="space-y-2 rounded-lg border border-border p-3 text-xs"><strong>{handoff?.name??'Research blueprint'}</strong><p className="text-[11px] text-muted-foreground">Frozen blueprint backbone + trainable image patches + byte text + action head. Native SFT from scratch. Final action settings are configured on this page.</p><Link to="/builder" className="text-primary underline">Open Research Lab</Link><Label className="flex items-center gap-2 text-[11px]"><input type="checkbox" checked={config.research_diagnostics} onChange={e=>patch({research_diagnostics:e.target.checked})}/>Capture research batch signals</Label>{numberField('vision_image_size','Image size',16)}{numberField('vision_patch_size','Patch size',2)}</div>}
         {config.architecture === 'native_vla' && <>{numberField('image_size', 'Размер изображения', 16)}{numberField('vision_grid', 'Пространственная сетка', 1)}</>}
         {config.architecture === 'vlm_action' && <>
           <Select aria-label="VLA backend" value={config.training_backend} onChange={event => patch({ training_backend: event.target.value })}
@@ -119,14 +155,14 @@ export function VLAStudio() {
       </div>
       <Button variant="outline" onClick={() => {
         const example = demos.data?.examples?.find(value => value.domain === config.domain)
-        if (example) patch({ ...presets[config.domain as keyof typeof presets], dataset_path: example.dataset_path, val_data_path: example.val_data_path })
-      }} disabled={!demos.data?.examples?.some(value => value.domain === config.domain)}>Синтетическое демо</Button>
+        if (example) patch({ ...(!standalone?presets[config.domain as keyof typeof presets]:{}), dataset_path: example.dataset_path, val_data_path: example.val_data_path })
+      }} disabled={!!standalone&&config.architecture!=='act'||!demos.data?.examples?.some(value => value.domain === config.domain)}>Синтетическое демо</Button>
       <div className="space-y-2"><Label htmlFor="vla-dataset" className="text-xs">Демонстрации JSONL</Label>
         <Input id="vla-dataset" placeholder="datasets/actions/train.jsonl" value={config.dataset_path} onChange={event => patch({ dataset_path: event.target.value })} />
         <Label htmlFor="vla-validation" className="text-xs">Holdout JSONL (опционально)</Label>
         <Input id="vla-validation" placeholder="datasets/actions/validation.jsonl" value={config.val_data_path} onChange={event => patch({ val_data_path: event.target.value })} /></div>
       <div className="space-y-2"><Label className="text-xs">Тип действий</Label>
-        <Select aria-label="VLA action type" value={config.action_type} onChange={event => patch({ action_type: event.target.value,
+        <Select disabled={!!standalone} aria-label="VLA action type" value={config.action_type} onChange={event => patch({ action_type: event.target.value,
           discrete_classes: event.target.value === 'hybrid' ? [4] : [], discrete_names: [], discrete_labels: [], action_names: [] })}
           options={[{ value: 'continuous', label: 'Непрерывные векторы' }, { value: 'discrete', label: 'Дискретные команды' }, { value: 'hybrid', label: 'Смешанные действия' }]} />
         {numberField('action_dim', config.action_type === 'discrete' ? 'Число классов' : 'Размер непрерывного вектора', config.action_type === 'discrete' ? 2 : 1)}
@@ -141,18 +177,18 @@ export function VLAStudio() {
         {numberField('learning_rate', 'Learning rate', 0.000001, 0.00001)}{numberField('max_steps', 'Optimizer steps', 1)}
         {numberField('save_every', 'Checkpoint every', 1)}{numberField('eval_every', 'Validation every', 1)}
         <Label className="text-xs">Устройство</Label><Select aria-label="VLA device" value={config.device} onChange={event => patch({ device: event.target.value })}
-          options={[{ value: 'auto', label: 'Auto' }, { value: 'cuda', label: 'CUDA' }, { value: 'cpu', label: 'CPU (Native VLA)', disabled: config.architecture === 'vlm_action' }]} />
+          options={[{ value: 'auto', label: 'Auto' }, { value: 'cuda', label: 'CUDA' }, { value: 'cpu', label: 'CPU (Native / ACT / blueprint)', disabled: ['vlm_action','openvla'].includes(config.architecture) }]} />
         <Select aria-label="VLA GPU" value={String(gpuId)} onChange={event => setGpuId(Number(event.target.value))}
           options={gpu?.gpus.length ? gpu.gpus.map(value => ({ value: String(value.id), label: `GPU ${value.id}` })) : [{ value: '0', label: 'GPU 0' }]} />
         <Select aria-label="VLA precision" value={config.mixed_precision} onChange={event => patch({ mixed_precision: event.target.value })}
-          options={[{ value: 'bf16', label: 'BF16' }, { value: 'fp16', label: 'FP16' }, { value: 'no', label: 'Float32' }]} />
+          options={[{ value: 'bf16', label: 'BF16' }, { value: 'fp16', label: 'FP16', disabled:!!standalone }, { value: 'no', label: 'Float32' }]} />
       </div>
     </aside>
     <main className="min-w-0 flex-1 overflow-auto p-6 space-y-4">
       <WorkspaceIntro space="vla" />
       <Tabs value={tab} onValueChange={setTab}><TabsList><TabsTrigger value="launch">Обучение</TabsTrigger><TabsTrigger value="predict">Action preview</TabsTrigger><TabsTrigger value="history">История</TabsTrigger><TabsTrigger value="data">Формат данных</TabsTrigger></TabsList>
         <TabsContent value="launch"><div className="space-y-4">
-          <Card><CardHeader><CardTitle>Action policy training</CardTitle><CardDescription>Native VLA учится с нуля; VLM + Action Head использует визуально-языковую основу и отдельный выход действий.</CardDescription></CardHeader><CardContent className="space-y-3">
+          <Card><CardHeader><CardTitle>Action policy training</CardTitle><CardDescription>Native/Blueprint, VLM + Action Head и отдельные OpenVLA, SmolVLA, ACT, π0 используют собственные пути обучения. Демонстрации JSONL должны соответствовать контракту выбранной политики.</CardDescription></CardHeader><CardContent className="space-y-3">
             <div className="flex flex-wrap gap-2"><Button variant="outline" onClick={check} disabled={checking || !!active || !config.dataset_path}>{checking ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}Проверить VLA</Button>
               <Button onClick={start} disabled={!ready || busy || !!active}><Play className="h-4 w-4" />Начать VLA обучение</Button>
               {active && <Button variant="destructive" onClick={stop} disabled={busy}><Square className="h-4 w-4" />Остановить</Button>}</div>
@@ -162,12 +198,13 @@ export function VLAStudio() {
             </div>}
           </CardContent></Card>
           {selected && <Card><CardHeader><CardTitle>Эксперимент {selected}</CardTitle></CardHeader><CardContent className="space-y-2 text-sm">
+            <RunResearchSignals signals={current?.research_signals} />
             <p>{current?.status ?? 'initializing'} · Step {current?.step ?? 0} · Loss {current?.loss?.toFixed(6) ?? '—'} · Val loss {current?.val_loss?.toFixed(6) ?? '—'}</p>
             <div className="h-1.5 rounded bg-muted overflow-hidden"><div className="h-full bg-primary" style={{ width: `${Math.min(100, 100 * (current?.step ?? 0) / Math.max(1, selectedRun?.total_steps ?? config.max_steps))}%` }} /></div>
             {(metrics.data?.history.length ?? 0) > 0 && <div className="h-52 w-full"><ResponsiveContainer width="100%" height="100%"><LineChart data={metrics.data?.history}>
               <CartesianGrid strokeDasharray="3 3" opacity={0.15} /><XAxis dataKey="step" /><YAxis width={45} /><Tooltip />
-              <Line dataKey="loss" name="Action loss" stroke="var(--color-primary, #8b5cf6)" dot={false} isAnimationActive={false} />
-              <Line dataKey="val_loss" name="Validation loss" stroke="#22c55e" connectNulls dot={false} isAnimationActive={false} />
+              <Line dataKey="loss" name="Action loss" stroke="var(--color-chart-training)" dot={false} isAnimationActive={false} />
+              <Line dataKey="val_loss" name="Validation loss" stroke="var(--color-chart-validation)" strokeDasharray="6 4" connectNulls dot={false} isAnimationActive={false} />
             </LineChart></ResponsiveContainer></div>}
             {current?.action_mae != null && <p className="text-xs">Action MAE (исходные единицы): {current.action_mae.toFixed(6)}</p>}
             {current?.action_accuracy != null && <p className="text-xs">Discrete accuracy: {(100 * current.action_accuracy).toFixed(1)}%</p>}
@@ -188,7 +225,7 @@ export function VLAStudio() {
             }}>Продолжить до {Math.max(config.max_steps, run.current_step + 100)}</Button>}
           </CardContent></Card>)}
         </div></TabsContent>
-        <TabsContent value="data"><Card><CardHeader><CardTitle>Демонстрации JSONL</CardTitle><CardDescription>Каждая строка — наблюдение, инструкция, состояние и явный action chunk. Пути изображений считаются от JSONL. Короткие конечные chunks маскируются; границы эпизодов не склеиваются.</CardDescription></CardHeader><CardContent className="space-y-4 text-sm">
+        <TabsContent value="data"><Card><CardHeader><CardTitle>Демонстрации JSONL</CardTitle><CardDescription>Каждая строка — наблюдение, инструкция, состояние и явный action chunk. Пути изображений считаются от JSONL. Короткие chunks маскируются для поддерживающих это политик; π0 требует полный horizon. Границы эпизодов не склеиваются.</CardDescription></CardHeader><CardContent className="space-y-4 text-sm">
           <p>Робототехника: вектор перемещений/суставов и gripper. Симуляторы: аналоговые оси и классы команд. Desktop: координаты/дельты, scroll, классы кнопок и клавиш. Единицы и таблица классов задаются вашим контрактом данных; пресеты можно менять.</p>
           <pre className="overflow-auto rounded bg-muted p-3 text-xs">{JSON.stringify({ image: 'frames/0001.png', instruction: 'move to target', state: config.state_dim ? Array(config.state_dim).fill(0) : [],
             actions: [config.action_type === 'continuous' ? Array(config.action_dim).fill(0) : config.action_type === 'discrete' ? 0 : { continuous: Array(config.action_dim).fill(0), discrete: config.discrete_classes.map(() => 0) }] }, null, 2)}</pre>

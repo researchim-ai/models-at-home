@@ -1,0 +1,14 @@
+{
+  "name": "models-at-home-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Bilingual static website for Models at Home",
+  "scripts": {
+    "dev": "node --watch scripts/serve.mjs",
+    "build": "node scripts/build.mjs",
+    "preview": "node scripts/serve.mjs --production",
+    "check": "node scripts/check.mjs"
+  },
+  "engines": { "node": ">=22.12.0" }
+}

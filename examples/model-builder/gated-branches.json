@@ -1,0 +1,81 @@
+{
+  "model_type": "homellm_blueprint",
+  "hidden_size": 32,
+  "vocab_size": 100,
+  "max_position_embeddings": 64,
+  "auto_project": false,
+  "blocks": [
+    {
+      "id": "embedding",
+      "type": "token_embedding",
+      "params": {
+        "hidden_size": 32,
+        "vocab_size": 100
+      }
+    },
+    {
+      "id": "value",
+      "type": "linear",
+      "inputs": [
+        "embedding"
+      ],
+      "params": {
+        "out_features": 32
+      }
+    },
+    {
+      "id": "gate_projection",
+      "type": "linear",
+      "inputs": [
+        "embedding"
+      ],
+      "params": {
+        "out_features": 32
+      }
+    },
+    {
+      "id": "gate",
+      "type": "activation",
+      "inputs": [
+        "gate_projection"
+      ],
+      "params": {
+        "activation": "sigmoid"
+      }
+    },
+    {
+      "id": "gated",
+      "type": "multiply",
+      "inputs": [
+        "value",
+        "gate"
+      ]
+    },
+    {
+      "id": "concat",
+      "type": "concat",
+      "inputs": [
+        "embedding",
+        "gated"
+      ],
+      "params": {
+        "dim": -1
+      }
+    },
+    {
+      "id": "project",
+      "type": "linear",
+      "params": {
+        "in_features": 64,
+        "out_features": 32
+      }
+    },
+    {
+      "id": "norm",
+      "type": "rmsnorm",
+      "params": {
+        "use_liger": false
+      }
+    }
+  ]
+}

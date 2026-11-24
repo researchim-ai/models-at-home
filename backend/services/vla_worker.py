@@ -19,13 +19,21 @@ def preflight(config):
     def check(name, status, detail):
         report['checks'].append({'name': name, 'status': status, 'detail': str(detail)[:2000]})
     try:
+        if config.get('architecture') == 'blueprint_vla':
+            from backend.services.blueprint_multimodal import check_core
+            check_core(config['model_blueprint_spec'])
+            check('Research backbone', 'pass', f"Snapshot {config['effective_blueprint_hash'][:12]}; {config['vision_tokens']} image patches + byte text → action head")
         data = Demonstrations(config['data_path'], config)
         if max(len(row['actions']) for row in data.rows) < config['action_horizon']:
             raise ValueError('No training targets for the full action horizon; reduce action_horizon or supply full chunks')
-        stats = data.statistics()
+        from backend.services.vla_policy_runtime import standalone,validate_rows,extra_statistics,preprocessor
+        external=standalone(config)
+        if external:validate_rows(data,config)
+        stats = extra_statistics(data,data.statistics(),config) if external else data.statistics()
         check('Demonstrations', 'pass', f'{len(data)} rows; all action/state dimensions and finite values checked')
         if config.get('val_data_path'):
             validation = Demonstrations(config['val_data_path'], config)
+            if external:validate_rows(validation,config)
             check('Validation', 'pass', f'{len(validation)} rows; train-only normalization')
             overlap = {row['image'] for row in data.rows} & {row['image'] for row in validation.rows}
             train_episodes = {str(row['episode_id']) for row in data.rows if row['episode_id'] is not None}
@@ -36,12 +44,18 @@ def preflight(config):
             validation = None
             check('Validation', 'warning', 'Holdout not selected; training loss alone does not measure policy quality')
         cuda = torch.cuda.is_available() and config['device'] != 'cpu'
-        if (config['device'] == 'cuda' or config['architecture'] == 'vlm_action') and not cuda:
+        if (config['device'] == 'cuda' or config['architecture'] in ('vlm_action','openvla')) and not cuda:
             raise ValueError('Selected action model requires CUDA')
         if cuda and config['mixed_precision'] == 'bf16' and not torch.cuda.is_bf16_supported():
             raise ValueError('GPU does not support bf16')
         check('Device', 'pass', torch.cuda.get_device_name(0) if cuda else 'CPU')
         processor = None
+        policy_preprocessor=preprocessor(config) if external else None
+        if external:
+            from backend.services.vla_policies import POLICIES
+            check('Standalone policy','pass',POLICIES[config['architecture']]['objective']+'; configuration/tokenizer only, no full weights loaded')
+            check('Policy contract','warning',POLICIES[config['architecture']]['note'])
+            check('Hardware scope','warning','Preflight does not measure peak VRAM or guarantee that pretrained weights fit; start with a small batch')
         if config['architecture'] == 'vlm_action':
             from transformers import AutoConfig, AutoModelForImageTextToText
             from homellm.training.vlm_common import load_vlm_processor
@@ -60,7 +74,8 @@ def preflight(config):
             for row in dataset.rows[:200]:
                 with Image.open(row['image']) as image:
                     image.verify()
-                batch([row], config, stats, processor)
+                if external:policy_preprocessor.prepare([row],config,stats)
+                else:batch([row], config, stats, processor)
             if len(dataset) > 200:
                 check('Image scope', 'warning', 'Image decoding/processor limited to first 200 rows per dataset')
         first = data.rows[0]
@@ -93,10 +108,13 @@ def predict(payload):
     if metadata['format'] != 'mah_vla_v1':
         raise ValueError('Not a Studio VLA policy export')
     config, stats = metadata['config'], metadata['statistics']
+    from backend.services.vla_policy_runtime import standalone,export_config,denormalize
+    external=standalone(config)
+    if external:config=export_config(config,payload['model_path'])
     cuda = torch.cuda.is_available() and payload.get('device', 'auto') != 'cpu'
     if payload.get('device') == 'cuda' and not cuda:
         raise ValueError('CUDA is unavailable')
-    if config['architecture'] == 'vlm_action' and not cuda:
+    if config['architecture'] in ('vlm_action','openvla') and not cuda:
         raise ValueError('VLM action policy requires CUDA')
     # Restore a local backbone snapshot; LoRA exports retain the original base reference.
     if config['architecture'] == 'vlm_action':
@@ -108,6 +126,7 @@ def predict(payload):
         raise ValueError('Invalid instruction length')
     state = _vector(payload.get('state', []), config['state_dim'], 'state')
     image = ImageOps.exif_transpose(Image.open(BytesIO(base64.b64decode(payload['image_base64'].split(',')[-1], validate=True)))).convert('RGB')
+    config={**config,'device':'cuda' if cuda else 'cpu'}
     model, processor = create(config)
     restore_weights(model, payload['model_path'])
     model.to('cuda' if cuda else 'cpu').eval()
@@ -117,15 +136,16 @@ def predict(payload):
         image.save(path)
         width = config['action_dim'] + (len(config.get('discrete_classes', [])) if config['action_type'] == 'hybrid' else 0)
         empty = np.zeros((1, width), dtype=np.float32) if config['action_type'] != 'discrete' else np.zeros(1, dtype=np.int64)
-        inputs, states, _, _ = batch([{'image': str(path), 'instruction': instruction, 'state': state, 'actions': empty}], config, stats, processor)
+        rows=[{'image':str(path),'instruction':instruction,'state':state,'actions':empty}]
+        inputs,states,_,_=model.prepare(rows,config,stats) if external else batch(rows,config,stats,processor)
         device = next(model.parameters()).device
         inputs = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in inputs.items()}
         from contextlib import nullcontext
         amp = torch.autocast('cuda', dtype=torch.bfloat16 if config['mixed_precision'] == 'bf16' else torch.float16) if cuda and config['mixed_precision'] != 'no' else nullcontext()
         with torch.no_grad(), amp:
-            output = model(inputs, states.to(device)).float()[0]
+            output = (model.predict(inputs) if external else model(inputs, states.to(device))).float()[0]
         if config['action_type'] == 'continuous':
-            actions = output * output.new_tensor(stats['action']['std']) + output.new_tensor(stats['action']['mean'])
+            actions = denormalize(model,output,stats) if external else output * output.new_tensor(stats['action']['std']) + output.new_tensor(stats['action']['mean'])
         elif config['action_type'] == 'hybrid':
             continuous = output[:, :config['action_dim']] * output.new_tensor(stats['action']['std']) + output.new_tensor(stats['action']['mean'])
             discrete, offset = [], config['action_dim']

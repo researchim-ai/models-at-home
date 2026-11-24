@@ -8,6 +8,9 @@ from pathlib import Path
 
 
 def inspect(config: dict) -> dict:
+    if config.get('architecture') == 'blueprint_vlm':
+        from backend.services.blueprint_vlm import preflight
+        return preflight(config)
     report = {'ready': False, 'checks': [], 'sample': None, 'datasets': []}
     def check(name, status, detail):
         report['checks'].append({'name': name, 'status': status, 'detail': str(detail)[:2000]})
@@ -17,7 +20,7 @@ def inspect(config: dict) -> dict:
         from transformers import AutoConfig, AutoModelForImageTextToText
         from homellm.training.vlm_common import load_vlm_processor
         from homellm.training.vlm_data import _extract_image_refs, _build_messages_from_record, load_image
-        from backend.services.vlm_runtime import adapter_source, runtime_types
+        from backend.services.vlm_runtime import adapter_source, runtime_types, record_parts
     except Exception as exc:
         check('Окружение', 'error', exc)
         return report
@@ -120,8 +123,7 @@ def inspect(config: dict) -> dict:
                         record = json.loads(line)
                         if not isinstance(record, dict):
                             raise ValueError('Ожидается JSON object')
-                        refs = _extract_image_refs(record, config.get('vlm_columns'))
-                        messages = _build_messages_from_record(record, 'Describe this image.', config.get('vlm_columns'))
+                        refs, messages = record_parts(record, field_map=config.get('vlm_columns'))
                         if not refs or not messages:
                             raise ValueError('Не найдены изображения или сообщения; проверьте формат/названия колонок')
                         refs = [str((root / ref).resolve()) if not ref.startswith(('http://', 'https://', 'file://')) and not Path(ref).is_absolute() else ref for ref in refs]

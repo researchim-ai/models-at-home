@@ -279,7 +279,7 @@ class Activation(nn.Module):
 
 @register_block("activation", "Standalone activation function")
 def build_activation(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
-    act = params.get("type", "silu")
+    act = params.get("activation", params.get("type", "silu"))
     return Activation(act), in_dim
 
 
@@ -291,12 +291,15 @@ class Repeater(nn.Module):
 
     def forward(self, x, **kwargs):
         for layer in self.layers:
-            x = layer(x, **kwargs)
+            from .recurrent import call_block
+            x = call_block(layer, x, kwargs.get("attention_mask"))
         return x
 
 @register_block("repeater", "Repeat a sub-block N times (e.g. Decoder Layers)")
 def build_repeater(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
     num_repeats = params.get("num_repeats", 1)
+    if isinstance(num_repeats, bool) or not isinstance(num_repeats, int) or not 1 <= num_repeats <= 256:
+        raise ValueError("num_repeats must be an integer in [1, 256]")
     block_type = params.get("block_type")
     block_params = params.get("block_params", {})
     
@@ -325,12 +328,7 @@ class FeedForward(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, activation: str = "silu", dropout: float = 0.0):
         super().__init__()
         act = activation.lower()
-        if act == "gelu":
-            activation_fn = nn.GELU()
-        elif act == "relu":
-            activation_fn = nn.ReLU()
-        else:
-            activation_fn = nn.SiLU()
+        activation_fn = Activation(act)
         self.net = nn.Sequential(
             nn.Linear(hidden_size, intermediate_size),
             activation_fn,
@@ -357,19 +355,20 @@ class CausalAttention(nn.Module):
         self.mha = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, dropout=dropout, batch_first=True)
 
     def forward(self, x, attention_mask=None):
-        # attention_mask expected as (batch, seq) with 1 for keep, 0 for pad
-        attn_mask = None
+        batch, length, width = x.shape
+        heads = self.mha.num_heads
+        q, k, v = F.linear(x, self.mha.in_proj_weight, self.mha.in_proj_bias).chunk(3, dim=-1)
+        q, k, v = [value.view(batch, length, heads, width // heads).transpose(1, 2) for value in (q, k, v)]
+        mask = None
         if attention_mask is not None:
-            bsz, seq = attention_mask.shape
-            causal = torch.triu(torch.ones(seq, seq, device=x.device, dtype=torch.bool), diagonal=1)
-            key_padding = ~attention_mask.bool()
-            attn_mask = causal
-            out, _ = self.mha(x, x, x, attn_mask=attn_mask, key_padding_mask=key_padding)
-        else:
-            seq = x.size(1)
-            causal = torch.triu(torch.ones(seq, seq, device=x.device, dtype=torch.bool), diagonal=1)
-            out, _ = self.mha(x, x, x, attn_mask=causal)
-        return out
+            if attention_mask.shape != (batch, length):
+                raise ValueError('attention_mask must match batch and sequence')
+            causal = torch.ones(length, length, device=x.device, dtype=torch.bool).tril()
+            mask = causal[None, None] & attention_mask[:, None, None, :].bool()
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=mask is None,
+            dropout_p=self.mha.dropout if self.training else 0)
+        out = out.transpose(1, 2).contiguous().view(batch, length, width)
+        return self.mha.out_proj(out)
 
 
 class RotaryEmbedding(nn.Module):
@@ -421,17 +420,20 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None):
     return q_embed, k_embed
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.0, use_rope: bool = False, rope_theta: float = 10000.0):
+    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.0, use_rope: bool = False, rope_theta: float = 10000.0, num_kv_heads: int | None = None):
         super().__init__()
         assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        if self.num_kv_heads < 1 or num_heads % self.num_kv_heads:
+            raise ValueError("num_kv_heads must divide num_heads")
         self.use_rope = use_rope
 
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.dropout_prob = dropout
         
@@ -443,42 +445,27 @@ class CausalSelfAttention(nn.Module):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         if self.use_rope:
              cos, sin = self.rotary_emb(v, seq_len=seq_len)
              q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Flash Attention support (PyTorch 2.0+)
-        # attention_mask: (batch, seq_len) -> we need (batch, 1, seq_len, seq_len) or similar for SDPA?
-        # F.scaled_dot_product_attention handles causal mask internally if is_causal=True
-        
-        # But wait! If we have padding (attention_mask has 0s), we must pass it.
-        # SDPA expects attn_mask to be a boolean mask where True indicates values to be computed (not masked out) ??
-        # Or float mask with -inf. 
-        # Actually SDPA docs: "attn_mask: binary mask where 0 (False) is ignore" IS NOT CORRECT. 
-        # Docs say: "The shape of attn_mask must be broadcastable to the shape of the attention weights."
-        
-        # Simple causal only:
-        is_causal = True
-        
-        # If we have padding mask (attention_mask from tokenizer):
-        # We need to combine causal + padding.
-        # SDPA supports is_causal=True which is efficient. Adding explicit mask disables flash attention in some versions.
-        # Ideally we rely on is_causal=True.
-        
-        # For now, let's use SDPA with is_causal=True.
-        # Warning: if there is padding in the batch (left or right), we ideally need to mask it.
-        # But for simple pretraining with packed sequences or simple causal, is_causal=True is often enough
-        # provided we don't attend to padding tokens which is handled by loss masking usually.
-        # However, for correctness, standard MHA masks padding.
-        
+        if self.num_kv_heads != self.num_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
+        mask = None
+        if attention_mask is not None:
+            if attention_mask.ndim != 2 or attention_mask.shape != (batch_size, seq_len):
+                raise ValueError("Blueprint attention_mask must have shape [batch, sequence]")
+            causal = torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool).tril()
+            mask = causal[None, None] & attention_mask[:, None, None, :].bool()
         out = F.scaled_dot_product_attention(
-            q, k, v, 
-            attn_mask=None, 
-            dropout_p=self.dropout_prob if self.training else 0.0, 
-            is_causal=is_causal
+            q, k, v, attn_mask=mask,
+            dropout_p=self.dropout_prob if self.training else 0.0,
+            is_causal=mask is None,
         )
 
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
@@ -500,7 +487,7 @@ def build_causal_self_attention(params: Dict[str, Any], in_dim: int, auto_projec
     if in_dim % num_heads != 0 and not auto_project:
         raise ValueError(f"in_dim {in_dim} not divisible by num_heads {num_heads}")
         
-    return CausalSelfAttention(in_dim, num_heads, dropout, use_rope, rope_theta), in_dim
+    return CausalSelfAttention(in_dim, num_heads, dropout, use_rope, rope_theta, params.get("num_kv_heads")), in_dim
 
 
 class SwiGLU(nn.Module):
@@ -682,6 +669,8 @@ class LlamaBlock(nn.Module):
         rope_theta: float = 10000.0, 
         eps: float = 1e-5,
         use_liger: bool = True,
+        num_kv_heads: int | None = None,
+        sandwich_norm: bool = False,
     ):
         super().__init__()
         
@@ -694,7 +683,9 @@ class LlamaBlock(nn.Module):
             self.norm1 = RMSNorm(hidden_size, eps=eps)
             self.norm2 = RMSNorm(hidden_size, eps=eps)
         
-        self.attn = CausalSelfAttention(hidden_size, num_heads, dropout=dropout, use_rope=True, rope_theta=rope_theta)
+        self.attn = CausalSelfAttention(hidden_size, num_heads, dropout=dropout, use_rope=True, rope_theta=rope_theta, num_kv_heads=num_kv_heads)
+        self.post_attn_norm = RMSNorm(hidden_size, eps=eps) if sandwich_norm else nn.Identity()
+        self.post_mlp_norm = RMSNorm(hidden_size, eps=eps) if sandwich_norm else nn.Identity()
         
         # Выбираем SwiGLU (Liger или стандартный)
         LigerSwiGLUMLP = get_liger_swiglu() if use_liger else None
@@ -710,12 +701,12 @@ class LlamaBlock(nn.Module):
         # Pre-Norm Residual Attention
         h = self.norm1(x)
         h = self.attn(h, attention_mask=attention_mask)
-        x = x + h
+        x = self.post_attn_norm(x + h)
         
         # Pre-Norm Residual MLP
         h = self.norm2(x)
         h = self.mlp(h)
-        x = x + h
+        x = self.post_mlp_norm(x + h)
         return x
 
 @register_block("llama_block", "Single Llama Transformer Block (автоматически использует Liger)")
@@ -729,7 +720,7 @@ def build_llama_block(params: Dict[str, Any], in_dim: int, auto_project: bool) -
     eps = params.get("eps", 1e-5)
     use_liger = params.get("use_liger", True)  # По умолчанию используем Liger
     
-    return LlamaBlock(in_dim, num_heads, intermediate_size, dropout, rope_theta, eps, use_liger), in_dim
+    return LlamaBlock(in_dim, num_heads, intermediate_size, dropout, rope_theta, eps, use_liger, params.get("num_kv_heads"), params.get("sandwich_norm", False)), in_dim
 
 
 @register_block("liger_llama_block", "LlamaBlock с Liger оптимизациями (явно)")
@@ -742,7 +733,7 @@ def build_liger_llama_block(params: Dict[str, Any], in_dim: int, auto_project: b
     rope_theta = params.get("rope_theta", 10000.0)
     eps = params.get("eps", 1e-5)
     
-    return LlamaBlock(in_dim, num_heads, intermediate_size, dropout, rope_theta, eps, use_liger=True), in_dim
+    return LlamaBlock(in_dim, num_heads, intermediate_size, dropout, rope_theta, eps, use_liger=True, num_kv_heads=params.get("num_kv_heads"), sandwich_norm=params.get("sandwich_norm", False)), in_dim
 
 
 
@@ -806,11 +797,10 @@ def build_dropout(params: Dict[str, Any], in_dim: int, auto_project: bool) -> Bu
 
 @register_block("linear", "Linear projection")
 def build_linear(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
-    out_dim = params["out_features"]
-    proj = _maybe_project(in_dim, out_dim, auto_project)
-    if proj is not None:
-        return proj, out_dim
-    return nn.Identity(), out_dim
+    out_dim = params.get("out_features", in_dim)
+    if params.get("in_features", in_dim) != in_dim:
+        raise ValueError("Linear in_features does not match its input")
+    return nn.Linear(in_dim, out_dim, bias=params.get("bias", False)), out_dim
 
 
 class Residual(nn.Module):
@@ -820,7 +810,8 @@ class Residual(nn.Module):
 
     def forward(self, x, **kwargs):
         # We assume inner module returns same shape
-        return x + self.inner(x, **kwargs)
+        from .recurrent import call_block
+        return x + call_block(self.inner, x, kwargs.get("attention_mask"))
 
 @register_block("residual_mlp", "Residual wrapper around MLP")
 def build_residual_mlp(params: Dict[str, Any], in_dim: int, auto_project: bool) -> BuildResult:
@@ -917,3 +908,7 @@ def get_block(name: str) -> BlockBuilder:
     if name not in BLOCK_REGISTRY:
         raise KeyError(f"Block '{name}' is not registered. Known: {list(BLOCK_REGISTRY.keys())}")
     return BLOCK_REGISTRY[name]
+
+
+# Register containers after the leaf builders, avoiding import-time recursion.
+from . import recurrent  # noqa: E402,F401

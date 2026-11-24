@@ -16,6 +16,11 @@ def main():
     try:
         from backend.services.vlm_runtime import configure
         config = json.loads(Path(args.config).read_text())
+        if config.get('architecture') == 'blueprint_vlm':
+            from backend.services.blueprint_vlm import train
+            from homellm.training.vlm_common import MetricsLogger
+            train(config, MetricsLogger(Path(args.metrics)))
+            return
         if config.get('training_backend') == 'unsloth':
             import unsloth  # Must patch Transformers/TRL before either is imported.
         configure(config)

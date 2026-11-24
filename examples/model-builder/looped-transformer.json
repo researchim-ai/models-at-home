@@ -1,0 +1,79 @@
+{
+  "model_type": "homellm_blueprint",
+  "hidden_size": 32,
+  "vocab_size": 100,
+  "max_position_embeddings": 64,
+  "auto_project": false,
+  "blocks": [
+    {
+      "id": "embedding",
+      "type": "token_embedding",
+      "params": {
+        "hidden_size": 32,
+        "vocab_size": 100
+      }
+    },
+    {
+      "id": "prelude",
+      "type": "llama_block",
+      "params": {
+        "num_heads": 4,
+        "num_kv_heads": 2,
+        "intermediate_size": 128,
+        "use_liger": false,
+        "sandwich_norm": true
+      }
+    },
+    {
+      "id": "core",
+      "type": "loop",
+      "params": {
+        "iterations": 4,
+        "eval_iterations": 4,
+        "min_iterations": 1,
+        "random_depth": false,
+        "gradient_steps": 0,
+        "checkpoint": false,
+        "input_injection": "concat",
+        "state_init": "zeros",
+        "step_embedding": "none",
+        "body": [
+          {
+            "type": "llama_block",
+            "params": {
+              "num_heads": 4,
+              "num_kv_heads": 2,
+              "intermediate_size": 128,
+              "use_liger": false,
+              "sandwich_norm": true
+            }
+          },
+          {
+            "type": "rmsnorm",
+            "params": {
+              "use_liger": false
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "coda",
+      "type": "llama_block",
+      "params": {
+        "num_heads": 4,
+        "num_kv_heads": 2,
+        "intermediate_size": 128,
+        "use_liger": false,
+        "sandwich_norm": true
+      }
+    },
+    {
+      "id": "norm",
+      "type": "rmsnorm",
+      "params": {
+        "use_liger": false
+      }
+    }
+  ]
+}

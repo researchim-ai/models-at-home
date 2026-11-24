@@ -33,10 +33,18 @@ _vlm_state: dict = {"model": None, "processor": None, "path": None}
 
 class VLMTrainingRequest(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
+    research_diagnostics: bool = False
     stage: Literal["vlm_pretrain", "vlm_sft", "vlm_grpo"] = "vlm_sft"
     model_path: str = ""
     dataset_path: str = ""
     experiment_name: str = ""
+    architecture: Literal['hf_vlm', 'blueprint_vlm'] = 'hf_vlm'
+    model_blueprint: str = ''
+    model_blueprint_spec: dict | None = None
+    source_blueprint_spec: dict | None = None
+    vision_image_size: int = Field(default=32, ge=16, le=256)
+    vision_patch_size: int = Field(default=8, ge=2, le=32)
+    device: Literal['auto', 'cpu', 'cuda'] = 'auto'
     resume_from_checkpoint: str = ""
     resumed_from_run: str = ""
     batch_size: int = Field(default=2, gt=0)
@@ -119,7 +127,7 @@ def start_vlm_training(req: VLMTrainingRequest):
     config = req.model_dump()
     try:
         _normalize_and_validate_vlm_config(config)
-        worker_python = vlm_python()
+        worker_python = sys.executable if config.get('architecture') == 'blueprint_vlm' else vlm_python()
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 
@@ -168,7 +176,7 @@ def preflight_vlm(req: VLMTrainingRequest):
     env.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
     env['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, req.gpu_ids)) if req.gpu_ids else env.get('CUDA_VISIBLE_DEVICES', '0').split(',')[0]
     try:
-        result = subprocess.run([vlm_python(), str(Path(__file__).parent.parent / 'services' / 'vlm_preflight_worker.py')],
+        result = subprocess.run([sys.executable if config.get('architecture') == 'blueprint_vlm' else vlm_python(), str(Path(__file__).parent.parent / 'services' / 'vlm_preflight_worker.py')],
             input=json.dumps(config), text=True, capture_output=True, cwd=PROJECT_ROOT, env=env, timeout=90)
         if result.returncode:
             return failed(result.stderr[-2000:] or f'Preflight worker exited: {result.returncode}')
@@ -268,6 +276,18 @@ def load_vlm(req: VLMLoadRequest):
     with _model_lock:
         global _vlm_state
         try:
+            native_source = Path(req.model_path).expanduser()
+            if not native_source.is_absolute():
+                native_source = PROJECT_ROOT / native_source
+            if (native_source / 'blueprint_vlm.json').is_file():
+                import torch
+                from backend.services.blueprint_multimodal import load_vlm as load_native
+                previous = _vlm_state.get('worker')
+                if previous:
+                    previous.close()
+                model = load_native(native_source, 'cuda' if torch.cuda.is_available() else 'cpu')
+                _vlm_state = {'model': model, 'processor': None, 'path': str(native_source), 'research_blueprint': True}
+                return {'success': True, 'architecture': 'blueprint_vlm'}
             python = vlm_python()
             if os.path.abspath(python) != os.path.abspath(sys.executable):
                 from backend.services.vlm_inference import InferenceWorker
@@ -353,6 +373,13 @@ def generate_vlm(req: VLMGenerateRequest):
                 raise HTTPException(400, 'Invalid base64 image') from exc
 
             model = _vlm_state["model"]
+            if _vlm_state.get('research_blueprint'):
+                import numpy as np
+                from PIL import ImageOps
+                size = model.config['vision_image_size']
+                image = ImageOps.exif_transpose(image).resize((size, size))
+                tensor = torch.from_numpy(np.asarray(image, dtype=np.float32).copy() / 255).permute(2, 0, 1).unsqueeze(0)
+                return {'text': model.generate_text(tensor, req.prompt, req.max_tokens, req.temperature)}
             processor = _vlm_state["processor"]
 
             messages = [{
@@ -447,6 +474,21 @@ def _normalize_and_validate_vlm_config(config: dict) -> None:
         config['assistant_only_loss'] = config.get('stage') != 'vlm_pretrain'
     if config.get('freeze_vision_tower') is None:
         config['freeze_vision_tower'] = config.get('stage') == 'vlm_pretrain'
+
+    if config.get('architecture') == 'blueprint_vlm':
+        from backend.services.blueprint_multimodal import normalize
+        config['tuning_method'] = config.get('tuning_method') or ('lora' if config.get('use_lora', True) else 'full')
+        normalize(config, PROJECT_ROOT, task='vlm')
+        config['freeze_vision_tower'] = False
+        config['freeze_projector'] = False
+        config['freeze_language_model'] = False
+        config['use_lora'] = False
+        config['model_path'] = config.get('model_path') or 'Research Lab blueprint'
+        if config.get('resume_from_checkpoint'):
+            from backend.services.blueprint_vlm import complete_checkpoint
+            if not complete_checkpoint(config['resume_from_checkpoint']):
+                raise ValueError('Resume requires a complete Research VLM optimizer checkpoint')
+        return
 
     model_path = config.get("base_model_path") or config.get("model_path")
     if not model_path:

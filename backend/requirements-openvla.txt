@@ -1,0 +1,14 @@
+# Original OpenVLA remote code requires this isolated Transformers API.
+-r requirements.txt
+torch==2.9.1
+torchvision==0.24.1
+transformers==4.40.1
+tokenizers==0.19.1
+peft==0.11.1
+accelerate==0.34.2
+timm==0.9.10
+huggingface-hub>=0.23,<1
+sentencepiece==0.2.1
+safetensors>=0.4.3,<1
+Pillow>=10,<14
+numpy>=1.26,<2.3

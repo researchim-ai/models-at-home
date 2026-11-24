@@ -1,3 +1,7 @@
+import { RunResearchSignals } from '@/components/builder/RunResearchSignals'
+import { useLabStore } from '@/stores/labStore'
+import { BlueprintTrainingPanel } from '@/components/builder/BlueprintTrainingPanel'
+import { useNavigate } from 'react-router-dom'
 import { WorkspaceIntro } from '@/components/layout/WorkspaceIntro'
 import { useState, useRef, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
@@ -356,6 +360,7 @@ function VLMLaunchTab({ config }: { config: Record<string, unknown> }) {
             <span>Loss {metrics?.loss?.toFixed(5) ?? '—'}</span>
           </div>
           {metrics?.error && <pre role="alert" className="max-h-48 overflow-auto whitespace-pre-wrap text-xs text-destructive">{metrics.error}</pre>}
+          <RunResearchSignals signals={metrics?.research_signals} />
           {metrics?.training_warning && <p role="status" className="text-xs text-warning">{metrics.training_warning}</p>}
           {config.stage === 'vlm_grpo' && <p className="text-xs text-muted-foreground">
             Reward: {metrics?.reward ?? '—'} · KL: {metrics?.kl_divergence ?? '—'}
@@ -632,13 +637,19 @@ function VLMHistoryTab() {
 
 export function VLMStudio() {
   const { t } = useTranslation()
+  const handoff=useLabStore(state=>state.handoffs.vlm)
+  const navigate=useNavigate()
+  const [device,setDevice]=useState('auto')
+  const [researchDiagnostics,setResearchDiagnostics]=useState(true)
+  const [visionSize,setVisionSize]=useState(handoff?.profile.vision_image_size??32)
+  const [patchSize,setPatchSize]=useState(handoff?.profile.vision_patch_size??8)
   const [activeTab, setActiveTab] = useState('launch')
 
   const [stage, setStage] = useState('vlm_sft')
   const [model, setModel] = useState('')
   const [datasetPath, setDatasetPath] = useState('')
   const [batchSize, setBatchSize] = useState(2)
-  const [lr, setLr] = useState(2e-5)
+  const [lr, setLr] = useState(handoff?3e-4:2e-5)
   const [maxSteps, setMaxSteps] = useState(500)
   const [epochs] = useState(1)
   const [backend, setBackend] = useState('transformers')
@@ -647,11 +658,11 @@ export function VLMStudio() {
   const [completionTokens, setCompletionTokens] = useState(256)
   const [reward, setReward] = useState('exact_match')
   const [experimentName] = useState(() => `vlm_${Date.now().toString(36)}`)
-  const [tuningMethod, setTuningMethod] = useState('lora')
+  const [tuningMethod, setTuningMethod] = useState(handoff?'full':'lora')
   const [gpuId, setGpuId] = useState(0)
-  const [seqLen, setSeqLen] = useState(2048)
+  const [seqLen, setSeqLen] = useState(Number(handoff?.blueprint.max_position_embeddings??2048))
   const [maxPixels, setMaxPixels] = useState<number | undefined>(undefined)
-  const [precision, setPrecision] = useState('bf16')
+  const [precision, setPrecision] = useState(handoff?'no':'bf16')
 
   const config = {
     stage,
@@ -673,11 +684,17 @@ export function VLMStudio() {
     max_pixels: maxPixels,
     mixed_precision: precision,
     experiment_name: experimentName,
+    ...(handoff?{architecture:'blueprint_vlm',model_blueprint_spec:handoff.blueprint,source_blueprint_spec:handoff.blueprint,model_blueprint:handoff.path,model_path:handoff.path,
+      research_diagnostics:researchDiagnostics,stage:'vlm_sft',training_backend:'transformers',tuning_method:'full',use_lora:false,freeze_vision_tower:false,
+      device,vision_image_size:visionSize,vision_patch_size:patchSize,warmup_steps:0,save_every:Math.min(100,maxSteps)}:{}),
   }
 
   return (
     <div className="flex h-full">
-      <VLMConfigSidebar
+      {handoff?<BlueprintTrainingPanel handoff={handoff} settings={{dataset_path:datasetPath,batch_size:batchSize,learning_rate:lr,max_steps:maxSteps,mixed_precision:precision,device,vision_image_size:visionSize,vision_patch_size:patchSize,research_diagnostics:researchDiagnostics}}
+        patch={value=>{if(value.research_diagnostics!==undefined)setResearchDiagnostics(value.research_diagnostics);if(value.dataset_path!==undefined)setDatasetPath(value.dataset_path);if(value.batch_size!==undefined)setBatchSize(value.batch_size);if(value.learning_rate!==undefined)setLr(value.learning_rate);if(value.max_steps!==undefined)setMaxSteps(value.max_steps);if(value.mixed_precision!==undefined)setPrecision(value.mixed_precision);if(value.device!==undefined)setDevice(value.device);if(value.vision_image_size!==undefined)setVisionSize(value.vision_image_size);if(value.vision_patch_size!==undefined)setPatchSize(value.vision_patch_size)}}
+        example={async()=>{try{const data=await api.researchExamples();setDatasetPath(data.train);setMaxSteps(20)}catch(e){toast.error(String(e))}}}
+        detach={()=>{useLabStore.getState().clearHandoff('vlm');setModel('');setTuningMethod('lora');setPrecision('bf16');navigate('/vlm')}} />:<VLMConfigSidebar
         stage={stage} setStage={setStage}
         model={model} setModel={setModel}
           datasetPath={datasetPath} setDatasetPath={setDatasetPath}
@@ -689,7 +706,7 @@ export function VLMStudio() {
         reward={reward} setReward={setReward}
         tuningMethod={tuningMethod} setTuningMethod={setTuningMethod} gpuId={gpuId} setGpuId={setGpuId}
         seqLen={seqLen} setSeqLen={setSeqLen} maxPixels={maxPixels} setMaxPixels={setMaxPixels} precision={precision} setPrecision={setPrecision}
-      />
+      />}
       <div className="min-w-0 flex-1 p-6 overflow-auto">
         <WorkspaceIntro space="vlm" />
         <Tabs value={activeTab} onValueChange={setActiveTab}>

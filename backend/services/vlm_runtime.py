@@ -48,6 +48,19 @@ def load_model(source, config, device):
     return model
 
 
+def record_parts(record, prompt='Describe this image.', field_map=None):
+    """Use identical column mapping in preflight and training across runtime versions."""
+    import inspect
+    from homellm.training.vlm_data import _extract_image_refs, _build_messages_from_record
+    mapped = dict(record)
+    for key, source in (field_map or {}).items():
+        if isinstance(source, str) and source in record:
+            mapped[key] = record[source]
+    refs = _extract_image_refs(record, field_map) if len(inspect.signature(_extract_image_refs).parameters) > 1 else _extract_image_refs(mapped)
+    messages = _build_messages_from_record(record, prompt, field_map) if len(inspect.signature(_build_messages_from_record).parameters) > 2 else _build_messages_from_record(mapped, prompt)
+    return refs, messages
+
+
 def runtime_types(config=None):
     config = config or {}
     import torch
@@ -63,8 +76,7 @@ def runtime_types(config=None):
                         continue
                     try:
                         record = json.loads(line)
-                        refs = _extract_image_refs(record, self.field_map)
-                        messages = _build_messages_from_record(record, self.prompt_for_caption, self.field_map)
+                        refs, messages = record_parts(record, self.prompt_for_caption, getattr(self, 'field_map', config.get('vlm_columns')))
                         if not refs or not messages:
                             raise ValueError('Missing image references or conversation')
                         self.examples.append({'messages': messages, 'image_refs': refs,
@@ -81,10 +93,29 @@ def runtime_types(config=None):
 
     class Collator(VLMDataCollator):
         def _load_example_images(self, example):
-            images = super()._load_example_images(example)
+            parent_loader = getattr(super(), '_load_example_images', None)
+            if parent_loader:
+                images = parent_loader(example)
+            else:
+                from homellm.training.vlm_data import load_image
+                images = [load_image(ref, self.base_dir) for ref in example['image_refs']]
+                images = [image for image in images if image is not None]
             if len(images) != len(example['image_refs']):
                 raise ValueError('An image failed to load; refusing to change the multimodal example silently')
             return images
+
+        @staticmethod
+        def _images_arg(images):
+            return images[0] if len(images) == 1 else images
+
+        def _build_inputs(self, prepared):
+            if not prepared:
+                raise ValueError('Empty VLM batch')
+            # The legacy base collator expects raw examples and truncates them.
+            # This adapter owns preparation and checks expanded image tokens itself.
+            return self.processor(text=[text for _, _, text in prepared],
+                images=[self._images_arg(images) for _, images, _ in prepared],
+                return_tensors='pt', padding=True, truncation=False)
 
         def _collect_special_token_ids(self):
             tokenizer = self.processor.tokenizer

@@ -7,9 +7,11 @@ import random
 
 def signature(config):
     keys = ('architecture', 'training_backend', 'model_path', 'action_type', 'domain', 'action_names', 'discrete_names', 'discrete_classes', 'discrete_labels', 'action_dim', 'action_horizon', 'state_dim',
+            'model_blueprint_spec', 'vision_image_size', 'vision_patch_size', 'byte_tokenizer_version',
             'hidden_dim', 'image_size', 'vision_grid', 'max_instruction_bytes', 'tuning_method', 'mixed_precision',
             'batch_size', 'gradient_accumulation', 'learning_rate', 'warmup_steps', 'seq_len',
-            'freeze_vision_tower', 'lora_r', 'lora_alpha', 'max_pixels')
+            'policy_camera_key', 'policy_revision', 'policy_train_expert_only', 'act_pretrained_backbone', 'act_dim_model', 'act_encoder_layers',
+            'freeze_vision_tower', 'gradient_checkpointing', 'lora_r', 'lora_alpha', 'lora_dropout', 'lora_target_modules', 'lora_modules_to_save', 'min_pixels', 'max_pixels')
     payload = {key: config.get(key) for key in keys}
     for key in ('data_path', 'val_data_path'):
         if config.get(key):
@@ -53,7 +55,7 @@ def train(config, metrics):
     cuda = config['device'] != 'cpu' and torch.cuda.is_available()
     if config['device'] == 'cuda' and not cuda:
         raise ValueError('CUDA is unavailable')
-    if config['architecture'] == 'vlm_action' and not cuda:
+    if config['architecture'] in ('vlm_action','openvla') and not cuda:
         raise ValueError('VLM action fine-tuning requires CUDA')
     device = 'cuda' if cuda else 'cpu'
     if cuda and config['mixed_precision'] == 'bf16' and not torch.cuda.is_bf16_supported():
@@ -64,7 +66,12 @@ def train(config, metrics):
     validation = Demonstrations(config['val_data_path'], config) if config.get('val_data_path') else None
     if max(len(row['actions']) for row in data.rows) < config['action_horizon']:
         raise ValueError('No training targets for the full action horizon; reduce action_horizon or supply full chunks')
-    stats, fingerprint = data.statistics(), signature(config)
+    from backend.services.vla_policy_runtime import standalone,validate_rows,extra_statistics
+    external=standalone(config)
+    if external:
+        validate_rows(data,config)
+        if validation:validate_rows(validation,config)
+    stats, fingerprint = extra_statistics(data,data.statistics(),config) if external else data.statistics(), signature(config)
     metrics.update(status='loading_model')
     model, processor = create(config)
     model.to(device)
@@ -72,6 +79,8 @@ def train(config, metrics):
         for parameter in model.parameters():
             if parameter.requires_grad:
                 parameter.data = parameter.data.float()
+    from backend.services.research_signals import RuntimeSignals
+    observer=RuntimeSignals(model.research_core.graph,config['model_blueprint_spec']) if config.get('research_diagnostics') and hasattr(model,'research_core') else None
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=config['learning_rate'])
     def schedule(step):
         if step < config['warmup_steps']:
@@ -107,7 +116,7 @@ def train(config, metrics):
     def amp():
         return torch.autocast('cuda', dtype=torch.bfloat16 if config['mixed_precision'] == 'bf16' else torch.float16) if cuda and config['mixed_precision'] != 'no' else nullcontext()
     def prepare(rows):
-        inputs, states, targets, mask = batch(rows, config, stats, processor)
+        inputs, states, targets, mask = model.prepare(rows,config,stats) if external else batch(rows, config, stats, processor)
         inputs = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in inputs.items()}
         return inputs, states.to(device), targets.to(device), mask.to(device)
     def checkpoint(directory, final=False):
@@ -125,6 +134,7 @@ def train(config, metrics):
                    trainable_params=sum(p.numel() for p in model.parameters() if p.requires_grad))
     while step < config['max_steps']:
         model.train()
+        if observer: observer.begin(step+1)
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.
         for _ in range(config['gradient_accumulation']):
@@ -137,8 +147,15 @@ def train(config, metrics):
                 cursor += 1
             inputs, states, targets, mask = prepare(rows)
             with amp():
-                predictions = model(inputs, states)
-                loss = action_loss(predictions, targets, mask, config)
+                if external:loss,_ = model.loss(inputs)
+                else:
+                    predictions = model(inputs, states)
+                    loss = action_loss(predictions, targets, mask, config)
+                if config.get('architecture') == 'blueprint_vla':
+                    from homellm.models.blocks.recurrent import auxiliary_losses
+                    aux = auxiliary_losses(model.research_core.graph)
+                    if aux:
+                        loss = loss + .01 * torch.stack(aux).sum()
             if not torch.isfinite(loss):
                 raise ValueError('Action loss is not finite')
             scaler.scale(loss / config['gradient_accumulation']).backward()
@@ -147,6 +164,9 @@ def train(config, metrics):
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
         if not torch.isfinite(norm):
             raise ValueError('Action gradients are not finite')
+        if observer:
+            signals=observer.collect()
+            if signals: metrics.update(research_signals=signals)
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
@@ -161,13 +181,20 @@ def train(config, metrics):
                 for offset in range(0, len(validation), config['batch_size']):
                     inputs, states, targets, mask = prepare(validation.rows[offset:offset + config['batch_size']])
                     with amp():
-                        predictions = model(inputs, states)
-                        loss = action_loss(predictions, targets, mask, config)
+                        if external:
+                            loss,_ = model.loss(inputs)
+                            predictions=model.predict(inputs)
+                        else:
+                            predictions = model(inputs, states)
+                            loss = action_loss(predictions, targets, mask, config)
                     count = float(mask.sum())
                     losses += float(loss) * count
                     valid_count += count
                     if config['action_type'] != 'discrete':
-                        error = (predictions[..., :config['action_dim']].float() - targets[..., :config['action_dim']]).abs() * predictions.new_tensor(stats['action']['std'])
+                        if external:
+                            from backend.services.vla_policy_runtime import denormalize
+                            error=(denormalize(model,predictions.float(),stats)-denormalize(model,targets,stats)).abs()
+                        else:error = (predictions[..., :config['action_dim']].float() - targets[..., :config['action_dim']]).abs() * predictions.new_tensor(stats['action']['std'])
                         total_error += float((error.mean(-1) * mask).sum())
                     else:
                         total_error += float(((predictions.argmax(-1) == targets) * mask).sum())
@@ -186,4 +213,5 @@ def train(config, metrics):
             checkpoint(Path(config['output_dir']) / f'checkpoint-{step}')
     final = Path(config['output_dir']) / 'final_model'
     checkpoint(final, final=True)
+    if observer: observer.close()
     metrics.update(status='completed', final_model_dir=str(final))

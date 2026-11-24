@@ -1,0 +1,9 @@
+# Install into .venv-lerobot, separate from LLM/VLM runtime. Select CPU/CUDA torch wheels first.
+-r requirements.txt
+torch==2.9.1
+torchvision==0.24.1
+lerobot[dataset,smolvla,pi]==0.7.0
+transformers==5.22.0
+safetensors==0.8.0
+Pillow>=10,<14
+numpy>=2,<2.3

@@ -1,3 +1,5 @@
+import type { LabAnalysis, LabProfile, ProbeResult } from '@/lib/research'
+import type { BlueprintAnalysis, BlockDefinition } from '@/lib/builder'
 import { consumeSSE } from './sse'
 
 async function resolvePort(): Promise<number> {
@@ -205,6 +207,11 @@ export const api = {
     request<{ blueprint: Record<string, unknown> }>('/blueprints/validate', {
       method: 'POST', body: JSON.stringify(blueprint),
     }),
+  researchExamples: () => request<{train:string;validation:string}>('/blueprints/research/examples'),
+  researchAnalyze: (blueprint: Record<string, unknown>, profile: LabProfile) => request<LabAnalysis>('/blueprints/research/analyze', { method:'POST', body:JSON.stringify({blueprint,profile}) }),
+  probeBlueprint: (blueprint: Record<string, unknown>, profile: LabProfile) => request<ProbeResult>('/blueprints/research/probe', { method:'POST', body:JSON.stringify({blueprint,profile}) }),
+  analyzeBlueprint: (blueprint: Record<string, unknown>) =>
+    request<BlueprintAnalysis>('/blueprints/analyze', { method: 'POST', body: JSON.stringify(blueprint) }),
   listBlueprints: () =>
     request<{ blueprints: Array<{ name: string; path: string; hidden_size: number; vocab_size: number; num_blocks: number; modified_at: string }> }>('/blueprints/list'),
   getBlueprint: (name: string) =>
@@ -217,7 +224,7 @@ export const api = {
   deleteBlueprint: (name: string) =>
     request<{ success: boolean }>(`/blueprints/delete/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   listBlocks: () =>
-    request<{ blocks: Array<{ type: string; description: string }> }>('/blueprints/blocks'),
+    request<{ blocks: BlockDefinition[] }>('/blueprints/blocks'),
 
   // Notebooks
   listNotebooks: () =>

@@ -31,20 +31,10 @@ class StudioBlueprintForCausalLM(BlueprintForCausalLM):
     def __init__(self, config):
         super().__init__(config)
         if getattr(config, 'studio_graph_version', 0) >= 1:
-            widths = {}
-            previous_width = config.hidden_size
             for block in self._blueprint.blocks:
-                width = widths.get(block.inputs[0], previous_width) if block.inputs else previous_width
-                module = self.model.modules_dict[block.id]
                 if block.type == 'positional_embedding':
+                    module = self.model.modules_dict[block.id]
                     self.model.modules_dict[block.id] = StudioPositionalEmbedding(module.embed)
-                if block.type in ('token_embedding', 'positional_embedding'):
-                    width = block.params.get('hidden_size', config.hidden_size)
-                if block.type == 'linear':
-                    output = block.params.get('out_features', width)
-                    self.model.modules_dict[block.id] = nn.Linear(width, output, bias=block.params.get('bias', False))
-                    width = output
-                widths[block.id] = previous_width = width
 
     def get_input_embeddings(self):
         for block in self._blueprint.blocks:
@@ -61,8 +51,8 @@ class StudioBlueprintForCausalLM(BlueprintForCausalLM):
     def gradient_checkpointing_disable(self):
         self._studio_checkpointing = False
 
-    def forward(self, input_ids, attention_mask=None, labels=None, **kwargs):
+    def forward(self, input_ids, attention_mask=None, labels=None, loop_iterations=None, **kwargs):
         if self.training and getattr(self, '_studio_checkpointing', False):
             from torch.utils.checkpoint import checkpoint
-            return checkpoint(super().forward, input_ids, attention_mask, labels, use_reentrant=False, **kwargs)
-        return super().forward(input_ids, attention_mask, labels, **kwargs)
+            return checkpoint(super().forward, input_ids, attention_mask, labels, use_reentrant=False, loop_iterations=loop_iterations, **kwargs)
+        return super().forward(input_ids, attention_mask, labels, loop_iterations=loop_iterations, **kwargs)

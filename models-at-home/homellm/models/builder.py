@@ -13,13 +13,14 @@ from homellm.models.blocks import get_block
 class BlueprintGraphModule(nn.Module):
     """Executes blocks as a DAG based on input dependencies."""
 
-    def __init__(self, modules: Dict[str, nn.Module], inputs_map: Dict[str, List[str]], ordering: List[str]):
+    def __init__(self, modules: Dict[str, nn.Module], inputs_map: Dict[str, List[str]], ordering: List[str], block_types=None):
         super().__init__()
         self.modules_dict = nn.ModuleDict(modules)
         self.inputs_map = inputs_map
         self.ordering = ordering
+        self.block_types = block_types or {}
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, loop_iterations: int | None = None, inputs_embeds: torch.Tensor | None = None) -> torch.Tensor:
         # State holds outputs of all blocks: {block_id: tensor}
         # Initial state has 'input' pointing to input_ids (or we could have a dedicated InputBlock)
         state = {}
@@ -57,9 +58,13 @@ class BlueprintGraphModule(nn.Module):
             if hasattr(module, "forward"):
                 module_cls = module.__class__.__name__
                 
-                if module_cls == "PositionalEmbedding":
+                if inputs_embeds is not None and self.block_types.get(block_id) == 'token_embedding':
+                    if inputs_embeds.shape[:2] != input_ids.shape or inputs_embeds.shape[-1] != module.embedding_dim:
+                        raise ValueError('inputs_embeds does not match the blueprint token embedding shape')
+                    out = inputs_embeds
+                elif module_cls == "PositionalEmbedding":
                     out = module(input_ids=input_ids, attention_mask=attention_mask)
-                elif module_cls == "Add":
+                elif module_cls in ("Add", "Multiply", "Concat"):
                     if len(args) < 2:
                         # Try to find 2 previous if sequential
                         # But in graph mode, args are explicit.
@@ -73,6 +78,8 @@ class BlueprintGraphModule(nn.Module):
                     # module(a, b) calls forward(a, b) -> sum((a, b))
                     out = module(*args)
                     
+                elif module_cls == "LoopedBlock":
+                    out = module(args[0], attention_mask=attention_mask, loop_iterations=loop_iterations)
                 elif module_cls == "InlineCodeOp":
                     # Pass context
                     # If sequential (args has 1 item), use it.
@@ -146,6 +153,8 @@ def build_model_from_blueprint(bp: Blueprint) -> Tuple[nn.Module, int]:
         # Build
         module, out_dim = builder(params, in_dim, bp.auto_project)
         
+        if block.type == "concat":
+            out_dim = sum(hidden_sizes[parent] for parent in block.inputs)
         modules[block.id] = module
         inputs_map[block.id] = block.inputs
         ordering.append(block.id)
@@ -153,5 +162,5 @@ def build_model_from_blueprint(bp: Blueprint) -> Tuple[nn.Module, int]:
         hidden_sizes[block.id] = out_dim
         current_dim = out_dim
 
-    model = BlueprintGraphModule(modules, inputs_map, ordering)
+    model = BlueprintGraphModule(modules, inputs_map, ordering, {block.id: block.type for block in bp.blocks})
     return model, current_dim

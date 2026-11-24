@@ -96,7 +96,7 @@ def image_tensor(path, size):
     return torch.from_numpy(array).permute(2, 0, 1)
 
 
-def batch(rows, config, stats, processor=None):
+def normalized_targets(rows, config, stats):
     import torch
     states = torch.tensor(np.stack([row['state'] for row in rows]))
     states = (states - states.new_tensor(stats['state']['mean'])) / states.new_tensor(stats['state']['std'])
@@ -112,6 +112,12 @@ def batch(rows, config, stats, processor=None):
             actions[:, :config['action_dim']] = (actions[:, :config['action_dim']] - actions.new_tensor(stats['action']['mean'])) / actions.new_tensor(stats['action']['std'])
         targets[index, :count] = actions
         mask[index, :count] = True
+    return states, targets, mask
+
+
+def batch(rows, config, stats, processor=None):
+    import torch
+    states, targets, mask = normalized_targets(rows, config, stats)
     if processor is None:
         inputs = {'images': torch.stack([image_tensor(row['image'], config['image_size']) for row in rows]),
                   'instructions': [row['instruction'] for row in rows]}

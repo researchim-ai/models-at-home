@@ -1203,6 +1203,12 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
         # ВАЖНО: Синхронизируем global_step с starting_step после resume
         # Это критично для правильной работы LR scheduler и checkpointing
         global_step = starting_step
+        research_observer = None
+        if config.get('research_diagnostics') and accelerator.is_main_process:
+            unwrapped = accelerator.unwrap_model(model)
+            if hasattr(unwrapped, '_blueprint'):
+                from backend.services.research_signals import RuntimeSignals
+                research_observer = RuntimeSignals(unwrapped.model, unwrapped._blueprint.model_dump())
         # ВАЖНО: ресинхронизируем scheduler к update-step индексу.
         # Это лечит ситуацию, когда scheduler в чекпоинте был "прокручен" по micro-step и LR улетает в ~0.
         if starting_step > 0 and bool(config.get("scheduler_resync_on_resume", True)):
@@ -1388,6 +1394,7 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                         sample_hash = hash(batch["input_ids"][0].cpu().numpy().tobytes())
                         debug_sample_ids.append((global_step, accelerator.process_index, sample_hash))
                 
+                if research_observer: research_observer.begin(global_step+1)
                 with accelerator.accumulate(model):
                     if is_streaming_sharded:
                         batch = {k: (v.to(accelerator.device) if hasattr(v, "to") else v) for k, v in batch.items()}
@@ -1455,6 +1462,9 @@ def run_training(config: Dict[str, Any], metrics_path: Path):
                         if max_grad_norm > 0:
                             accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                         
+                        if research_observer:
+                            signals=research_observer.collect('post_clip' if max_grad_norm>0 else 'trainer_defined_before_optimizer')
+                            if signals: metrics.update(research_signals=signals)
                         optimizer.step()
                         if (
                             optimizer_name == "muon"

@@ -103,3 +103,15 @@ def test_unsupported_blueprint_grpo_rejected_before_launch(client, workspace):
     response = client.post('/api/training/start', json={'stage': 'grpo', 'model_path': str(model), 'dataset_path': str(data)})
     assert response.status_code == 400 and 'not supported' in response.text
     assert list((workspace / '.runs').glob('*/config.json')) == []
+
+
+def test_saved_invalid_graph_rejected_before_ui_render(client, workspace):
+    atomic_json(workspace / 'blueprints' / 'hand-edited.json', {'blocks': [{'type': 'loop'}]})
+    assert client.get('/api/blueprints/get/hand-edited').status_code == 400
+
+
+def test_invalid_nested_type_is_a_validation_error_not_server_failure(client):
+    value = blueprint()
+    value['blocks'][1] = {'id': 'core', 'type': 'loop', 'params': {'body': [{'type': ['invalid'], 'params': {}}]}}
+    response = client.post('/api/blueprints/save', json={'name': 'bad-child', 'blueprint': value})
+    assert response.status_code == 400

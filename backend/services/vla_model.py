@@ -10,7 +10,11 @@ class ActionPolicy(nn.Module):
         super().__init__()
         self.config, self.backbone = config, backbone
         self.output_dim = config['action_dim'] + (sum(config['discrete_classes']) if config['action_type'] == 'hybrid' else 0)
-        if backbone is None:
+        if config.get('architecture') == 'blueprint_vla':
+            from backend.services.blueprint_multimodal import BlueprintMultimodalCore
+            self.research_core = BlueprintMultimodalCore(config)
+            width = self.research_core.output_width
+        elif backbone is None:
             grid = config.get('vision_grid', 1)  # Old exports used global pooling.
             self.vision = nn.Sequential(nn.Conv2d(3, 16, 5, stride=2, padding=2), nn.GELU(),
                 nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.GELU(), nn.AdaptiveAvgPool2d((grid, grid)), nn.Flatten())
@@ -23,7 +27,13 @@ class ActionPolicy(nn.Module):
             nn.Linear(config['hidden_dim'], config['action_horizon'] * self.output_dim))
 
     def forward(self, inputs, states):
-        if self.backbone is None:
+        if hasattr(self, 'research_core'):
+            from backend.services.blueprint_multimodal import instruction_batch
+            ids, mask = instruction_batch(inputs['instructions'], states.device)
+            hidden, full_mask, _ = self.research_core(inputs['images'], ids, mask)
+            indices = torch.arange(hidden.shape[1], device=hidden.device).expand(len(hidden), -1).masked_fill(full_mask == 0, -1).max(-1).values
+            features = hidden[torch.arange(len(hidden), device=hidden.device), indices]
+        elif self.backbone is None:
             tokens = [list(text.encode('utf-8')) for text in inputs['instructions']]
             lengths = torch.tensor([len(row) for row in tokens])
             ids = torch.zeros(len(tokens), int(lengths.max()), dtype=torch.long, device=states.device)
@@ -45,7 +55,11 @@ class ActionPolicy(nn.Module):
 
 
 def create(config):
-    if config['architecture'] == 'native_vla':
+    from backend.services.vla_policy_runtime import standalone
+    if standalone(config):
+        from backend.services.vla_policy_runtime import create as create_policy
+        return create_policy(config)
+    if config['architecture'] in ('native_vla', 'blueprint_vla'):
         return ActionPolicy(config), None
     from homellm.training.vlm_common import load_vlm_processor
     from backend.services.vlm_runtime import load_model, apply_adapters
@@ -58,6 +72,7 @@ def create(config):
 
 
 def save(directory, model, processor, stats, config):
+    if hasattr(model,'studio_config'):return model.save(directory,stats,config)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     if model.backbone is None:
@@ -72,6 +87,7 @@ def save(directory, model, processor, stats, config):
 
 
 def restore_weights(model, directory):
+    if hasattr(model,'studio_config'):return model.restore(directory)
     from safetensors.torch import load_file
     directory = Path(directory)
     if model.backbone is None:

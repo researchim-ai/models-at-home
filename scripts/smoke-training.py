@@ -18,8 +18,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--multi-gpu', action='store_true')
-    parser.add_argument('--architecture', choices=['home', 'gpt2', 'home_moe', 'blueprint'], default='home')
+    parser.add_argument('--architecture', choices=['home', 'gpt2', 'home_moe', 'blueprint', 'looped'], default='home')
+    parser.add_argument('--cpu', action='store_true', help='Run the offline smoke on CPU, including inference')
     args = parser.parse_args()
+    if args.cpu:
+        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+        os.environ['ACCELERATE_USE_CPU'] = 'true'
+    if args.cpu and args.multi_gpu:
+        parser.error('--cpu and --multi-gpu cannot be combined')
     with tempfile.TemporaryDirectory(prefix="mah-training-smoke-") as temporary:
         root = Path(temporary)
         os.environ.update(MODELS_AT_HOME_ROOT=temporary, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
@@ -64,7 +70,8 @@ def main():
 
         try:
             settings = {
-                'stage': 'pretrain', 'model_type': args.architecture, 'model_id': str(tokenizer_dir),
+                'research_diagnostics': args.architecture in ('blueprint','looped'),
+                'stage': 'pretrain', 'model_type': 'blueprint' if args.architecture == 'looped' else args.architecture, 'model_id': str(tokenizer_dir),
                 'tokenizer_path': str(tokenizer_dir), 'dataset_path': str(data),
                 'hidden_size': 32, 'num_layers': 1, 'n_heads': 4, 'seq_len': 64,
                 'num_experts': 2, 'num_experts_per_tok': 1, 'intermediate_size': 64,
@@ -72,10 +79,10 @@ def main():
                 'warmup_steps': 0, 'save_every': 1, 'log_every': 1, 'mixed_precision': 'no',
                 'use_liger': False, 'liger_fused_ce': False, 'grad_checkpoint': False,
                 'use_flash_attention': False, 'export_on_checkpoint': False,
-                'gpu_ids': [0, 1] if args.multi_gpu else [1],
+                'gpu_ids': [] if args.cpu else ([0, 1] if args.multi_gpu else [1]),
                 'parallel_mode': 'multi_gpu' if args.multi_gpu else 'single',
             }
-            if args.architecture == 'blueprint':
+            if args.architecture in ('blueprint', 'looped'):
                 blueprint = {'hidden_size': 32, 'vocab_size': 50257, 'max_position_embeddings': 64,
                     'blocks': [
                         {'id': 'embedding', 'type': 'token_embedding', 'params': {'hidden_size': 32, 'vocab_size': 50257}},
@@ -84,6 +91,11 @@ def main():
                         {'id': 'attention', 'type': 'causal_self_attention', 'params': {'num_heads': 4, 'use_rope': True}},
                         {'id': 'norm', 'type': 'layernorm'},
                     ]}
+                if args.architecture == 'looped':
+                    blueprint['blocks'][3] = {'id': 'core', 'type': 'loop', 'params': {
+                        'iterations': 3, 'eval_iterations': 4, 'input_injection': 'concat', 'state_init': 'zeros',
+                        'gradient_steps': 2, 'checkpoint': True, 'random_depth': True, 'min_iterations': 2,
+                        'body': [{'type': 'llama_block', 'params': {'num_heads': 4, 'num_kv_heads': 2, 'intermediate_size': 64, 'sandwich_norm': True, 'use_liger': False}}]}}
                 response = client.post('/api/blueprints/save', json={'name': 'tiny', 'blueprint': blueprint})
                 assert response.status_code == 200, response.text
                 settings.update(model_blueprint=response.json()['path'], grad_checkpoint=True)
@@ -92,6 +104,9 @@ def main():
             first_id = response.json()['run_id']
             first = completed(first_id)
             assert first['current_step'] == 2, first
+            if args.architecture in ('blueprint','looped'):
+                signals=client.get(f'/api/training/runs/{first_id}/metrics').json()['metrics'].get('research_signals')
+                assert signals and signals['blocks'], 'Missing real LLM research signals'
             print('PASS local pretrain: step 2', flush=True)
             response = client.post(f'/api/training/runs/{first_id}/continue', json={'max_steps': 4})
             assert response.status_code == 200, response.text
@@ -103,9 +118,9 @@ def main():
             print('PASS checkpoint resume: step 2 -> 4, separate output directories', flush=True)
             final_model = str(Path(resumed['config']['output_dir']) / 'final_model')
             saved = json.loads((Path(final_model) / 'config.json').read_text())
-            assert saved['model_type'] == {'home': 'homellm', 'gpt2': 'gpt2_home', 'home_moe': 'homellm_moe', 'blueprint': 'homellm_blueprint'}[args.architecture], saved
+            assert saved['model_type'] == {'home': 'homellm', 'gpt2': 'gpt2_home', 'home_moe': 'homellm_moe', 'blueprint': 'homellm_blueprint', 'looped': 'homellm_blueprint'}[args.architecture], saved
             assert saved['hidden_size'] == 32, saved
-            if args.architecture != 'blueprint':
+            if args.architecture not in ('blueprint', 'looped'):
                 assert saved['intermediate_size'] == 64, saved
             else:
                 assert saved['vocab_size'] == len(vocabulary)
@@ -117,7 +132,7 @@ def main():
             assert response.status_code == 200, response.text
             assert isinstance(response.json()['text'], str)
             print('PASS inference from exported Home model', flush=True)
-            if args.architecture == 'blueprint':
+            if args.architecture in ('blueprint', 'looped'):
                 import torch
                 loaded = chat._loaded_backend['model']
                 with torch.inference_mode():
@@ -126,6 +141,11 @@ def main():
                     assert not torch.allclose(first, second), 'Positional embedding discarded the token representation'
                 assert isinstance(loaded.model.modules_dict['projection'], torch.nn.Linear)
                 print('PASS positional encoding preserves tokens; same-width linear is trainable', flush=True)
+                if args.architecture == 'looped':
+                    core = loaded.model.modules_dict['core']
+                    assert core.last_iterations == 4
+                    assert len(core.body.layers) == 1
+                    print('PASS exported recurrent core retains shared weights, GQA, TBPTT, checkpointing and inference depth', flush=True)
             chat.unload_model()
             for fmt in ('chat', 'instruct'):
                 sft_data = root / 'datasets' / f'{fmt}.jsonl'

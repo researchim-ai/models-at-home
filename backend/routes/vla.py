@@ -21,8 +21,9 @@ WORKER = Path(__file__).resolve().parents[1] / 'services' / 'vla_worker.py'
 
 class VLATrainingRequest(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
+    research_diagnostics: bool = False
     stage: Literal['vla_sft'] = 'vla_sft'
-    architecture: Literal['native_vla', 'vlm_action'] = 'native_vla'
+    architecture: Literal['native_vla', 'vlm_action', 'blueprint_vla', 'openvla', 'smolvla', 'act', 'pi0'] = 'native_vla'
     training_backend: Literal['transformers', 'unsloth'] = 'transformers'
     domain: Literal['robotics', 'simulation', 'desktop'] = 'robotics'
     action_type: Literal['continuous', 'discrete', 'hybrid'] = 'continuous'
@@ -30,6 +31,17 @@ class VLATrainingRequest(BaseModel):
     discrete_classes: list[int] = []
     discrete_names: list[str] = []
     discrete_labels: list[list[str]] = []
+    model_blueprint: str = ''
+    model_blueprint_spec: dict | None = None
+    source_blueprint_spec: dict | None = None
+    vision_patch_size: int = Field(default=8, ge=2, le=32)
+    vision_image_size: int = Field(default=32, ge=16, le=256)
+    policy_camera_key: str = ''
+    policy_revision: str = ''
+    policy_train_expert_only: bool = True
+    act_pretrained_backbone: bool = False
+    act_dim_model: int = Field(default=256, ge=32, le=1024, multiple_of=8)
+    act_encoder_layers: int = Field(default=4, ge=1, le=12)
     model_path: str = ''
     dataset_path: str = ''
     val_data_path: str = ''
@@ -68,13 +80,15 @@ class VLATrainingRequest(BaseModel):
 
     @model_validator(mode='after')
     def coherent(self):
+        from backend.services.vla_policies import validate_contract
+        validate_contract(self.model_dump())
         if len(self.gpu_ids) > 1 or any(value < 0 for value in self.gpu_ids):
             raise ValueError('VLA supports one selected GPU')
         if self.architecture == 'native_vla' and self.vision_grid > self.image_size // 4:
             raise ValueError('vision_grid exceeds encoded image resolution')
-        if self.architecture == 'native_vla' and self.training_backend != 'transformers':
+        if self.architecture in ('native_vla', 'blueprint_vla') and self.training_backend != 'transformers':
             raise ValueError('Unsloth accelerates VLM backbones; native VLA uses our PyTorch model')
-        if self.architecture == 'native_vla' and self.tuning_method != 'full':
+        if self.architecture in ('native_vla', 'blueprint_vla') and self.tuning_method != 'full':
             raise ValueError('Native VLA trains from scratch; LoRA/QLoRA require VLM action architecture')
         if self.architecture == 'vlm_action' and not self.model_path.strip():
             raise ValueError('Choose a VLM backbone model_path')
@@ -123,12 +137,15 @@ def complete_checkpoint(directory):
 
 def normalized(req):
     config = req.model_dump()
+    if req.architecture == 'blueprint_vla':
+        from backend.services.blueprint_multimodal import normalize
+        normalize(config, PROJECT_ROOT, task='vla')
     config['data_path'] = config['dataset_path'] = existing(req.dataset_path, 'dataset_path')
     if req.val_data_path:
         config['val_data_path'] = existing(req.val_data_path, 'val_data_path')
         if config['val_data_path'] == config['data_path']:
             raise ValueError('Holdout must differ from training dataset')
-    if req.architecture == 'vlm_action':
+    if req.model_path and req.architecture in ('vlm_action','openvla','smolvla','act','pi0'):
         local = Path(req.model_path).expanduser()
         if not local.is_absolute() and (PROJECT_ROOT / local).exists():
             local = PROJECT_ROOT / local
@@ -155,7 +172,10 @@ def env(gpu_ids):
 
 def probe(mode, payload, gpu_ids):
     try:
-        result = subprocess.run([python_command(), str(WORKER), '--mode', mode], input=json.dumps(payload),
+        from backend.services.vla_policies import python_for
+        architecture = payload.get('architecture')
+        if mode == 'predict':architecture = json.loads((Path(payload['model_path']) / 'policy.json').read_text())['config']['architecture']
+        result = subprocess.run([python_for(architecture), str(WORKER), '--mode', mode], input=json.dumps(payload),
             text=True, capture_output=True, cwd=PROJECT_ROOT, env=env(gpu_ids), timeout=180)
         if result.returncode:
             raise ValueError(result.stderr[-3000:] or f'VLA {mode} worker exited {result.returncode}')
@@ -165,6 +185,12 @@ def probe(mode, payload, gpu_ids):
         return response
     except subprocess.TimeoutExpired as exc:
         raise ValueError(f'VLA {mode} exceeded 180 seconds') from exc
+
+
+@router.get('/policies')
+def policy_catalog():
+    from backend.services.vla_policies import catalog
+    return {'policies':catalog()}
 
 
 @router.get('/examples')
@@ -188,7 +214,9 @@ def preflight(req: VLATrainingRequest):
 def start(req: VLATrainingRequest):
     try:
         config = normalized(req)
-        python = python_command()
+        import sys
+        from backend.services.vla_policies import python_for
+        python = python_for(req.architecture)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     run_id = 'vla_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:6]

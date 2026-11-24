@@ -1,3 +1,4 @@
+import type { RuntimeSignalsData } from '@/lib/research'
 export type TrainingStage = 'pretrain' | 'continual_pretrain' | 'sft' | 'grpo'
 export type VLMStage = 'vlm_pretrain' | 'vlm_sft' | 'vlm_grpo'
 export type RunStatus = 'running' | 'completed' | 'error' | 'stopped' | 'initializing' | 'building_model' | 'resumed' | 'unknown' | 'starting' | 'training'
@@ -21,6 +22,8 @@ export interface VLMPreflightReport {
 export type TrainingMode = 'epochs' | 'steps'
 
 export interface TrainingConfig {
+  research_diagnostics?: boolean
+
   stage: TrainingStage
   model_type: string
   model_blueprint?: string
@@ -142,6 +145,8 @@ export interface TrainingRun {
 }
 
 export interface MetricsSnapshot {
+  research_signals?: RuntimeSignalsData
+
   elapsed_seconds?: number
   step_seconds?: number
   estimated_remaining_seconds?: number

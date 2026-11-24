@@ -17,8 +17,8 @@ class BlueprintLMConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size: int,
-        hidden_size: int,
+        vocab_size: int = 50257,
+        hidden_size: int = 512,
         max_position_embeddings: int = 2048,
         auto_project: bool = True,
         blueprint: Optional[Dict] = None,
@@ -35,6 +35,7 @@ class BlueprintLMConfig(PretrainedConfig):
 class BlueprintForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = BlueprintLMConfig
     base_model_prefix = "blueprint_model"
+    _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config: BlueprintLMConfig):
         super().__init__(config)
@@ -44,33 +45,33 @@ class BlueprintForCausalLM(PreTrainedModel, GenerationMixin):
         self.model, hidden_size = build_model_from_blueprint(self._blueprint)
         self.lm_head = nn.Linear(hidden_size, config.vocab_size, bias=False)
         
-        # Tie weights if requested (default for causal LM)
-        if config.tie_word_embeddings:
-            # Try to find the token embedding layer in the built model
-            # We look for the first module that is an instance of nn.Embedding
-            embedding_layer = None
-            for module in self.model.modules():
-                if isinstance(module, nn.Embedding) and module.num_embeddings == config.vocab_size:
-                    embedding_layer = module
-                    break
-            
-            if embedding_layer is not None:
-                if self.lm_head.weight.shape == embedding_layer.weight.shape:
-                    self.lm_head.weight = embedding_layer.weight
-                else:
-                    # Dimensions might mismatch if there is a projection or different hidden size
-                    pass
-
         self.post_init()
+
+    def tie_weights(self):
+        # An explicit final projection may change width; only compatible heads tie.
+        if self.config.tie_word_embeddings:
+            embedding = self.get_input_embeddings()
+            if self.lm_head.weight.shape == embedding.weight.shape:
+                self.lm_head.weight = embedding.weight
+
+    def get_input_embeddings(self):
+        for block in self._blueprint.blocks:
+            if block.type == 'token_embedding':
+                return self.model.modules_dict[block.id]
+        raise ValueError('Blueprint has no token_embedding')
+
+    def get_output_embeddings(self):
+        return self.lm_head
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        loop_iterations: Optional[int] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        hidden_states = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_states = self.model(input_ids=input_ids, attention_mask=attention_mask, loop_iterations=loop_iterations)
         logits = self.lm_head(hidden_states)
 
         loss = None
@@ -84,15 +85,10 @@ class BlueprintForCausalLM(PreTrainedModel, GenerationMixin):
             )
             
             # Add auxiliary loss from MoE layers (load balancing)
-            aux_loss = 0.0
-            for module in self.model.modules():
-                if hasattr(module, "aux_loss") and isinstance(module.aux_loss, torch.Tensor):
-                    aux_loss += module.aux_loss
-            
-            # Standard coefficient for load balancing loss is usually 0.01-0.02
-            # We can make it configurable later, but for now 0.01 is a safe research default.
-            if isinstance(aux_loss, torch.Tensor) or aux_loss > 0:
-                loss += 0.01 * aux_loss
+            from homellm.models.blocks.recurrent import auxiliary_losses
+            losses = auxiliary_losses(self.model)
+            if losses:
+                loss = loss + 0.01 * torch.stack(losses).sum()
 
         return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=None)
 
