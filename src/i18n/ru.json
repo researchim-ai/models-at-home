@@ -182,7 +182,7 @@
   "study.title": "Учебный центр",
   "study.subtitle": "Материалы для изучения ML/AI",
   "notebooks.title": "Ноутбуки",
-  "notebooks.subtitle": "Интеграция JupyterLab",
+  "notebooks.subtitle": "Учебные примеры и Python внутри студии",
   "notebooks.open": "Открыть JupyterLab",
   "common.loading": "Загрузка...",
   "common.none": "Нет",

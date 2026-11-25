@@ -34,6 +34,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await run_in_threadpool(notebooks.notebook_runtime.shutdown)
         await run_in_threadpool(world_play.service.close)
         await run_in_threadpool(processes.shutdown)
         await run_in_threadpool(agent.stop_server)

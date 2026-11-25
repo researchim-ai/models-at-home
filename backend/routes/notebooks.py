@@ -258,3 +258,165 @@ def _probe_url(url: str) -> str:
     if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
         raise HTTPException(400, "Expected an HTTP(S) Jupyter URL")
     return url
+
+# Native Studio editor. Legacy JupyterLab endpoints remain for older clients.
+import hashlib
+from pydantic import BaseModel, Field
+from backend.paths import safe_child, atomic_json
+from backend.services import notebook_runtime
+
+_document_lock = threading.Lock()
+
+
+class NotebookWrite(BaseModel):
+    path: str = Field(max_length=240)
+    notebook: dict
+    revision: str | None = None
+
+
+class NotebookSession(BaseModel):
+    path: str = Field(max_length=240)
+
+
+class CellExecution(BaseModel):
+    code: str = Field(max_length=100_000)
+    cell_id: str = Field(min_length=1, max_length=100)
+
+
+def _notebook_path(name: str) -> Path:
+    path = safe_child(NOTEBOOKS_DIR, name)
+    if path.suffix != '.ipynb':
+        raise HTTPException(400, 'Expected an .ipynb file')
+    return path
+
+
+def _read_notebook(path: Path):
+    if not path.is_file():
+        raise HTTPException(404, 'Notebook not found')
+    if path.stat().st_size > 10_000_000:
+        raise HTTPException(413, 'Notebook exceeds the 10 MB editor limit')
+    raw = path.read_bytes()
+    try:
+        notebook = json.loads(raw)
+        _validate_notebook(notebook)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, f'Invalid notebook: {exc}')
+    return notebook, hashlib.sha256(raw).hexdigest()
+
+
+def _validate_notebook(notebook):
+    if not isinstance(notebook, dict) or notebook.get('nbformat') != 4:
+        raise ValueError('Only nbformat 4 notebooks are supported')
+    cells = notebook.get('cells')
+    if not isinstance(cells, list) or len(cells) > 500:
+        raise ValueError('Expected at most 500 cells')
+    if not isinstance(notebook.get('metadata'), dict):
+        raise ValueError('Notebook metadata must be an object')
+    for cell in cells:
+        if not isinstance(cell, dict) or cell.get('cell_type') not in ('code', 'markdown', 'raw'):
+            raise ValueError('Invalid cell type')
+        source = cell.get('source')
+        if not isinstance(source, str) and not (isinstance(source, list) and all(isinstance(s, str) for s in source)):
+            raise ValueError('Invalid cell source')
+        if cell['cell_type'] == 'code' and not isinstance(cell.get('outputs', []), list):
+            raise ValueError('Invalid outputs')
+        for output in cell.get('outputs', []):
+            if not isinstance(output, dict) or not isinstance(output.get('output_type'), str):
+                raise ValueError('Invalid output item')
+            if 'data' in output and not isinstance(output['data'], dict):
+                raise ValueError('Invalid output data')
+            if 'traceback' in output and not (isinstance(output['traceback'], list) and all(isinstance(line, str) for line in output['traceback'])):
+                raise ValueError('Invalid traceback')
+
+
+class NotebookValidation(BaseModel):
+    notebook: dict
+
+
+@router.post('/validate')
+def validate_notebook(payload: NotebookValidation):
+    try:
+        _validate_notebook(payload.notebook)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, str(exc))
+    return {'valid': True}
+
+
+@router.get('/library')
+def notebook_library(lang: str = 'ru'):
+    items = []
+    if NOTEBOOKS_DIR.exists():
+        for path in sorted(NOTEBOOKS_DIR.rglob('*.ipynb')):
+            if '.ipynb_checkpoints' in path.parts:
+                continue
+            try:
+                notebook, _ = _read_notebook(_notebook_path(str(path.relative_to(NOTEBOOKS_DIR))))
+                info = notebook.get('metadata', {}).get('studio', {})
+                if info.get('language') and info['language'] != ('ru' if lang.startswith('ru') else 'en'):
+                    continue
+                items.append({'path': str(path.relative_to(NOTEBOOKS_DIR)), 'title': info.get('title', path.stem),
+                              'description': info.get('description', ''), 'topic': info.get('topic', 'custom'),
+                              'minutes': info.get('minutes'), 'level': info.get('level', ''),
+                              'track': info.get('track', 'foundations' if info.get('lesson') else 'custom'),
+                              'paper': info.get('paper') if isinstance(info.get('paper'), dict) else None,
+                              'lesson': bool(info.get('lesson')), 'cells': len(notebook['cells'])})
+            except (HTTPException, OSError, ValueError):
+                continue
+    items.sort(key=lambda item: (not item['lesson'], item['path']))
+    return {'notebooks': items, 'runtime': {'available': notebook_runtime.available(),
+            'python': sys.version.split()[0], 'executable': sys.executable,
+            'install': 'python -m pip install jupyter-client ipykernel matplotlib'}}
+
+
+@router.get('/document')
+def notebook_document(path: str):
+    notebook, revision = _read_notebook(_notebook_path(path))
+    return {'notebook': notebook, 'revision': revision, 'path': path}
+
+
+@router.put('/document')
+def save_notebook(payload: NotebookWrite):
+    path = _notebook_path(payload.path)
+    try:
+        _validate_notebook(payload.notebook)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, str(exc))
+    if len(json.dumps(payload.notebook).encode()) > 10_000_000:
+        raise HTTPException(413, 'Notebook exceeds the 10 MB editor limit')
+    with _document_lock:
+        if path.exists():
+            _, revision = _read_notebook(path)
+            if payload.revision != revision:
+                raise HTTPException(409, 'Notebook changed on disk. Reopen it or save a copy.')
+        elif payload.revision:
+            raise HTTPException(409, 'Notebook was removed. Save a copy instead.')
+        atomic_json(path, payload.notebook)
+        _, revision = _read_notebook(path)
+    return {'revision': revision, 'path': payload.path}
+
+
+@router.post('/sessions')
+def start_notebook_session(payload: NotebookSession):
+    _read_notebook(_notebook_path(payload.path))
+    return notebook_runtime.start(PROJECT_ROOT, payload.path)
+
+
+@router.get('/sessions/{session_id}')
+def notebook_session_status(session_id: str):
+    return notebook_runtime.get(session_id).snapshot()
+
+
+@router.post('/sessions/{session_id}/execute')
+def execute_notebook_cell(session_id: str, payload: CellExecution):
+    return notebook_runtime.get(session_id).execute(payload.code, payload.cell_id)
+
+
+@router.post('/sessions/{session_id}/interrupt')
+def interrupt_notebook_cell(session_id: str):
+    return notebook_runtime.get(session_id).interrupt()
+
+
+@router.delete('/sessions/{session_id}')
+def close_notebook_session(session_id: str):
+    notebook_runtime.stop(session_id)
+    return {'success': True}

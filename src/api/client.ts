@@ -47,6 +47,15 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  notebookLibrary: (lang: string) => request<{ notebooks: import('@/api/notebook-types').Lesson[]; runtime: { available: boolean; python: string; executable: string; install: string } }>(`/notebooks/library?lang=${encodeURIComponent(lang)}`),
+  validateNotebook: (notebook: import('@/api/notebook-types').Notebook) => request<{ valid: boolean }>('/notebooks/validate', { method: 'POST', body: JSON.stringify({ notebook }) }),
+  notebookDocument: (path: string) => request<{ notebook: import('@/api/notebook-types').Notebook; revision: string }>(`/notebooks/document?path=${encodeURIComponent(path)}`),
+  saveNotebook: (path: string, notebook: import('@/api/notebook-types').Notebook, revision: string | null) => request<{ revision: string; path: string }>('/notebooks/document', { method: 'PUT', body: JSON.stringify({ path, notebook, revision }) }),
+  startNotebook: (path: string) => request<import('@/api/notebook-types').NotebookSession>('/notebooks/sessions', { method: 'POST', body: JSON.stringify({ path }) }),
+  notebookSession: (id: string) => request<import('@/api/notebook-types').NotebookSession>(`/notebooks/sessions/${encodeURIComponent(id)}`),
+  executeNotebook: (id: string, code: string, cell_id: string) => request<import('@/api/notebook-types').NotebookSession>(`/notebooks/sessions/${encodeURIComponent(id)}/execute`, { method: 'POST', body: JSON.stringify({ code, cell_id }) }),
+  interruptNotebook: (id: string) => request<import('@/api/notebook-types').NotebookSession>(`/notebooks/sessions/${encodeURIComponent(id)}/interrupt`, { method: 'POST' }),
+  closeNotebook: (id: string) => request<{ success: boolean }>(`/notebooks/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   // Vision-language-action policies
   worldResources: (payload: Record<string, unknown>) => request<import('./types').WorldResourceReport>('/world-models/resources/estimate', { method: 'POST', body: JSON.stringify(payload) }),
   benchmarkWorldResources: (payload: Record<string, unknown>) => request<import('./types').WorldResourceReport>('/world-models/resources/benchmark', { method: 'POST', body: JSON.stringify(payload) }),

@@ -162,7 +162,7 @@ const routes = [
   { path: '/builder', name: 'ModelBuilder', content: /Saved Blueprints/ },
   { path: '/world-models', name: 'WorldModelsStudio', content: /World Models Studio/ },
   { path: '/study', name: 'StudyCenter', content: /Select a document from the sidebar/ },
-  { path: '/notebooks', name: 'Notebooks', content: /JupyterLab Connection/ },
+  { path: '/notebooks', name: 'Notebooks', content: /Learning Lab/ },
   { path: '/agent', name: 'AgentStudio', content: /llama-server/ },
   { path: '/settings', name: 'Settings', content: /Configure your studio preferences/ },
 ]

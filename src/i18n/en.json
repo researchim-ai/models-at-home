@@ -182,7 +182,7 @@
   "study.title": "Study Center",
   "study.subtitle": "Learning materials for ML/AI",
   "notebooks.title": "Notebooks",
-  "notebooks.subtitle": "JupyterLab Integration",
+  "notebooks.subtitle": "Learn and run Python inside Studio",
   "notebooks.open": "Open JupyterLab",
   "common.loading": "Loading...",
   "common.none": "None",
